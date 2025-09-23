@@ -1,0 +1,1595 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Hypertuna P2P Relay Server</title>
+    <!-- Capture console output to a persistent log file -->
+    <script type="module" src="console-file-logger.js"></script>
+    <!-- Polyfills for browser compatibility -->
+    <script type="module" src="browser-compat.js"></script>
+    <!-- Load crypto and hypercore helpers before app scripts -->
+    <script type="module" src="crypto-libraries.js"></script>
+    <script type="module" src="hypercore-crypto-loader.js"></script>
+    <!-- Load worker control logic from desktop app -->
+    <script type="module" src="app.js"></script>
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <!-- Main App Container -->
+    <div class="app-container">
+        <!-- Header -->
+        <header class="app-header">
+            <div class="header-content">
+                <h1 class="app-title">Hypertuna</h1>
+                <div class="header-actions">
+                    <button class="icon-btn" id="btn-settings" aria-label="Settings">
+                        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <circle cx="12" cy="12" r="3"></circle>
+                            <path d="M12 1v6m0 6v6m9-9h-6m-6 0H3"></path>
+                        </svg>
+                    </button>
+                </div>
+            </div>
+        </header>
+
+        <!-- Main Content Area -->
+        <main class="app-main">
+            <!-- Authentication page -->
+            <div id="page-auth" class="page active">
+                <div class="auth-container">
+                    <div class="auth-card">
+                        <div class="auth-header">
+                            <h2>Welcome to Hypertuna</h2>
+                            <p>Your decentralized relay network</p>
+                        </div>
+                        
+                        <div id="profile-display" class="profile-preview hidden">
+                            <div class="profile-avatar-large">
+                                <span>👤</span>
+                            </div>
+                            <h3 id="profile-name">Unknown User</h3>
+                            <div class="profile-pubkey-preview" id="profile-pubkey"></div>
+                            <button id="btn-logout" class="btn btn-secondary">Switch Account</button>
+                        </div>
+                        
+                        <div id="auth-form" class="auth-form">
+                            <div class="form-group">
+                                <label for="privateKey">Private Key</label>
+                                <div class="input-with-action">
+                                    <input type="password" id="privateKey" placeholder="Enter your private key (nsec or hex) or generate a new one">
+                                    <button id="btn-toggle-key-visibility" class="input-action-btn" aria-label="Toggle visibility">
+                                        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                            <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path>
+                                            <circle cx="12" cy="12" r="3"></circle>
+                                        </svg>
+                                    </button>
+                                </div>
+                            </div>
+                            <div class="auth-actions">
+                                <button id="btn-generate-key" class="btn btn-secondary">Generate New</button>
+                                <button id="btn-login" class="btn btn-primary">Continue</button>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <div class="relay-config-card">
+                        <h3>Relay Connection</h3>
+                        <div class="form-group">
+                            <label for="relay-connection-type">Connection Type</label>
+                            <select id="relay-connection-type" class="form-select">
+                                <option value="real">Real Nostr Relays</option>
+                                <option value="simulated">Simulated Local Relay</option>
+                            </select>
+                        </div>
+                        <div id="real-relays-config" class="form-group">
+                            <label for="relay-list">Relay URLs</label>
+                            <textarea id="relay-list" class="form-textarea" rows="3" placeholder="wss://relay.damus.io&#10;wss://relay.nostr.band&#10;wss://nos.lol"></textarea>
+                        </div>
+                        <button id="btn-connect-relay" class="btn btn-primary btn-block">Connect</button>
+                        <div id="relay-status" class="status-message warning">
+                            Not connected to any relay
+                        </div>
+                    </div>
+                </div>
+            </div>
+            
+            <!-- Groups list page -->
+            <div id="page-groups" class="page">
+                <div class="groups-container">
+                    <div class="groups-header">
+                        <div class="list-toggle">
+                            <button class="toggle-option active" data-view="your">Your Relays</button>
+                            <button class="toggle-option" data-view="discover">Discover</button>
+                        </div>
+                        <button id="btn-create-new-group" class="btn btn-primary btn-small">
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <line x1="12" y1="5" x2="12" y2="19"></line>
+                                <line x1="5" y1="12" x2="19" y2="12"></line>
+                            </svg>
+                            New Relay
+                        </button>
+                        <button id="btn-edit-following" class="btn btn-primary btn-small" style="display: none;">
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"></path>
+                                <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"></path>
+                            </svg>
+                            Following
+                        </button>
+                    </div>
+
+                    <div id="invite-summary" class="invite-summary hidden">
+                        <span id="invite-count">0</span> invite(s) pending
+                        <button id="btn-view-invites" class="btn btn-secondary btn-small">View</button>
+                    </div>
+
+                    <div id="groups-list" class="groups-list">
+                        <!-- Your relays will be populated here -->
+                    </div>
+                    
+                    <div id="discover-list" class="groups-list hidden">
+                        <!-- Discover relays will be populated here -->
+                    </div>
+                </div>
+            </div>
+            
+            <!-- Group detail page -->
+            <div id="page-group-detail" class="page">
+                <div class="group-detail-container">
+                    <!-- Group Header -->
+                    <div class="group-header-bar">
+                        <button id="btn-back-to-groups" class="icon-btn">
+                            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <polyline points="15 18 9 12 15 6"></polyline>
+                            </svg>
+                        </button>
+                        <div class="group-header-info">
+                            <h2 id="group-detail-name">Relay Name</h2>
+                            <div class="group-meta-inline">
+                                <span id="group-detail-visibility" class="meta-badge">Public</span>
+                                <span id="group-detail-join-type" class="meta-badge">Open</span>
+                            </div>
+                        </div>
+                        <button id="btn-group-menu" class="icon-btn">
+                            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <circle cx="12" cy="12" r="1"></circle>
+                                <circle cx="12" cy="5" r="1"></circle>
+                                <circle cx="12" cy="19" r="1"></circle>
+                            </svg>
+                        </button>
+                    </div>
+                    
+                    <!-- Group Description (hidden, used by JS) -->
+                    <div id="group-detail-description" style="display: none;"></div>
+                    
+                    <!-- Tab Navigation -->
+                    <div class="tab-nav">
+                        <button class="tab-btn active" data-tab="messages">Messages</button>
+                        <button class="tab-btn" data-tab="members">Members</button>
+                        <button class="tab-btn" data-tab="settings">Settings</button>
+                    </div>
+                    
+                    <!-- Tab Content -->
+                    <div class="tab-content-container">
+                        <!-- Messages Tab -->
+                        <div id="tab-messages" class="tab-content active">
+                            <div class="messages-container">
+                                <div id="message-list" class="message-list">
+                                    <!-- Messages will be populated here -->
+                                </div>
+                                
+                                <div class="message-input-container">
+                                    <div class="message-input-wrapper">
+                                        <textarea id="message-input" class="message-input" placeholder="Type a message..." rows="1"></textarea>
+                                        <input type="file" id="message-file" accept="*/*">
+                                        <button id="btn-send-message" class="send-btn" aria-label="Send message">
+                                            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                                <line x1="22" y1="2" x2="11" y2="13"></line>
+                                                <polygon points="22 2 15 22 11 13 2 9 22 2"></polygon>
+                                            </svg>
+                                        </button>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                        
+                        <!-- Members Tab -->
+                        <div id="tab-members" class="tab-content">
+                            <div class="members-container">
+                                <members-list id="member-list" class="member-list">
+                                    <!-- Members will be populated here -->
+                                </members-list>
+                                
+                                <div id="admin-panel" class="admin-panel hidden">
+                                    <h3>Admin Actions</h3>
+                                    <div class="admin-actions">
+                                        <button id="btn-invite-members" class="btn btn-secondary btn-small">Invite Members</button>
+                                    </div>
+                                    <div id="join-requests-section" class="join-requests hidden">
+                                        <h4>Pending Join Requests (<span id="join-request-count">0</span>)</h4>
+                                        <div id="join-request-list" class="join-request-list"></div>
+                                    </div>
+                                </div>
+                                <div id="member-actions" class="member-panel hidden">
+                                    <h3>Member Actions</h3>
+                                    <div class="member-actions">
+                                        <button id="btn-member-invite" class="btn btn-secondary btn-small">Invite Members</button>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                        
+                        <!-- Settings Tab -->
+                        <div id="tab-settings" class="tab-content">
+                            <div class="settings-container">
+                                <div id="group-settings-form" class="settings-form hidden">
+                                    <h3>Relay Settings</h3>
+                                    <div class="form-group">
+                                        <label for="edit-group-name">Relay Name</label>
+                                        <input type="text" id="edit-group-name" class="form-input">
+                                    </div>
+                                    <div class="form-group">
+                                        <label for="edit-group-description">Description</label>
+                                        <textarea id="edit-group-description" class="form-textarea" rows="3"></textarea>
+                                    </div>
+                                    <div class="settings-toggles">
+                                        <div class="toggle-item">
+                                            <label class="toggle-label">
+                                                <input type="checkbox" id="edit-group-public" class="toggle-checkbox">
+                                                <span class="toggle-switch"></span>
+                                                <span class="toggle-text">Public Relay</span>
+                                            </label>
+                                        </div>
+                                        <div class="toggle-item">
+                                            <label class="toggle-label">
+                                                <input type="checkbox" id="edit-group-open" class="toggle-checkbox">
+                                                <span class="toggle-switch"></span>
+                                                <span class="toggle-text">Open to Join</span>
+                                            </label>
+                                        </div>
+                                        <div class="toggle-item">
+                                            <label class="toggle-label">
+                                                <input type="checkbox" id="edit-group-file-sharing" class="toggle-checkbox" disabled>
+                                                <span class="toggle-switch"></span>
+                                                <span class="toggle-text">Enable File Sharing</span>
+                                            </label>
+                                        </div>
+                                    </div>
+                                    <div class="settings-actions">
+                                        <button id="btn-save-group-settings" class="btn btn-primary">Save Changes</button>
+                                        <button id="btn-delete-group" class="btn btn-danger">Delete Relay</button>
+                                    </div>
+                                </div>
+                                <div id="group-settings-no-permission" class="no-permission-message hidden">
+                                    <p>You don't have permission to edit this relay's settings.</p>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <!-- Join/Leave Button (floating on mobile) -->
+                    <div class="group-action-bar">
+                        <button id="btn-join-group" class="btn btn-primary btn-block">Join Relay</button>
+                        <button id="btn-leave-group" class="btn btn-secondary btn-block hidden">Leave Relay</button>
+                    </div>
+                </div>
+            </div>
+            
+            <!-- Create group page -->
+            <div id="page-create-group" class="page">
+                <div class="create-group-container">
+                    <div class="page-header">
+                        <button id="btn-cancel-create" class="icon-btn">
+                            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <line x1="18" y1="6" x2="6" y2="18"></line>
+                                <line x1="6" y1="6" x2="18" y2="18"></line>
+                            </svg>
+                        </button>
+                        <h2>Create New Relay</h2>
+                        <div class="header-spacer"></div>
+                    </div>
+                    
+                    <form class="create-group-form">
+                        <div class="form-group">
+                            <label for="new-group-name">Relay Name</label>
+                            <input type="text" id="new-group-name" class="form-input" placeholder="Enter relay name">
+                        </div>
+                        <div class="form-group">
+                            <label for="new-group-description">Description</label>
+                            <textarea id="new-group-description" class="form-textarea" rows="4" placeholder="What's this relay about?"></textarea>
+                        </div>
+                            <div class="settings-toggles">
+                                <div class="toggle-item">
+                                    <label class="toggle-label">
+                                        <input type="checkbox" id="new-group-public" class="toggle-checkbox" checked>
+                                    <span class="toggle-switch"></span>
+                                    <span class="toggle-text">Public Relay</span>
+                                </label>
+                                <p class="toggle-description">Anyone can discover this relay</p>
+                            </div>
+                                <div class="toggle-item">
+                                    <label class="toggle-label">
+                                        <input type="checkbox" id="new-group-open" class="toggle-checkbox" checked>
+                                        <span class="toggle-switch"></span>
+                                        <span class="toggle-text">Open to Join</span>
+                                    </label>
+                                    <p class="toggle-description">No invite code required</p>
+                                </div>
+                                <div class="toggle-item">
+                                    <label class="toggle-label">
+                                        <input type="checkbox" id="new-group-file-sharing" class="toggle-checkbox">
+                                        <span class="toggle-switch"></span>
+                                        <span class="toggle-text">Enable File Sharing</span>
+                                    </label>
+                                </div>
+                            </div>
+                        <button id="btn-create-group" type="button" class="btn btn-primary btn-block">Create Relay</button>
+                    </form>
+                </div>
+            </div>
+            
+            <!-- Profile page -->
+            <div id="page-profile" class="page">
+                <div class="profile-container">
+                    <div class="page-header">
+                        <h2>Your Profile</h2>
+                    </div>
+                    
+                    <div class="profile-section">
+                        <div class="profile-avatar-section">
+                            <div class="profile-avatar-large">
+                                <span>👤</span>
+                            </div>
+                            <button class="btn btn-secondary btn-small">Change Avatar</button>
+                        </div>
+                        
+                        <div class="profile-form">
+                            <div class="form-group">
+                                <label for="profile-name-input">Display Name</label>
+                                <input type="text" id="profile-name-input" class="form-input" placeholder="Enter your display name">
+                            </div>
+                            <div class="form-group">
+                                <label for="profile-about-input">About</label>
+                                <textarea id="profile-about-input" class="form-textarea" rows="3" placeholder="Tell us about yourself"></textarea>
+                            </div>
+                            <button id="btn-update-profile" class="btn btn-primary">Update Profile</button>
+                        </div>
+                    </div>
+                    
+                    <div class="profile-section">
+                        <h3>NOSTR Identity Keys</h3>
+                        <div class="keys-section">
+                            <div class="form-group">
+                                <label>Public Key</label>
+                                <div class="key-display">
+                                    <input type="text" id="profile-pubkey-display" class="form-input" readonly>
+                                    <button class="copy-btn" data-copy="profile-pubkey-display">Copy</button>
+                                </div>
+                            </div>
+                            <div class="form-group">
+                                <label>Private Key</label>
+                                <div class="key-display">
+                                    <input type="password" id="profile-privkey-display" class="form-input" readonly>
+                                    <button id="btn-toggle-privkey" class="icon-btn">
+                                        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                            <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path>
+                                            <circle cx="12" cy="12" r="3"></circle>
+                                        </svg>
+                                    </button>
+                                    <button class="copy-btn" data-copy="profile-privkey-display">Copy</button>
+                                </div>
+                            </div>
+                            <div class="warning-message">
+                                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                    <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"></path>
+                                    <line x1="12" y1="9" x2="12" y2="13"></line>
+                                    <line x1="12" y1="17" x2="12.01" y2="17"></line>
+                                </svg>
+                                Keep your private key secure. Anyone with this key can control your account.
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <div class="profile-section">
+                        <h3>Network Discovery Relays</h3>
+                        <div class="form-group">
+                            <label for="profile-relay-urls">Connected Relays</label>
+                            <textarea id="profile-relay-urls" class="form-textarea" rows="4" placeholder="wss://relay.damus.io&#10;wss://relay.nostr.band&#10;wss://nos.lol"></textarea>
+                        </div>
+                        <button id="btn-update-relays" class="btn btn-secondary">Update Relays</button>
+                    </div>
+
+                    <div class="profile-section">
+                        <h3>Hypertuna Relay Node</h3>
+                        <div class="form-group">
+                            <span id="worker-status-text">Stopped</span>
+                        </div>
+                        <div class="button-group">
+                            <button id="start-worker" class="btn btn-primary">Start</button>
+                            <button id="stop-worker" class="btn btn-secondary">Stop</button>
+                        </div>
+                        <div class="form-group">Gateway: <span id="gateway-status">Not Registered</span></div>
+                    </div>
+
+                    <div class="profile-section">
+                      <button id="btn-logout-profile" class="btn btn-secondary btn-block">Logout</button>
+                  </div>
+
+                </div>
+            </div>
+        </main>
+
+        <!-- Bottom Navigation -->
+        <nav class="bottom-nav">
+            <a href="#" class="nav-item active" data-page="groups">
+                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"></path>
+                    <polyline points="3.27 6.96 12 12.01 20.73 6.96"></polyline>
+                    <line x1="12" y1="22.08" x2="12" y2="12"></line>
+                </svg>
+                <span>Relays</span>
+            </a>
+            <a href="#" class="nav-item" data-page="create-group">
+                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <circle cx="12" cy="12" r="10"></circle>
+                    <line x1="12" y1="8" x2="12" y2="16"></line>
+                    <line x1="8" y1="12" x2="16" y2="12"></line>
+                </svg>
+                <span>Create</span>
+            </a>
+            <a href="#" class="nav-item" data-page="profile">
+                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"></path>
+                    <circle cx="12" cy="7" r="4"></circle>
+                </svg>
+                <span>Profile</span>
+            </a>
+        </nav>
+    </div>
+
+    <!-- Modals -->
+    <!-- Join Group Modal -->
+    <div id="join-group-modal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3>Join Private Relay</h3>
+                <button class="modal-close" id="close-join-modal">&times;</button>
+            </div>
+            <div class="modal-body">
+                <p id="join-modal-message">This relay requires an invite code to join.</p>
+                <div id="invite-code-group" class="form-group">
+                    <label for="invite-code-input">Invite Code</label>
+                    <input type="text" id="invite-code-input" class="form-input" placeholder="Enter invite code">
+                </div>
+                <div id="join-request-status" class="status-message success hidden"></div>
+            </div>
+            <div class="modal-footer">
+                <button id="btn-cancel-join" class="btn btn-secondary">Cancel</button>
+                <button id="btn-confirm-join" class="btn btn-primary">Join</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Confirmation Modal -->
+    <div id="confirmation-modal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3 id="confirmation-title">Confirm Action</h3>
+                <button class="modal-close" id="close-confirmation-modal">&times;</button>
+            </div>
+            <div class="modal-body">
+                <p id="confirmation-message">Are you sure you want to proceed?</p>
+            </div>
+            <div class="modal-footer">
+                <button id="btn-cancel-confirmation" class="btn btn-secondary">Cancel</button>
+                <button id="btn-confirm-action" class="btn btn-danger">Confirm</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Add Member Modal -->
+    <div id="add-member-modal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3>Add Member</h3>
+                <button class="modal-close" id="close-add-member-modal">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="form-group">
+                    <label for="add-member-pubkey">Public Key</label>
+                    <input type="text" id="add-member-pubkey" class="form-input" placeholder="Enter member's public key (npub or hex)">
+                </div>
+                <div class="form-group">
+                    <label for="add-member-role">Role</label>
+                    <select id="add-member-role" class="form-select">
+                        <option value="member">Member</option>
+                        <option value="moderator">Moderator</option>
+                        <option value="admin">Admin</option>
+                    </select>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button id="btn-cancel-add-member" class="btn btn-secondary">Cancel</button>
+                <button id="btn-confirm-add-member" class="btn btn-primary">Add Member</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Invite Code Display Modal -->
+    <div id="invite-code-modal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3>Invite Code</h3>
+                <button class="modal-close" id="close-invite-code-modal">&times;</button>
+            </div>
+            <div class="modal-body">
+                <p>Share this code with people you want to invite:</p>
+                <div class="invite-code-display">
+                    <code id="invite-code-value">XXXXXXXXXX</code>
+                    <button class="copy-btn" data-copy="invite-code-value">Copy</button>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button id="btn-close-invite-code" class="btn btn-primary">Close</button>
+            </div>
+        </div>
+    </div>
+
+    <div id="following-modal" class="modal">
+        <div class="modal-content modal-wide">
+            <div class="modal-header">
+                <h3>Following</h3>
+                <button class="modal-close" id="close-following-modal">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="following-add-section">
+                    <div class="form-group">
+                        <label for="add-follow-pubkey">Add someone to follow</label>
+                        <div class="input-with-action">
+                            <input type="text" id="add-follow-pubkey" class="form-input" placeholder="Enter public key (npub or hex)">
+                            <button id="btn-add-follow" class="btn btn-primary btn-small">Add</button>
+                        </div>
+                    </div>
+                </div>
+                <div class="following-list-section">
+                    <h4>Currently Following <span id="following-count">(0)</span></h4>
+                    <div id="following-list" class="following-list">
+                        <!-- Following list will be populated here -->
+                    </div>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button id="btn-save-following" class="btn btn-primary">Save Changes</button>
+                <button id="btn-cancel-following" class="btn btn-secondary">Cancel</button>
+            </div>
+        </div>
+    </div>
+
+    <div id="invite-members-modal" class="modal">
+        <div class="modal-content modal-wide">
+            <div class="modal-header">
+                <h3>Invite Members</h3>
+                <button class="modal-close" id="close-invite-members-modal">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="invite-members-list-section">
+                    <h4>Followed Users</h4>
+                    <div id="invite-members-list" class="invite-members-list">
+                        <!-- Followed users will be listed here -->
+                    </div>
+                </div>
+                <div class="invite-members-add-section">
+                    <div class="form-group">
+                        <label for="invite-member-pubkey">Add pubkey</label>
+                        <div class="input-with-action">
+                            <input type="text" id="invite-member-pubkey" class="form-input" placeholder="Enter public key (npub or hex)">
+                            <button id="btn-add-invite-member" class="btn btn-primary btn-small">Add</button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button id="btn-send-invites" class="btn btn-primary">Send Invites</button>
+                <button id="btn-cancel-invite-members" class="btn btn-secondary">Cancel</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Invites Modal -->
+    <div id="invites-modal" class="modal">
+        <div class="modal-content modal-wide">
+            <div class="modal-header">
+                <h3>Relay Invites</h3>
+                <button class="modal-close" id="close-invites-modal">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div id="invite-list" class="invite-list"></div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Join Authentication Modal -->
+    <div id="join-auth-modal" class="modal">
+        <div class="modal-content modal-auth">
+            <div class="modal-header">
+                <h3>Join Relay Authentication</h3>
+                <button class="modal-close" id="close-join-auth-modal">&times;</button>
+            </div>
+            <div class="modal-body">
+                <!-- Status Section -->
+                <div id="auth-status" class="auth-status">
+                    <div class="status-icon">
+                        <div class="spinner"></div>
+                    </div>
+                    <div class="status-message">
+                        <h4 id="auth-status-title">Approval Pending</h4>
+                        <p id="auth-status-message">Registering your pubkey with the relay...</p>
+                    </div>
+                </div>
+                
+                <!-- Progress Steps -->
+                <div class="auth-progress">
+                    <div class="progress-step active" id="step-request">
+                        <div class="step-number">1</div>
+                        <div class="step-label">Join Request</div>
+                    </div>
+                    <div class="progress-step" id="step-verify">
+                        <div class="step-number">2</div>
+                        <div class="step-label">Verify Identity</div>
+                    </div>
+                    <div class="progress-step" id="step-complete">
+                        <div class="step-number">3</div>
+                        <div class="step-label">Access Granted</div>
+                    </div>
+                </div>
+                
+                <!-- Success Section (hidden initially) -->
+                <div id="auth-success" class="auth-success hidden">
+                    <div class="success-icon">
+                        <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"></path>
+                            <polyline points="22 4 12 14.01 9 11.01"></polyline>
+                        </svg>
+                    </div>
+                    <h4>Authentication Successful!</h4>
+                    <p>You now have write access to this relay.</p>
+                    
+                </div>
+                
+                <!-- Error Section (hidden initially) -->
+                <div id="auth-error" class="auth-error hidden">
+                    <div class="error-icon">
+                        <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <circle cx="12" cy="12" r="10"></circle>
+                            <line x1="12" y1="8" x2="12" y2="12"></line>
+                            <line x1="12" y1="16" x2="12.01" y2="16"></line>
+                        </svg>
+                    </div>
+                    <h4>Authentication Failed</h4>
+                    <p id="auth-error-message">An error occurred during authentication.</p>
+                    <button id="btn-retry-auth" class="btn btn-primary">Retry</button>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button id="btn-close-auth-modal" class="btn btn-primary hidden">Continue</button>
+                <button id="btn-cancel-auth" class="btn btn-secondary">Cancel</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Include the same script section from the original HTML -->
+    <script type="module">
+      console.log('Index: Script module starting at:', new Date().toISOString());
+      
+      // Import original NostrUtils from app.js (for compatibility)
+      import { NostrUtils } from './NostrUtils.js';
+      
+      // Import the new modules for real relay integration
+      import WebSocketRelayManager from './WebSocketRelayManager.js';
+      import NostrEvents from './NostrEvents.js';
+      import NostrGroupClient from './NostrGroupClient.js';
+      import NostrIntegration from './NostrIntegration.js';
+      import integrateNostrRelays from './AppIntegration.js';
+      import { HypertunaUtils } from './HypertunaUtils.js';
+      import MembersList from './MembersList.js';
+      // Initialize the original app logic
+      const App = {
+          currentPage: 'auth',
+          currentUser: null,
+          currentGroup: null,
+          currentGroupId: null,
+          relay: null,
+          
+          async init() {
+            console.log('[Index] App.init() called');
+            this.setupEventListeners();
+            this.setupAuthModalListeners();
+
+            // Preselect the groups view for returning users so relay events
+            // that fire during loadUserFromLocalStorage can rebuild the list.
+            const explicitLogout = localStorage.getItem('explicit_logout') === 'true';
+            const hasSavedUser = !!localStorage.getItem('nostr_user');
+            if (hasSavedUser && !explicitLogout) {
+                this.currentPage = 'groups';
+            }
+
+            await this.loadUserFromLocalStorage();
+            
+            // If user is already logged in, navigate to groups page
+            if (this.currentUser) {
+                this.currentPage = 'groups';
+            }
+            
+            this.updateUIState();
+        },
+          
+        async loadUserFromLocalStorage() {
+          const savedUser = localStorage.getItem('nostr_user');
+          if (savedUser) {
+              try {
+                  this.currentUser = JSON.parse(savedUser);
+                  
+                  // Check for Hypertuna configuration
+                  const hypertunaConfig = localStorage.getItem('hypertuna_config');
+                  if (hypertunaConfig) {
+                      this.currentUser.hypertunaConfig = JSON.parse(hypertunaConfig);
+                  }
+                  
+                  this.updateProfileDisplay();
+              } catch (e) {
+                  console.error('Error loading user data:', e);
+                  localStorage.removeItem('nostr_user');
+              }
+          }
+      },
+          
+          saveUserToLocalStorage() {
+              if (this.currentUser) {
+                  localStorage.setItem('nostr_user', JSON.stringify(this.currentUser));
+              } else {
+                  localStorage.removeItem('nostr_user');
+              }
+          },
+          
+          setupEventListeners() {
+              console.log('[Index] App.setupEventListeners() called');
+              
+              // Navigation
+              document.querySelectorAll('.nav-item').forEach(item => {
+                  item.addEventListener('click', e => {
+                      e.preventDefault();
+                      this.navigateTo(item.dataset.page);
+                  });
+              });
+              
+              // Auth page
+              document.getElementById('btn-generate-key').addEventListener('click', () => {
+                  document.getElementById('privateKey').value = NostrUtils.generatePrivateKey();
+              });
+              
+              document.getElementById('btn-login').addEventListener('click', () => {
+                  this.login();
+              });
+              
+              document.getElementById('btn-logout').addEventListener('click', () => {
+                  this.logout();
+              });
+
+              document.getElementById('btn-logout-profile').addEventListener('click', () => {
+                  this.logout();
+              });
+              
+              document.getElementById('btn-connect-relay').addEventListener('click', () => {
+                  this.connectRelay();
+              });
+              
+              // Toggle private key visibility
+              document.getElementById('btn-toggle-key-visibility').addEventListener('click', () => {
+                  const input = document.getElementById('privateKey');
+                  input.type = input.type === 'password' ? 'text' : 'password';
+              });
+              
+              // Group detail page
+              document.getElementById('btn-back-to-groups').addEventListener('click', () => {
+                  this.navigateTo('groups');
+              });
+              
+              document.getElementById('btn-join-group').addEventListener('click', () => {
+                  this.joinGroup();
+              });
+              
+              document.getElementById('btn-leave-group').addEventListener('click', () => {
+                  this.leaveGroup();
+              });
+              
+              document.getElementById('btn-send-message').addEventListener('click', () => {
+                  this.sendMessage();
+              });
+              
+              // Enter key to send message
+              document.getElementById('message-input').addEventListener('keypress', (e) => {
+                  if (e.key === 'Enter' && !e.shiftKey) {
+                      e.preventDefault();
+                      this.sendMessage();
+                  }
+              });
+              
+              // Auto-resize message input
+              document.getElementById('message-input').addEventListener('input', (e) => {
+                  e.target.style.height = 'auto';
+                  e.target.style.height = Math.min(e.target.scrollHeight, 120) + 'px';
+              });
+              
+              // Admin panel
+              const inviteMembers = document.getElementById('btn-invite-members');
+              if (inviteMembers) {
+                  inviteMembers.addEventListener('click', () => {
+                      this.showInviteMembersModal();
+                  });
+              }
+
+              const memberInvite = document.getElementById('btn-member-invite');
+              if (memberInvite) {
+                  memberInvite.addEventListener('click', () => {
+                      this.showInviteMembersModal();
+                  });
+              }
+
+              const viewInvites = document.getElementById('btn-view-invites');
+              if (viewInvites) {
+                  viewInvites.addEventListener('click', () => {
+                      this.showInvitesModal();
+                  });
+              }
+              
+              document.getElementById('btn-save-group-settings').addEventListener('click', () => {
+                  this.saveGroupSettings();
+              });
+              
+              document.getElementById('btn-delete-group').addEventListener('click', () => {
+                  this.showConfirmationModal(
+                      'Delete Relay',
+                      'Are you sure you want to delete this relay? This action cannot be undone.',
+                      () => this.deleteGroup()
+                  );
+              });
+              
+              // Create group page
+              document.getElementById('btn-create-new-group').addEventListener('click', () => {
+                  this.navigateTo('create-group');
+              });
+              
+              document.getElementById('btn-cancel-create').addEventListener('click', () => {
+                  this.navigateTo('groups');
+              });
+              
+              document.getElementById('btn-create-group').addEventListener('click', () => {
+                  this.createGroup();
+              });
+              
+              // Profile page
+              document.getElementById('btn-update-profile').addEventListener('click', () => {
+                  this.updateProfile();
+              });
+              
+              document.getElementById('btn-toggle-privkey').addEventListener('click', () => {
+                  const input = document.getElementById('profile-privkey-display');
+                  input.type = input.type === 'password' ? 'text' : 'password';
+              });
+              
+              document.getElementById('btn-update-relays').addEventListener('click', () => {
+                  const relayUrls = document.getElementById('profile-relay-urls').value
+                      .split('\n')
+                      .map(url => url.trim())
+                      .filter(url => url.length > 0);
+
+                  if (this.nostr) {
+                      this.configureRelays(relayUrls);
+                  }
+              });
+
+              // REMOVED: Worker button event listeners - handled by app.js
+              // The app.js module now handles all worker button event listeners
+              console.log('Index: Worker button listeners will be set up by app.js');
+              
+              // Settings button
+              document.getElementById('btn-settings').addEventListener('click', () => {
+                  // Navigate to profile/settings page
+                  this.navigateTo('profile');
+              });
+              
+              // Group menu button (shows settings tab)
+              document.getElementById('btn-group-menu').addEventListener('click', () => {
+                  this.switchTab('settings');
+              });
+              
+              // Tab navigation
+              document.querySelectorAll('.tab-btn').forEach(tab => {
+                  tab.addEventListener('click', () => {
+                      const tabName = tab.dataset.tab;
+                      this.switchTab(tabName);
+                  });
+              });
+              
+              // Copy buttons
+              document.querySelectorAll('.copy-btn').forEach(btn => {
+                btn.addEventListener('click', () => {
+                    const targetId = btn.dataset.copy;
+                    const target = document.getElementById(targetId);
+                    if (target) {
+                        const isPassword = target.type === 'password';
+                        if (isPassword) target.type = 'text';
+                        
+                        // Copy the current displayed value (npub/nsec or hex)
+                        target.select();
+                        document.execCommand('copy');
+                        
+                        if (isPassword) target.type = 'password';
+                        
+                        const originalText = btn.textContent;
+                        btn.textContent = 'Copied!';
+                        setTimeout(() => {
+                            btn.textContent = originalText;
+                        }, 2000);
+                    }
+                });
+            });
+              
+              // Modal handlers
+              document.getElementById('close-join-modal').addEventListener('click', () => {
+                  this.closeJoinModal();
+              });
+              
+              document.getElementById('btn-cancel-join').addEventListener('click', () => {
+                  this.closeJoinModal();
+              });
+              
+              document.getElementById('btn-confirm-join').addEventListener('click', () => {
+                  this.confirmJoinGroup();
+              });
+              
+              document.getElementById('close-confirmation-modal').addEventListener('click', () => {
+                  this.closeConfirmationModal();
+              });
+              
+              document.getElementById('btn-cancel-confirmation').addEventListener('click', () => {
+                  this.closeConfirmationModal();
+              });
+              
+              document.getElementById('close-invite-code-modal').addEventListener('click', () => {
+                  this.closeInviteCodeModal();
+              });
+
+              document.getElementById('btn-close-invite-code').addEventListener('click', () => {
+                  this.closeInviteCodeModal();
+              });
+
+              const closeInviteMembers = document.getElementById('close-invite-members-modal');
+              if (closeInviteMembers) {
+                  closeInviteMembers.addEventListener('click', () => {
+                      this.closeInviteMembersModal();
+                  });
+              }
+
+              const cancelInviteMembers = document.getElementById('btn-cancel-invite-members');
+              if (cancelInviteMembers) {
+                  cancelInviteMembers.addEventListener('click', () => {
+                      this.closeInviteMembersModal();
+                  });
+              }
+
+              const sendInvites = document.getElementById('btn-send-invites');
+              if (sendInvites) {
+                  sendInvites.addEventListener('click', () => {
+                      this.saveInviteMembers();
+                  });
+              }
+
+              const addInviteMember = document.getElementById('btn-add-invite-member');
+              if (addInviteMember) {
+                  addInviteMember.addEventListener('click', () => {
+                      const input = document.getElementById('invite-member-pubkey');
+                      const value = input.value.trim();
+                      if (!value) return;
+                      input.value = '';
+                      const pubkey = NostrUtils.normalizePublicKey(value);
+                      if (!pubkey || !/^[a-fA-F0-9]{64}$/.test(pubkey)) {
+                          alert('Invalid public key format.');
+                          return;
+                      }
+                      if (document.querySelector(`#invite-members-list [data-pubkey="${pubkey}"]`)) return;
+                      const name = `User_${NostrUtils.truncatePubkey(pubkey)}`;
+                      const npub = NostrUtils.hexToNpub(pubkey);
+                      const displayPub = NostrUtils.truncateNpub(npub);
+                      const item = document.createElement('div');
+                      item.className = 'invite-member-item';
+                      item.dataset.pubkey = pubkey;
+                      item.innerHTML = `
+                        <label>
+                          <input type="checkbox" data-pubkey="${pubkey}" checked>
+                          <div class="invite-member-info">
+                            <div class="name">${name}</div>
+                            <div class="pubkey">${displayPub}</div>
+                          </div>
+                        </label>`;
+                      const checkbox = item.querySelector('input');
+                      checkbox.addEventListener('change', () => {
+                          if (checkbox.checked) this.pendingInvites.add(pubkey); else this.pendingInvites.delete(pubkey);
+                      });
+                      this.pendingInvites.add(pubkey);
+                      document.getElementById('invite-members-list').prepend(item);
+                  });
+              }
+
+              const closeInvites = document.getElementById('close-invites-modal');
+              if (closeInvites) {
+                  closeInvites.addEventListener('click', () => {
+                      this.closeInvitesModal();
+                  });
+              }
+              
+              // Relay type selector
+              document.getElementById('relay-connection-type').addEventListener('change', (e) => {
+                  const isRealRelay = e.target.value === 'real';
+                  document.getElementById('real-relays-config').style.display = isRealRelay ? 'block' : 'none';
+              });
+              
+              // Click outside modals to close
+              window.addEventListener('click', (e) => {
+                  if (e.target.classList.contains('modal')) {
+                      if (e.target.id === 'join-group-modal') this.closeJoinModal();
+                      else if (e.target.id === 'confirmation-modal') this.closeConfirmationModal();
+                      else if (e.target.id === 'invite-code-modal') this.closeInviteCodeModal();
+                      else if (e.target.id === 'invites-modal') this.closeInvitesModal();
+                      else if (e.target.id === 'invite-members-modal') this.closeInviteMembersModal();
+                  }
+              });
+            // Setup list toggle for discover relays
+            if (typeof this.setupListToggle === 'function') {
+                this.setupListToggle();
+            }
+        },
+          
+          updateUIState() {
+              // Update navigation
+              document.querySelectorAll('.nav-item').forEach(item => {
+                  item.classList.toggle('active', item.dataset.page === this.currentPage);
+              });
+              
+              // Show/hide pages
+              document.querySelectorAll('.page').forEach(page => {
+                  const pageId = page.id.replace('page-', '');
+                  page.classList.toggle('active', pageId === this.currentPage);
+              });
+              
+              // Update authentication UI
+              const isLoggedIn = !!this.currentUser;
+              document.getElementById('profile-display').classList.toggle('hidden', !isLoggedIn);
+              document.getElementById('auth-form').classList.toggle('hidden', isLoggedIn);
+              
+              // Show/hide bottom nav based on login state
+              document.querySelector('.bottom-nav').style.display = isLoggedIn ? 'flex' : 'none';
+              
+              // If logged in and on auth page, switch to groups if connected to relay
+              if (isLoggedIn && this.currentPage === 'auth') {
+                  if (this.relay && this.relay.isConnected()) {
+                      this.navigateTo('groups');
+                  } else if (this.nostr && this.nostr.client.relayManager.getRelays().length > 0) {
+                      this.navigateTo('groups');
+                  }
+              }
+
+              // Handle profile page specifically
+              if (this.currentPage === 'profile' && isLoggedIn) {
+                  // Ensure profile is fully displayed including Hypertuna config
+                  setTimeout(() => {
+                      this.updateProfileDisplay();
+                      if (this.currentUser.hypertunaConfig) {
+                          this.updateHypertunaDisplay();
+                      }
+                  }, 50);
+              }
+              
+              // Additional UI updates based on current page
+              if (this.currentPage === 'groups' && isLoggedIn) {
+                  // Check if relay is connected
+                  if ((this.relay && this.relay.isConnected()) || 
+                      (this.nostr && this.nostr.client.relayManager.getRelays().length > 0)) {
+                      this.loadGroups();
+                  }
+              } else if (this.currentPage === 'group-detail' && isLoggedIn) {
+                  // Check if relay is connected
+                  if ((this.relay && this.relay.isConnected()) || 
+                      (this.nostr && this.nostr.client.relayManager.getRelays().length > 0)) {
+                      this.loadGroupDetails();
+                  }
+              }
+          },
+          
+          navigateTo(page) {
+              this.currentPage = page;
+              this.updateUIState();
+              
+              // Scroll to top when navigating
+              window.scrollTo(0, 0);
+          },
+          
+          switchTab(tabName) {
+              // Update active tab
+              document.querySelectorAll('.tab-btn').forEach(tab => {
+                  tab.classList.toggle('active', tab.dataset.tab === tabName);
+              });
+              
+              // Show active tab content
+              document.querySelectorAll('.tab-content').forEach(content => {
+                  content.classList.toggle('active', content.id === `tab-${tabName}`);
+              });
+          },
+          
+          login() {
+              const privateKey = document.getElementById('privateKey').value.trim();
+              
+              if (!privateKey) {
+                  alert('Please enter a valid private key or generate a new one.');
+                  return;
+              }
+              
+              try {
+                  const pubkey = NostrUtils.getPublicKey(privateKey);
+                  
+                  this.currentUser = {
+                      privateKey,
+                      pubkey,
+                      name: 'User_' + NostrUtils.truncatePubkey(pubkey),
+                      about: ''
+                  };
+                  
+                  this.saveUserToLocalStorage();
+                  this.updateProfileDisplay();
+                  
+                  // Connect to relay if not already connected
+                  if ((!this.relay || !this.relay.isConnected()) && (!this.nostr)) {
+                      this.connectRelay();
+                  } else {
+                      this.updateUIState();
+                  }
+              } catch (e) {
+                  console.error('Error logging in:', e);
+                  alert('Error: Invalid private key format.');
+              }
+          },
+          
+          // logout() {
+          //     // Disconnect from relays
+          //     if (this.relay && this.relay.isConnected()) {
+          //         this.relay.disconnect();
+          //     }
+              
+          //     if (this.nostr && this.nostr.client) {
+          //         // Disconnect from all relays
+          //         this.nostr.client.relayManager.getRelays().forEach(url => {
+          //             this.nostr.client.relayManager.removeRelay(url);
+          //         });
+          //     }
+              
+          //     window.stopWorker();
+          //     this.currentUser = null;
+          //     this.saveUserToLocalStorage();
+          //     this.navigateTo('auth');
+          //     this.updateUIState();
+          // },
+          
+          // Placeholder for connectRelay - will be replaced by integration
+          connectRelay() {
+              const relayType = document.getElementById('relay-connection-type').value;
+              
+              if (relayType === 'simulated') {
+                  // Use the local storage relay simulation
+                  this.relay = LocalRelay.init();
+                  this.relay.connect()
+                      .then(() => {
+                          document.getElementById('relay-status').className = 'status-message success';
+                          document.getElementById('relay-status').textContent = 'Connected to simulated relay';
+                          this.updateUIState();
+                      })
+                      .catch(e => {
+                          console.error('Error connecting to relay:', e);
+                          document.getElementById('relay-status').className = 'status-message error';
+                          document.getElementById('relay-status').textContent = 'Error connecting to simulated relay';
+                      });
+              } else {
+                  // Use real relay integration
+                  alert('The real relay connection will be handled by the NostrIntegration module.');
+              }
+          },
+          
+          updateProfileDisplay() {
+              if (!this.currentUser) return;
+              
+              const name = this.currentUser.name || 'User_' + NostrUtils.truncatePubkey(this.currentUser.pubkey);
+              
+              // Update profile display on auth page
+              const profileNameElement = document.getElementById('profile-name');
+              if (profileNameElement) {
+                  profileNameElement.textContent = name;
+              }
+              
+              const profilePubkeyElement = document.getElementById('profile-pubkey');
+              if (profilePubkeyElement) {
+                  profilePubkeyElement.textContent = this.currentUser.pubkey;
+              }
+              
+              // Update profile page
+              const profileNameInput = document.getElementById('profile-name-input');
+              if (profileNameInput) {
+                  profileNameInput.value = this.currentUser.name || '';
+              }
+              
+              const profileAboutInput = document.getElementById('profile-about-input');
+              if (profileAboutInput) {
+                  profileAboutInput.value = this.currentUser.about || '';
+              }
+              
+              const profilePubkeyDisplay = document.getElementById('profile-pubkey-display');
+              if (profilePubkeyDisplay) {
+                  profilePubkeyDisplay.value = this.currentUser.pubkey;
+              }
+              
+              const profilePrivkeyDisplay = document.getElementById('profile-privkey-display');
+              if (profilePrivkeyDisplay) {
+                  profilePrivkeyDisplay.value = this.currentUser.privateKey;
+              }
+              
+              // Populate relay list if using real relays
+              if (this.nostr && this.nostr.client) {
+                  const profileRelayUrls = document.getElementById('profile-relay-urls');
+                  if (profileRelayUrls) {
+                      profileRelayUrls.value = this.nostr.client.relayManager.getRelays().join('\n');
+                  }
+              }
+          },
+          
+          // Modal methods
+          showJoinModal(requireInvite = true) {
+              const modal = document.getElementById('join-group-modal');
+              modal.classList.add('show');
+              const inviteGroup = document.getElementById('invite-code-group');
+              const confirmBtn = document.getElementById('btn-confirm-join');
+              const messageEl = document.getElementById('join-modal-message');
+
+              if (requireInvite) {
+                  if (inviteGroup) inviteGroup.classList.remove('hidden');
+                  if (confirmBtn) confirmBtn.classList.remove('hidden');
+                  if (messageEl) messageEl.textContent = 'This relay requires an invite code to join.';
+                  document.getElementById('invite-code-input').value = '';
+                  document.getElementById('invite-code-input').focus();
+              } else {
+                  if (inviteGroup) inviteGroup.classList.add('hidden');
+                  if (confirmBtn) confirmBtn.classList.add('hidden');
+                  if (messageEl) messageEl.textContent = 'Sending join request...';
+              }
+          },
+          
+          closeJoinModal() {
+              document.getElementById('join-group-modal').classList.remove('show');
+          },
+          
+          showConfirmationModal(title, message, onConfirm) {
+              document.getElementById('confirmation-title').textContent = title;
+              document.getElementById('confirmation-message').textContent = message;
+              document.getElementById('confirmation-modal').classList.add('show');
+              
+              // Set up confirm action
+              const confirmBtn = document.getElementById('btn-confirm-action');
+              
+              // Remove previous event listeners
+              const newBtn = confirmBtn.cloneNode(true);
+              confirmBtn.parentNode.replaceChild(newBtn, confirmBtn);
+              
+              // Add new event listener
+              newBtn.addEventListener('click', () => {
+                  onConfirm();
+                  this.closeConfirmationModal();
+              });
+          },
+          
+          closeConfirmationModal() {
+              document.getElementById('confirmation-modal').classList.remove('show');
+          },
+          
+          showAddMemberModal() {
+              document.getElementById('add-member-modal').classList.add('show');
+              document.getElementById('add-member-pubkey').value = '';
+              document.getElementById('add-member-role').value = 'member';
+              document.getElementById('add-member-pubkey').focus();
+          },
+          
+          closeAddMemberModal() {
+              document.getElementById('add-member-modal').classList.remove('show');
+          },
+          
+          showInviteCodeModal(code) {
+              document.getElementById('invite-code-value').textContent = code;
+              document.getElementById('invite-code-modal').classList.add('show');
+          },
+          
+          closeInviteCodeModal() {
+              document.getElementById('invite-code-modal').classList.remove('show');
+          },
+
+          updateInviteSummary(invites) {
+              const summary = document.getElementById('invite-summary');
+              const countEl = document.getElementById('invite-count');
+              if (!summary || !countEl) return;
+              if (invites && invites.length > 0) {
+                  countEl.textContent = invites.length;
+                  summary.classList.remove('hidden');
+              } else {
+                  summary.classList.add('hidden');
+              }
+          },
+
+          updateJoinRequests(groupId, requests) {
+              const section = document.getElementById('join-requests-section');
+              const countEl = document.getElementById('join-request-count');
+              const list = document.getElementById('join-request-list');
+              if (!section || !countEl || !list) return;
+              if (!requests || requests.length === 0) {
+                  section.classList.add('hidden');
+                  countEl.textContent = '0';
+                  list.innerHTML = '';
+                  return;
+              }
+
+              countEl.textContent = requests.length;
+              list.innerHTML = '';
+              requests.forEach(req => {
+                  const profile = this.nostr.client.cachedProfiles.get(req.pubkey) || { name: req.pubkey };
+                  const item = document.createElement('div');
+                  item.className = 'join-request-item';
+                  const display = req.pubkey.substring(0,8) + '...';
+                  item.innerHTML = `
+                      <div class="request-info">
+                        <div class="request-name">${profile.name}</div>
+                        <div class="request-pubkey">${display}</div>
+                      </div>
+                      <div class="request-actions">
+                        <button class="btn btn-primary btn-small" data-action="approve" data-pub="${req.pubkey}">Approve</button>
+                        <button class="btn btn-danger btn-small" data-action="reject" data-pub="${req.pubkey}">Reject</button>
+                      </div>`;
+                  list.appendChild(item);
+              });
+
+              list.querySelectorAll('button[data-action="approve"]').forEach(btn => {
+                  btn.addEventListener('click', () => {
+                      this.approveJoinRequest(btn.dataset.pub);
+                  });
+              });
+              list.querySelectorAll('button[data-action="reject"]').forEach(btn => {
+                  btn.addEventListener('click', () => {
+                      this.rejectJoinRequest(btn.dataset.pub);
+                  });
+              });
+
+              section.classList.remove('hidden');
+          },
+
+          showInvitesModal() {
+              const modal = document.getElementById('invites-modal');
+              const list = document.getElementById('invite-list');
+              if (!modal || !list || !this.nostr) return;
+              list.innerHTML = '';
+              const invites = this.nostr.client.getInvites();
+              invites.forEach(inv => {
+                  const profile = this.nostr.client.cachedProfiles.get(inv.inviter) || { name: inv.inviter };
+                  const group = this.nostr.getGroupById(inv.groupId) || {};
+                  const item = document.createElement('div');
+                  item.className = 'invite-item';
+                  item.innerHTML = `
+                      <div class="invite-info">
+                        <div class="invite-relay">${group.name || inv.groupId}</div>
+                        <div class="invite-inviter">from ${profile.name}</div>
+                      </div>
+                      <div class="invite-actions">
+                        <button class="btn btn-primary btn-small" data-id="${inv.id}" data-action="accept">Accept</button>
+                        <button class="btn btn-secondary btn-small" data-id="${inv.id}" data-action="decline">Decline</button>
+                      </div>`;
+                  list.appendChild(item);
+              });
+
+              list.querySelectorAll('button[data-action="accept"]').forEach(btn => {
+                  btn.addEventListener('click', async () => {
+                      await this.acceptInvite(btn.dataset.id);
+                  });
+              });
+              list.querySelectorAll('button[data-action="decline"]').forEach(btn => {
+                  btn.addEventListener('click', () => {
+                      this.nostr.client.removeInvite(btn.dataset.id);
+                  });
+              });
+
+              modal.classList.add('show');
+          },
+
+          closeInvitesModal() {
+              document.getElementById('invites-modal').classList.remove('show');
+          },
+
+          async acceptInvite(inviteId) {
+              try {
+                  const invite = await this.nostr.client.acceptInvite(inviteId);
+                  if (window.joinRelayFromInvite) {
+                      await window.joinRelayFromInvite(invite.relayKey, invite.name, invite.about, invite.publicIdentifier || invite.groupId, invite.token, invite.fileSharing);
+                  } else if (window.joinRelayInstance) {
+                      await window.joinRelayInstance(invite.relayKey);
+                  }
+                  this.closeInvitesModal();
+              } catch (e) {
+                  console.error('Error accepting invite:', e);
+                  alert('Error accepting invite: ' + e.message);
+              }
+          },
+          
+          // Placeholder methods that will be replaced by integration
+          loadGroups() {
+              // This will be replaced by the integration, but adding example structure
+              const groupsList = document.getElementById('groups-list');
+              groupsList.innerHTML = '<div class="loading">Loading relays...</div>';
+          },
+          
+          loadGroupDetails() {
+              // This will be replaced by the integration
+          },
+          
+          loadGroupMessages() {
+              // This will be replaced by the integration
+          },
+          
+          loadGroupMembers() {
+              // This will be replaced by the integration
+          },
+          loadJoinRequests() {},
+          createGroup() {},
+          joinGroup() {},
+          sendJoinRequest() {},
+          confirmJoinGroup() {},
+          leaveGroup() {},
+          sendMessage() {},
+          createInvite() {},
+          addMember() {},
+          updateMemberRole() {},
+          removeMember() {},
+          approveJoinRequest() {},
+          rejectJoinRequest() {},
+          saveGroupSettings() {},
+          deleteGroup() {},
+          updateProfile() {},
+      };
+
+      // Expose App globally so worker handlers can access it
+      window.App = App;
+      
+      // Local storage based relay simulation - for backward compatibility
+      const LocalRelay = {
+          storageKey: 'nostr_local_relay_data',
+          connected: false,
+          relayPubkey: '00000000000000000000000000000000000000000000000000000000relay',
+          relayPrivkey: 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef',
+          
+          init() {
+              // Initialize the local storage if it doesn't exist
+              if (!localStorage.getItem(this.storageKey)) {
+                  localStorage.setItem(this.storageKey, JSON.stringify({
+                      events: [],
+                      inviteCodes: {}
+                  }));
+              }
+              return this;
+          },
+          
+          connect() {
+              this.connected = true;
+              return Promise.resolve();
+          },
+          
+          disconnect() {
+              this.connected = false;
+              return Promise.resolve();
+          },
+          
+          isConnected() {
+              return this.connected;
+          },
+          
+          // Other methods from your original LocalRelay implementation
+          // ...
+      };
+      
+      // Initialize the app with debugging
+      document.addEventListener('DOMContentLoaded', async () => {
+        console.log('[Index] DOMContentLoaded event fired at:', new Date().toISOString());
+
+        // Pre-load QRCode library early
+        if (!window.QRCode) {
+            console.log('[Index] Pre-loading QRCode library...');
+            const script = document.createElement('script');
+            script.src = 'https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js';
+            script.async = true;
+            
+            script.onload = () => {
+                console.log('[Index] QRCode library pre-loaded successfully');
+            };
+            
+            script.onerror = () => {
+                console.error('[Index] Failed to pre-load QRCode library');
+            };
+            
+            document.head.appendChild(script);
+        }
+        
+        // Integrate with real nostr relays FIRST, so App.init() uses the real methods
+        integrateNostrRelays(App);
+
+        // Initialize the original app logic
+        await App.init();
+        
+        // Setup the list toggle after integration
+        if (App.setupListToggle) {
+            App.setupListToggle();
+        }
+        
+        // Check for explicit logout flag
+        const explicitLogout = localStorage.getItem('explicit_logout') === 'true';
+
+        // Setup default relay URLs
+        const defaultRelays = [
+            'wss://relay.damus.io',
+            'wss://relay.nostr.band',
+            'wss://nos.lol'
+        ];
+
+        if (App.currentUser && !explicitLogout) {
+            document.getElementById('relay-list').value = defaultRelays.join('\n');
+            document.getElementById('profile-relay-urls').value = defaultRelays.join('\n');
+            
+            // Auto-connect for returning users
+            setTimeout(async () => {
+                console.log('[Index] Auto-connecting for returning user...');
+                try {
+                    // Start worker if available
+                    if (window.startWorker) {
+                      const key = await window.startWorker();
+                        if (key && App.currentUser && App.currentUser.hypertunaConfig) {
+                            App.currentUser.hypertunaConfig.swarmPublicKey = key;
+                            await HypertunaUtils.saveConfig(App.currentUser.hypertunaConfig);
+                            App.saveUserToLocalStorage();
+                            if (typeof App.updateHypertunaDisplay === 'function') {
+                                App.updateHypertunaDisplay();
+                            }
+                        }
+                        console.log('[Index] Worker started');
+                    }
+                } catch (e) {
+                    console.error('[Index] Error during auto-connect:', e);
+                }
+            }, 100);
+        }
+        console.log('[Index] Hypertuna Client initialized');
+        
+        // Add debugging for worker button state
+        setTimeout(() => {
+            console.log('[Index] Final button state check after 3 seconds:');
+            console.log('- Start button:', document.getElementById('start-worker'));
+            console.log('- Stop button:', document.getElementById('stop-worker'));
+            console.log('- window.startWorker:', typeof window.startWorker);
+            console.log('- window.stopWorker:', typeof window.stopWorker);
+            console.log('- window.debugButtonState:', typeof window.debugButtonState);
+            
+            if (window.debugButtonState) {
+                window.debugButtonState();
+            }
+        }, 3000);
+    });
+  </script>
+</body>
+</html>

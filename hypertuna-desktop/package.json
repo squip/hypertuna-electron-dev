@@ -1,0 +1,43 @@
+{
+  "name": "hypertuna-desktop",
+  "version": "1.0.0",
+  "description": "Hypertuna P2P Relay Server",
+  "main": "main.cjs",
+  "type": "module",
+  "license": "Apache-2.0",
+  "scripts": {
+    "start": "electron .",
+    "dev": "electron .",
+    "build": "electron-builder",
+    "dist": "electron-builder --publish=never",
+    "test": "brittle test/*.test.js"
+  },
+  "devDependencies": {
+    "brittle": "^3.0.0",
+    "electron": "^27.0.0",
+    "electron-builder": "^24.6.4"
+  },
+  "dependencies": {
+    "bech32": "^2.0.0",
+    "browserify-cipher": "^1.0.1",
+    "hypercore-crypto": "^3.6.0",
+    "noble-secp256k1": "^1.2.14",
+    "qrcodejs": "^1.0.0"
+  },
+  "build": {
+    "appId": "com.hypertuna.relay",
+    "productName": "Hypertuna Relay",
+    "directories": {
+      "output": "dist"
+    },
+    "mac": {
+      "category": "public.app-category.utilities"
+    },
+    "win": {
+      "target": "nsis"
+    },
+    "linux": {
+      "target": "AppImage"
+    }
+  }
+}

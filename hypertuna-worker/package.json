@@ -1,0 +1,40 @@
+{
+  "name": "hypertuna-worker",
+  "type": "module",
+  "main": "index.js",
+  "license": "Apache-2.0",
+  "scripts": {
+    "dev": "pear run -d .",
+    "test": "brittle test/*.test.js"
+  },
+  "pear": {
+    "name": "worker-app",
+    "type": "terminal",
+    "links": [
+      "http://localhost:1945",
+      "https://*"
+    ]
+  },
+  "dependencies": {
+    "@noble/curves": "^1.2.0",
+    "@noble/hashes": "^1.3.2",
+    "autobase": "^6.4.0",
+    "axios": "^1.6.2",
+    "b4a": "^1.6.4",
+    "compact-encoding": "^2.13.0",
+    "corestore": "^6.14.2",
+    "express": "^4.18.2",
+    "hyperbee": "^2.13.4",
+    "hypercore": "^10.25.0",
+    "hypercore-crypto": "^3.4.0",
+    "hyperdrive": "^13.0.1",
+    "hyperswarm": "^4.11.7",
+    "pear-interface": "^1.0.0",
+    "protomux": "^3.10.1",
+    "secp256k1": "^5.0.1"
+  },
+  "devDependencies": {
+    "brittle": "^3.0.0",
+    "pear-interface": "^1.0.0"
+  }
+}
