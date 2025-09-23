@@ -35,6 +35,16 @@ const relayMemberRemoves = new Map();
 const publicToKey = new Map();
 const keyToPublic = new Map();
 
+function getGatewayWebsocketProtocol(config) {
+    return config?.proxy_websocket_protocol === 'ws' ? 'ws' : 'wss';
+}
+
+function buildGatewayWebsocketBase(config) {
+    const protocol = getGatewayWebsocketProtocol(config);
+    const host = config?.proxy_server_address || 'localhost';
+    return `${protocol}://${host}`;
+}
+
 export function setRelayMapping(relayKey, publicIdentifier) {
     if (!relayKey) return;
     if (publicIdentifier) {
@@ -188,13 +198,14 @@ export async function createRelay(options = {}) {
         }
         
         console.log('[RelayAdapter] Created relay:', relayKey);
-        console.log(`[RelayAdapter] Connect at: wss://${config.proxy_server_address}/${relayKey}`);
+        const gatewayBase = buildGatewayWebsocketBase(config);
+        console.log(`[RelayAdapter] Connect at: ${gatewayBase}/${relayKey}`);
         
         // Build the authenticated relay URL
         const identifierPath = publicIdentifier ? 
             publicIdentifier.replace(':', '/') : 
             relayKey;
-        const baseUrl = `wss://${config.proxy_server_address}/${identifierPath}`;
+        const baseUrl = `${gatewayBase}/${identifierPath}`;
         const authenticatedUrl = authToken ? `${baseUrl}?token=${authToken}` : baseUrl;
         
         // Send relay initialized message for newly created relay
@@ -297,7 +308,7 @@ export async function joinRelay(options = {}) {
             const identifierPath = profileInfo?.public_identifier ?
                 profileInfo.public_identifier.replace(':', '/') :
                 relayKey;
-            const baseUrl = `wss://${config.proxy_server_address}/${identifierPath}`;
+            const baseUrl = `${buildGatewayWebsocketBase(config)}/${identifierPath}`;
             const connectionUrl = userAuthToken ? `${baseUrl}?token=${userAuthToken}` : baseUrl;
 
             // Still send initialized message since the UI might be waiting
@@ -382,7 +393,8 @@ export async function joinRelay(options = {}) {
         // Send relay initialized message for joined relay ONLY if not from auto-connect
         if (!fromAutoConnect && global.sendMessage) {
             const identifierPath = profileInfo.public_identifier ? profileInfo.public_identifier.replace(':', '/') : relayKey;
-            const baseGw = `wss://${config.proxy_server_address}/${identifierPath}`;
+            const gatewayBase = buildGatewayWebsocketBase(config);
+            const baseGw = `${gatewayBase}/${identifierPath}`;
             const gw = authToken ? `${baseGw}?token=${authToken}` : baseGw;
             console.log(`[RelayAdapter] [3] joinRelay -> Sending relay-initialized for ${relayKey} with URL ${gw}`);
             global.sendMessage({
@@ -398,7 +410,8 @@ export async function joinRelay(options = {}) {
         }
         
         const identifierPathReturn = profileInfo.public_identifier ? profileInfo.public_identifier.replace(':', '/') : relayKey;
-        const returnBase = `wss://${config.proxy_server_address}/${identifierPathReturn}`;
+        const gatewayBaseReturn = buildGatewayWebsocketBase(config);
+        const returnBase = `${gatewayBaseReturn}/${identifierPathReturn}`;
         return {
             success: true,
             relayKey,
@@ -578,7 +591,7 @@ export async function autoConnectStoredRelays(config) {
                     const identifierPath = profile.public_identifier ?
                         profile.public_identifier.replace(':', '/') :
                         profile.relay_key;
-                    const baseUrl = `wss://${config.proxy_server_address}/${identifierPath}`;
+                    const baseUrl = `${buildGatewayWebsocketBase(config)}/${identifierPath}`;
                     const connectionUrl = userAuthToken ? `${baseUrl}?token=${userAuthToken}` : baseUrl;
                     console.log(`[RelayAdapter] Built connection URL for ${profile.relay_key}: ${connectionUrl}`);
 
@@ -694,7 +707,7 @@ export async function autoConnectStoredRelays(config) {
                     const identifierPath = profile.public_identifier ?
                         profile.public_identifier.replace(':', '/') :
                         profile.relay_key;
-                    const baseUrl = `wss://${config.proxy_server_address}/${identifierPath}`;
+                    const baseUrl = `${buildGatewayWebsocketBase(config)}/${identifierPath}`;
                     const connectionUrl = userAuthToken ? `${baseUrl}?token=${userAuthToken}` : baseUrl;
 
                     // Send relay initialized message with auth info
@@ -882,7 +895,7 @@ export async function getActiveRelays() {
             peerCount,
             name: profile?.name || `Relay ${key.substring(0, 8)}`,
             description: profile?.description || '',
-            connectionUrl: `wss://${globalConfig?.proxy_server_address || 'localhost'}/${identifierPath}`,
+            connectionUrl: `${buildGatewayWebsocketBase(globalConfig || { proxy_server_address: 'localhost', proxy_websocket_protocol: 'wss' })}/${identifierPath}`,
             createdAt: profile?.created_at || profile?.joined_at || null,
             isActive: true
         });

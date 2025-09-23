@@ -24,6 +24,8 @@
     "compact-encoding": "^2.13.0",
     "corestore": "^6.14.2",
     "express": "^4.18.2",
+    "http": "^0.0.1-security",
+    "https": "^1.0.0",
     "hyperbee": "^2.13.4",
     "hypercore": "^10.25.0",
     "hypercore-crypto": "^3.4.0",

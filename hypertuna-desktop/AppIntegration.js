@@ -754,9 +754,11 @@ App.syncHypertunaConfigToFile = async function() {
             const updatedSettings = await HypertunaUtils.persistGatewaySettings(gatewayUrl);
             const normalizedGatewayUrl = updatedSettings.gatewayUrl;
             const proxyHost = updatedSettings.proxyHost;
+            const proxyWebsocketProtocol = updatedSettings.proxyWebsocketProtocol;
 
             this.currentUser.hypertunaConfig.gatewayUrl = normalizedGatewayUrl;
             this.currentUser.hypertunaConfig.proxy_server_address = proxyHost;
+            this.currentUser.hypertunaConfig.proxy_websocket_protocol = proxyWebsocketProtocol;
 
             await HypertunaUtils.saveConfig(this.currentUser.hypertunaConfig);
 
@@ -1609,6 +1611,7 @@ App.syncHypertunaConfigToFile = async function() {
             }
 
             const proxyServer = this.currentUser?.hypertunaConfig?.proxy_server_address || '';
+            const proxyProtocol = this.currentUser?.hypertunaConfig?.proxy_websocket_protocol || 'wss';
 
             if (relayKey && relayKey.authToken) {
                 await this.showAuthSuccess(relayKey, isPublic);
@@ -1623,6 +1626,7 @@ App.syncHypertunaConfigToFile = async function() {
                 isOpen,
                 relayKey,
                 proxyServer,
+                proxyProtocol,
                 npub,
                 relayKey?.relayUrl || null,
                 fileSharing

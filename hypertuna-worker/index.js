@@ -45,6 +45,16 @@ const defaultStorageDir = process.env.STORAGE_DIR || pearRuntime?.config?.storag
 
 global.userConfig = global.userConfig || { storage: defaultStorageDir }
 
+function getGatewayWebsocketProtocol(config) {
+  return config?.proxy_websocket_protocol === 'ws' ? 'ws' : 'wss'
+}
+
+function buildGatewayWebsocketBase(config) {
+  const protocol = getGatewayWebsocketProtocol(config)
+  const host = config?.proxy_server_address || 'localhost'
+  return `${protocol}://${host}`
+}
+
 // Variable to store the relay server module
 let relayServer = null
 let isShuttingDown = false
@@ -183,6 +193,7 @@ async function loadOrCreateConfig(customDir = null) {
     port: 1945,
     gatewayUrl: defaultGatewayUrl,
     proxy_server_address: defaultProxyHost,
+    proxy_websocket_protocol: gatewaySettings.proxyWebsocketProtocol || cachedGatewaySettings.proxyWebsocketProtocol,
     registerWithGateway: true,
     registerInterval: 300000,
     relays: [],
@@ -195,6 +206,10 @@ async function loadOrCreateConfig(customDir = null) {
     const loadedConfig = JSON.parse(configData)
     if (!('driveKey' in loadedConfig)) {
       loadedConfig.driveKey = null
+      await fs.writeFile(configPath, JSON.stringify(loadedConfig, null, 2))
+    }
+    if (!('proxy_websocket_protocol' in loadedConfig) || !loadedConfig.proxy_websocket_protocol) {
+      loadedConfig.proxy_websocket_protocol = defaultConfig.proxy_websocket_protocol
       await fs.writeFile(configPath, JSON.stringify(loadedConfig, null, 2))
     }
     return { ...defaultConfig, ...loadedConfig }
@@ -368,7 +383,7 @@ async function addAuthInfoToRelays(relays) {
         ? profile.public_identifier.replace(':', '/')
         : r.relayKey
 
-      const baseUrl = `wss://${config.proxy_server_address}/${identifierPath}`
+      const baseUrl = `${buildGatewayWebsocketBase(config)}/${identifierPath}`
       const connectionUrl = token ? `${baseUrl}?token=${token}` : baseUrl
 
       return {

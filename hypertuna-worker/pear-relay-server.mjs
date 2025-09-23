@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import process from 'node:process';
 import crypto from 'hypercore-crypto';
 import { setTimeout, setInterval, clearInterval } from 'node:timers';
+import http from 'node:http';
 import https from 'node:https';
 import b4a from 'b4a';
 import { URL } from 'node:url';
@@ -75,6 +76,27 @@ let healthState = {
   }
 };
 
+function getGatewayWebsocketProtocol(cfg = config) {
+  const protocol = cfg?.proxy_websocket_protocol === 'ws' ? 'ws' : 'wss';
+  return protocol;
+}
+
+function buildGatewayWebsocketBase(cfg = config) {
+  const protocol = getGatewayWebsocketProtocol(cfg);
+  const host = cfg?.proxy_server_address || 'localhost';
+  return `${protocol}://${host}`;
+}
+
+function resolveHttpClient(url) {
+  const protocol = url.protocol || new URL(url).protocol;
+  const isHttps = protocol === 'https:';
+  return {
+    client: isHttps ? https : http,
+    defaultPort: isHttps ? 443 : 80,
+    isHttps
+  };
+}
+
 // Initialize with enhanced config
 export async function initializeRelayServer(customConfig = {}) {
   console.log('[RelayServer] ========================================');
@@ -91,6 +113,7 @@ export async function initializeRelayServer(customConfig = {}) {
 
   const defaultGatewayUrl = gatewaySettings.gatewayUrl || fallbackGatewaySettings.gatewayUrl;
   const defaultProxyHost = gatewaySettings.proxyHost || fallbackGatewaySettings.proxyHost;
+  const defaultProxyProtocol = gatewaySettings.proxyWebsocketProtocol || fallbackGatewaySettings.proxyWebsocketProtocol;
 
   // Merge with defaults
   config = {
@@ -102,6 +125,7 @@ export async function initializeRelayServer(customConfig = {}) {
     proxy_publicKey: customConfig.proxy_publicKey || generateHexKey(),
     proxy_seed: customConfig.proxy_seed || generateHexKey(),
     proxy_server_address: customConfig.proxy_server_address || defaultProxyHost,
+    proxy_websocket_protocol: customConfig.proxy_websocket_protocol || defaultProxyProtocol,
     gatewayUrl: customConfig.gatewayUrl || defaultGatewayUrl,
     registerWithGateway: customConfig.registerWithGateway ?? true,
     registerInterval: customConfig.registerInterval || 60000,
@@ -171,7 +195,7 @@ export async function initializeRelayServer(customConfig = {}) {
                   const identifierPath = profile.public_identifier ?
                       profile.public_identifier.replace(':', '/') :
                       relayKey;
-                  const baseUrl = `wss://${config.proxy_server_address}/${identifierPath}`;
+                  const baseUrl = `${buildGatewayWebsocketBase(config)}/${identifierPath}`;
                   const connectionUrl = userAuthToken ? `${baseUrl}?token=${userAuthToken}` : baseUrl;
               
                   // Send registration complete message with CORRECT URL
@@ -562,13 +586,14 @@ function setupProtocolHandlers(protocol) {
         const activeRelays = await getActiveRelays();
         const profiles = await getRelayProfiles();
         
+        const gatewayBase = buildGatewayWebsocketBase(config);
         const relayList = activeRelays.map(relay => {
             const profile = profiles.find(p => p.relay_key === relay.relayKey) || {};
             
             // Use public identifier in the connection URL if available
             const connectionUrl = profile.public_identifier ? 
-                `wss://${config.proxy_server_address}/${profile.public_identifier.replace(':', '/')}` :
-                `wss://${config.proxy_server_address}/${relay.relayKey}`;
+                `${gatewayBase}/${profile.public_identifier.replace(':', '/')}` :
+                `${gatewayBase}/${relay.relayKey}`;
             
             return {
                 relayKey: relay.relayKey, // Still include for backward compatibility
@@ -933,7 +958,7 @@ function setupProtocolHandlers(protocol) {
         await publishMemberAddEvent(canonicalIdentifier, pubkey, result.token);
       }
 
-      const relayUrl = `wss://${config.proxy_server_address}/${canonicalIdentifier.replace(':', '/')}?token=${result.token}`;
+      const relayUrl = `${buildGatewayWebsocketBase(config)}/${canonicalIdentifier.replace(':', '/')}?token=${result.token}`;
 
       console.log(`[RelayServer] Auth finalized successfully`);
       updateMetrics(true);
@@ -1689,6 +1714,7 @@ async function registerWithGateway(relayProfileInfo = null) {
       
       // Build relay list with public identifiers
       const relayList = [];
+      const gatewayBase = buildGatewayWebsocketBase(config);
       for (const relay of activeRelays) {
           const profile = profiles.find(p => p.relay_key === relay.relayKey);
           if (profile) {
@@ -1696,16 +1722,20 @@ async function registerWithGateway(relayProfileInfo = null) {
                   identifier: profile.public_identifier || relay.relayKey,
                   name: profile.name || 'Unnamed Relay',
                   connectionUrl: profile.public_identifier ? 
-                      `wss://${config.proxy_server_address}/${profile.public_identifier.replace(':', '/')}` :
-                      `wss://${config.proxy_server_address}/${relay.relayKey}`
+                      `${gatewayBase}/${profile.public_identifier.replace(':', '/')}` :
+                      `${gatewayBase}/${relay.relayKey}`
               });
           }
       }
       
+      const advertisedAddress = config.proxy_server_address && config.proxy_server_address.includes(':')
+          ? config.proxy_server_address
+          : `${config.proxy_server_address}:${config.port}`;
+
       const registrationData = {
           publicKey,  // Hyperswarm public key for P2P connection
           relays: relayList, // List with public identifiers
-          address: `${config.proxy_server_address}:${config.port}`,
+          address: advertisedAddress,
           mode: 'hyperswarm',
           timestamp: new Date().toISOString()
       };
@@ -1733,20 +1763,23 @@ async function registerWithGateway(relayProfileInfo = null) {
       const postData = JSON.stringify(registrationData);
       
       const url = new URL(config.gatewayUrl);
+      const { client, defaultPort, isHttps } = resolveHttpClient(url);
       const options = {
           hostname: url.hostname,
-          port: url.port || 443,
+          port: url.port || defaultPort,
           path: '/register',
           method: 'POST',
           headers: {
               'Content-Type': 'application/json',
               'Content-Length': b4a.byteLength(postData)
-          },
-          rejectUnauthorized: false // For self-signed certs
+          }
       };
-      
+      if (isHttps) {
+          options.rejectUnauthorized = false; // For self-signed certs
+      }
+
       const response = await new Promise((resolve, reject) => {
-          const req = https.request(options, (res) => {
+          const req = client.request(options, (res) => {
               let data = '';
               res.on('data', (chunk) => data += chunk.toString());
               res.on('end', () => {
@@ -1838,7 +1871,7 @@ export async function createRelay(options) {
         
         // Update the result object with the definitive token and URL.
         result.authToken = authToken;
-        result.relayUrl = `wss://${config.proxy_server_address}/${result.publicIdentifier.replace(':', '/')}?token=${authToken}`;
+        result.relayUrl = `${buildGatewayWebsocketBase(config)}/${result.publicIdentifier.replace(':', '/')}?token=${authToken}`;
 
         await publishMemberAddEvent(result.publicIdentifier, adminPubkey, authToken, subnetHashes, 'admin');
         console.log(`[RelayServer] Auto-authorized creator ${adminPubkey.substring(0, 8)}...`);
@@ -1957,26 +1990,29 @@ export async function startJoinAuthentication(options) {
     const joinEvent = await createGroupJoinRequest(publicIdentifier, userNsec);
     console.log(`[RelayServer] Created join event ID: ${joinEvent.id.substring(0, 8)}...`);
     
-    // 2. Make an https.request to the gateway's /post/join/:identifier endpoint
+    // 2. Make an HTTP(S) request to the gateway's /post/join/:identifier endpoint
     const gatewayUrl = new URL(config.gatewayUrl);
+    const { client: joinClient, defaultPort: joinDefaultPort, isHttps: joinIsHttps } = resolveHttpClient(gatewayUrl);
     const postData = JSON.stringify({ event: joinEvent });
     
     const requestOptions = {
       hostname: gatewayUrl.hostname,
-      port: gatewayUrl.port || 443,
+      port: gatewayUrl.port || joinDefaultPort,
       path: `/post/join/${publicIdentifier}`,
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         'Content-Length': b4a.byteLength(postData)
-      },
-      rejectUnauthorized: false // For self-signed certs in dev
+      }
     };
+    if (joinIsHttps) {
+      requestOptions.rejectUnauthorized = false; // For self-signed certs in dev
+    }
     
     console.log(`[RelayServer] Sending join request to gateway: ${requestOptions.hostname}${requestOptions.path}`);
     
     const joinResponse = await new Promise((resolve, reject) => {
-      const req = https.request(requestOptions, (res) => {
+      const req = joinClient.request(requestOptions, (res) => {
         let data = '';
         res.on('data', (chunk) => data += chunk);
         res.on('end', () => {
@@ -2050,22 +2086,25 @@ export async function startJoinAuthentication(options) {
       iv: ivBase64
     });
 
+    const { client: verifyClient, defaultPort: verifyDefaultPort, isHttps: verifyIsHttps } = resolveHttpClient(verifyGatewayUrl);
     const verifyOptions = {
       hostname: verifyGatewayUrl.hostname,
-      port: verifyGatewayUrl.port || 443,
+      port: verifyGatewayUrl.port || verifyDefaultPort,
       path: verifyGatewayUrl.pathname,
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         'Content-Length': b4a.byteLength(verifyPostData)
-      },
-      rejectUnauthorized: false // For self-signed certs in dev
+      }
     };
+    if (verifyIsHttps) {
+      verifyOptions.rejectUnauthorized = false; // For self-signed certs in dev
+    }
 
     console.log(`[RelayServer] Sending verification request to gateway: ${verifyOptions.hostname}${verifyOptions.path}`);
 
     const verifyResponse = await new Promise((resolve, reject) => {
-      const req = https.request(verifyOptions, (res) => {
+      const req = verifyClient.request(verifyOptions, (res) => {
         let data = '';
         res.on('data', (chunk) => data += chunk);
         res.on('end', () => {

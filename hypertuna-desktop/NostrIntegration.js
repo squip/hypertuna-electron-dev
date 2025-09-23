@@ -448,7 +448,7 @@ class NostrIntegration {
      * @param {string} [authenticatedRelayUrl] - Tokenized relay URL from the worker
      * @returns {Promise<Object>} - Create group events collection
      */
-    async createGroup(name, about, isPublic, isOpen, relayKey, proxyServer, npub, authenticatedRelayUrl = null, fileSharing = false) {
+    async createGroup(name, about, isPublic, isOpen, relayKey, proxyServer, proxyProtocol, npub, authenticatedRelayUrl = null, fileSharing = false) {
         try {
             // Validate inputs
             if (typeof name !== 'string') {
@@ -473,6 +473,7 @@ class NostrIntegration {
                 isOpen,
                 relayKey,
                 proxyServer,
+                proxyProtocol,
                 npub,
                 authenticatedRelayUrl,
                 fileSharing

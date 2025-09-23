@@ -2349,6 +2349,7 @@ async fetchMultipleProfiles(pubkeys) {
             isOpen: Boolean(groupData.isOpen),
             identifier: groupData.identifier || null,
             proxyServer: groupData.proxyServer || '',
+            proxyProtocol: groupData.proxyProtocol || 'wss',
             authenticatedRelayUrl: groupData.authenticatedRelayUrl || null,
             fileSharing: Boolean(groupData.fileSharing)
         };
@@ -2365,7 +2366,8 @@ async fetchMultipleProfiles(pubkeys) {
             this.user.privateKey,
             normalizedData.identifier,
             normalizedData.proxyServer,
-            npub
+            npub,
+            normalizedData.proxyProtocol
         );
         
         const {

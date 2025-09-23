@@ -242,13 +242,13 @@ class NostrEvents {
      * @param {string} privateKey - Private key for signing
      * @returns {Promise<Object>} - Collection of events for group creation
      */
-    static async createGroupCreationEvent(name, about, isPublic, isOpen, fileSharing, privateKey, relayKey = null, proxyServer = '', npub) {
+    static async createGroupCreationEvent(name, about, isPublic, isOpen, fileSharing, privateKey, relayKey = null, proxyServer = '', npub, proxyProtocol = 'wss') {
         // Import the utility
         const { PublicIdentifierUtils } = await import('./PublicIdentifierUtils.js');
         
         // Generate the public identifier
         const publicIdentifier = PublicIdentifierUtils.generatePublicIdentifier(npub, name);
-        const wsUrl = PublicIdentifierUtils.generateWebSocketUrl(proxyServer, npub, name);
+        const wsUrl = PublicIdentifierUtils.generateWebSocketUrl(proxyServer, npub, name, proxyProtocol);
         
         console.log(`Creating group with public identifier: ${publicIdentifier}`);
         console.log(`WebSocket URL: ${wsUrl}`);

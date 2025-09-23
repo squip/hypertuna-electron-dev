@@ -1,6 +1,7 @@
 const DEFAULT_SETTINGS = Object.freeze({
   gatewayUrl: 'https://hypertuna.com',
-  proxyHost: 'hypertuna.com'
+  proxyHost: 'hypertuna.com',
+  proxyWebsocketProtocol: 'wss'
 });
 
 const LOCAL_STORAGE_KEY = 'hypertuna_gateway_settings';
@@ -36,6 +37,13 @@ function normalizeSettings(raw = {}) {
     }
   }
 
+  if (typeof raw.proxyWebsocketProtocol === 'string') {
+    const trimmed = raw.proxyWebsocketProtocol.trim().toLowerCase();
+    if (trimmed === 'ws' || trimmed === 'wss') {
+      normalized.proxyWebsocketProtocol = trimmed;
+    }
+  }
+
   return normalized;
 }
 
@@ -43,11 +51,28 @@ function deriveProxyHost(value) {
   if (!value || typeof value !== 'string') return '';
   try {
     const url = new URL(value);
-    return url.hostname;
+    return url.host;
   } catch (_err) {
     const stripped = value.replace(/^https?:\/\//i, '').split('/')[0] || value;
     return stripped.trim();
   }
+}
+
+function deriveProxyWebsocketProtocol(value) {
+  if (!value || typeof value !== 'string') return DEFAULT_SETTINGS.proxyWebsocketProtocol;
+  try {
+    const url = new URL(value);
+    if (url.protocol === 'http:') return 'ws';
+    if (url.protocol === 'https:') return 'wss';
+    if (url.protocol === 'ws:') return 'ws';
+    if (url.protocol === 'wss:') return 'wss';
+  } catch (_err) {
+    if (/^http:/.test(value)) return 'ws';
+    if (/^https:/.test(value)) return 'wss';
+    if (/^ws:/.test(value)) return 'ws';
+    if (/^wss:/.test(value)) return 'wss';
+  }
+  return DEFAULT_SETTINGS.proxyWebsocketProtocol;
 }
 
 function withDefaults(raw = {}) {
@@ -57,6 +82,10 @@ function withDefaults(raw = {}) {
   if (!merged.proxyHost) {
     const derived = deriveProxyHost(merged.gatewayUrl);
     merged.proxyHost = derived || DEFAULT_SETTINGS.proxyHost;
+  }
+
+  if (!merged.proxyWebsocketProtocol) {
+    merged.proxyWebsocketProtocol = deriveProxyWebsocketProtocol(merged.gatewayUrl);
   }
 
   return merged;
@@ -209,6 +238,10 @@ export async function updateGatewaySettings(partial) {
 
 export function deriveGatewayProxyHost(url) {
   return deriveProxyHost(url);
+}
+
+export function deriveGatewayWebsocketProtocol(url) {
+  return deriveProxyWebsocketProtocol(url);
 }
 
 export function invalidateGatewaySettingsCache() {

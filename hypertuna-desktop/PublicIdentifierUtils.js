@@ -28,7 +28,7 @@ export class PublicIdentifierUtils {
      * @param {string} relayName - The relay name
      * @returns {string} - WebSocket URL
      */
-    static generateWebSocketUrl(proxyServer, npub, relayName) {
+    static generateWebSocketUrl(proxyServer, npub, relayName, protocol = 'wss') {
         const camelCaseName = relayName
             .split(' ')
             .map((word, index) => {
@@ -39,7 +39,8 @@ export class PublicIdentifierUtils {
             })
             .join('');
         
-        return `wss://${proxyServer}/${npub}/${camelCaseName}`;
+        const normalizedProtocol = protocol === 'ws' ? 'ws' : 'wss';
+        return `${normalizedProtocol}://${proxyServer}/${npub}/${camelCaseName}`;
     }
     
     /**

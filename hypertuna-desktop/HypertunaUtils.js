@@ -11,7 +11,8 @@ import {
     loadGatewaySettings,
     updateGatewaySettings,
     getCachedGatewaySettings,
-    deriveGatewayProxyHost
+    deriveGatewayProxyHost,
+    deriveGatewayWebsocketProtocol
 } from '../shared/config/GatewaySettings.mjs';
 
 // Import hypercore-crypto library
@@ -49,9 +50,14 @@ export class HypertunaUtils {
         return deriveGatewayProxyHost(value);
     }
 
+    static getGatewayWebsocketProtocol(value) {
+        return deriveGatewayWebsocketProtocol(value);
+    }
+
     static async persistGatewaySettings(gatewayUrl) {
         const proxyHost = deriveGatewayProxyHost(gatewayUrl);
-        return updateGatewaySettings({ gatewayUrl, proxyHost });
+        const proxyWebsocketProtocol = deriveGatewayWebsocketProtocol(gatewayUrl);
+        return updateGatewaySettings({ gatewayUrl, proxyHost, proxyWebsocketProtocol });
     }
     
     /**
@@ -263,6 +269,7 @@ export class HypertunaUtils {
         const effectiveGatewayUrl = gatewayUrl || await this.getDefaultGatewayUrl();
         const cachedSettings = this.getCachedGatewaySettings();
         const proxyHost = this.getGatewayHost(effectiveGatewayUrl) || cachedSettings.proxyHost;
+        const proxyWebsocketProtocol = this.getGatewayWebsocketProtocol(effectiveGatewayUrl) || cachedSettings.proxyWebsocketProtocol;
         try {
             // Derive the keypair for Hypertuna relay
             const derivedKeypair = await this.deriveHypertunaKeypair(privateKeyHex);
@@ -290,6 +297,7 @@ export class HypertunaUtils {
                 // Server configuration
                 proxy_server_address: proxyHost,
                 gatewayUrl: effectiveGatewayUrl,
+                proxy_websocket_protocol: proxyWebsocketProtocol,
                 registerWithGateway: true,
                 registerInterval: 300000
             };
@@ -321,6 +329,7 @@ export class HypertunaUtils {
                 // Server configuration
                 proxy_server_address: proxyHost,
                 gatewayUrl: effectiveGatewayUrl,
+                proxy_websocket_protocol: proxyWebsocketProtocol,
                 registerWithGateway: true,
                 registerInterval: 300000
             };
@@ -490,6 +499,7 @@ export class HypertunaUtils {
         
         // Ensure bech32 values are present (for backward compatibility)
         if (config) {
+            const gatewaySettings = await this.getGatewaySettings();
             // Check if bech32 values are missing and generate them
             if (config.nostr_pubkey_hex && !config.nostr_npub) {
                 config.nostr_npub = NostrUtils.hexToNpub(config.nostr_pubkey_hex);
@@ -525,6 +535,15 @@ export class HypertunaUtils {
 
             if (typeof config.driveKey === 'undefined') {
                 config.driveKey = null;
+            }
+
+            if (!config.proxy_server_address && gatewaySettings.proxyHost) {
+                config.proxy_server_address = gatewaySettings.proxyHost;
+            }
+
+            if (!config.proxy_websocket_protocol) {
+                const referenceGatewayUrl = config.gatewayUrl || gatewaySettings.gatewayUrl;
+                config.proxy_websocket_protocol = gatewaySettings.proxyWebsocketProtocol || this.getGatewayWebsocketProtocol(referenceGatewayUrl);
             }
         }
 
