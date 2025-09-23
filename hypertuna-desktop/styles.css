@@ -1033,6 +1033,11 @@ members-list,.member-list {
     box-shadow: var(--shadow-md);
 }
 
+.profile-container h3,
+.summary-title {
+    font-size: 1.25rem;
+}
+
 .profile-section.accordion-card {
     padding: 0;
     overflow: hidden;
@@ -1114,9 +1119,9 @@ members-list,.member-list {
 
 .profile-card-content {
     display: flex;
-    gap: var(--space-xl);
-    align-items: flex-start;
-    flex-wrap: wrap;
+    flex-direction: column;
+    align-items: center;
+    gap: var(--space-lg);
 }
 
 .profile-avatar-section {
@@ -1124,16 +1129,21 @@ members-list,.member-list {
     flex-direction: column;
     gap: var(--space-md);
     margin-bottom: 0;
-    align-items: flex-start;
+    align-items: center;
+    text-align: center;
+    width: 100%;
 }
 
 .profile-form {
-    flex: 1;
-    min-width: 16rem;
+    width: 100%;
+    max-width: 26rem;
+    margin: var(--space-md) auto 0;
+    display: flex;
+    flex-direction: column;
 }
 
 .profile-card-content .profile-avatar-large {
-    margin: 0;
+    margin: 0 auto;
 }
 
 .profile-avatar-small {
@@ -1173,6 +1183,19 @@ members-list,.member-list {
 
 .button-group.align-end {
     justify-content: flex-end;
+}
+
+.button-group.align-center {
+    justify-content: center;
+}
+
+#profile-details-card:not(.collapsed) .summary-avatar,
+#profile-details-card:not(.collapsed) #profile-summary-name {
+    display: none;
+}
+
+#profile-details-card:not(.collapsed) .accordion-summary {
+    justify-content: center;
 }
 
 .keys-section {
@@ -2216,6 +2239,15 @@ members-list,.member-list {
     color: var(--text-primary);
 }
 
+.status-indicator {
+    width: 0.75rem;
+    height: 0.75rem;
+    border-radius: var(--radius-full);
+    background: var(--border-color);
+    box-shadow: none;
+    flex-shrink: 0;
+}
+
 .relay-empty-state {
     text-align: center;
     padding: var(--space-md);
@@ -2253,6 +2285,17 @@ members-list,.member-list {
 .status-indicator.status-error {
     background: var(--error-color);
     box-shadow: 0 0 10px rgba(255, 68, 68, 0.4);
+}
+
+.status-stack {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-xs);
+    margin-bottom: var(--space-md);
+}
+
+.status-subtext {
+    font-size: 0.9rem;
 }
 
 .accordion-card.collapsed .relay-list-item {

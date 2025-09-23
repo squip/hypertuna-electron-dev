@@ -3175,7 +3175,11 @@ App.setupFollowingModalListeners = function() {
         this.discoveryRelays = nextRelays;
 
         if (!skipRender) {
-            this.renderDiscoveryRelays();
+            if (typeof this.renderDiscoveryRelays === 'function') {
+                this.renderDiscoveryRelays();
+            } else {
+                this._pendingDiscoveryRender = true;
+            }
         }
     };
 
@@ -3207,7 +3211,9 @@ App.setupFollowingModalListeners = function() {
         if (entries.length === 0) {
             if (emptyState) emptyState.classList.remove('hidden');
             listEl.classList.add('hidden');
-            this.updateDiscoveryRelaySummary();
+            if (typeof this.updateDiscoveryRelaySummary === 'function') {
+                this.updateDiscoveryRelaySummary();
+            }
             return;
         }
 
@@ -3215,10 +3221,13 @@ App.setupFollowingModalListeners = function() {
         listEl.classList.remove('hidden');
 
         entries.forEach((entry) => {
-            const status = this.nostr?.client?.relayManager?.getRelayStatus(entry.connection) ||
+            const rawStatus = this.nostr?.client?.relayManager?.getRelayStatus(entry.connection) ||
                 this.nostr?.client?.relayManager?.getRelayStatus(entry.normalized) ||
                 'closed';
-            const indicatorStatus = ['open', 'connecting', 'closed', 'error'].includes(status) ? status : 'closed';
+            const indicatorStatusSource = rawStatus === 'pending' ? 'connecting' : rawStatus;
+            const indicatorStatus = ['open', 'connecting', 'closed', 'error'].includes(indicatorStatusSource)
+                ? indicatorStatusSource
+                : 'closed';
 
             const item = document.createElement('li');
             item.className = 'relay-list-item';
@@ -3230,6 +3239,7 @@ App.setupFollowingModalListeners = function() {
             const indicator = document.createElement('span');
             indicator.className = `status-indicator status-${indicatorStatus}`;
             indicator.setAttribute('aria-hidden', 'true');
+            indicator.title = indicatorStatus.charAt(0).toUpperCase() + indicatorStatus.slice(1);
 
             const text = document.createElement('span');
             text.className = 'relay-url';
@@ -3247,8 +3257,15 @@ App.setupFollowingModalListeners = function() {
             listEl.appendChild(item);
         });
 
-        this.updateDiscoveryRelaySummary();
+        if (typeof this.updateDiscoveryRelaySummary === 'function') {
+            this.updateDiscoveryRelaySummary();
+        }
     };
+
+    if (App._pendingDiscoveryRender) {
+        App._pendingDiscoveryRender = false;
+        App.renderDiscoveryRelays();
+    }
 
     /**
      * Update discovery relay summary count text

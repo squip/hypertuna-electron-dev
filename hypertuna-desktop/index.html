@@ -367,7 +367,7 @@
                                         <label for="profile-about-input">About</label>
                                         <textarea id="profile-about-input" class="form-textarea" rows="3" placeholder="Tell us about yourself"></textarea>
                                     </div>
-                                    <div class="button-group align-start">
+                                    <div class="button-group align-center">
                                         <button id="btn-update-profile" class="btn btn-primary">Update Profile</button>
                                     </div>
                                 </div>
@@ -441,13 +441,11 @@
 
                     <div class="profile-section">
                         <h3>Hypertuna Relay Node</h3>
-                        <div class="form-group">
+                        <div class="status-stack">
                             <span id="worker-status-text">Stopped</span>
+                            <span class="status-subtext muted">Gateway: <span id="gateway-status">Not Registered</span></span>
                         </div>
-                        <div class="form-group muted">
-                            Gateway: <span id="gateway-status">Not Registered</span>
-                        </div>
-                        <div class="button-group">
+                        <div class="button-group align-start">
                             <button id="start-worker" class="btn btn-primary">Start</button>
                             <button id="stop-worker" class="btn btn-secondary">Stop</button>
                         </div>
