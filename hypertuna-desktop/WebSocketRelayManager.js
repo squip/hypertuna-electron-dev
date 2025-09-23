@@ -533,16 +533,35 @@ _validateEvent(event) {
      */
     removeRelay(url) {
         const { cleanUrl } = this.parseRelayUrl(url);
-        if (!this.relays.has(cleanUrl)) {
+        const normalizedKey = cleanUrl.startsWith('wss://') || cleanUrl.startsWith('ws://')
+            ? cleanUrl
+            : `wss://${cleanUrl}`;
+
+        if (!this.relays.has(normalizedKey)) {
             return;
         }
 
-        const relay = this.relays.get(cleanUrl);
+        const relay = this.relays.get(normalizedKey);
         if (relay.conn && relay.conn.readyState !== WebSocket.CLOSED) {
             relay.conn.close();
         }
 
-        this.relays.delete(cleanUrl);
+        const relayType = this.relayTypes.get(normalizedKey) || this.relayTypes.get(cleanUrl);
+        if (relayType === 'discovery') {
+            this.discoveryRelays.delete(normalizedKey);
+            this.discoveryRelays.delete(cleanUrl);
+        } else if (relayType === 'group') {
+            for (const [groupId, relayUrl] of this.groupRelays.entries()) {
+                if (relayUrl === normalizedKey || relayUrl === cleanUrl) {
+                    this.groupRelays.delete(groupId);
+                }
+            }
+        }
+
+        this.relayTypes.delete(normalizedKey);
+        this.relayTypes.delete(cleanUrl);
+
+        this.relays.delete(normalizedKey);
     }
 
     /**
@@ -551,6 +570,14 @@ _validateEvent(event) {
      */
     getRelays() {
         return Array.from(this.relays.keys());
+    }
+
+    /**
+     * Get configured discovery relays
+     * @returns {Array}
+     */
+    getDiscoveryRelays() {
+        return Array.from(this.discoveryRelays);
     }
 
     /**

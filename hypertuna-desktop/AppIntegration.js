@@ -46,6 +46,11 @@ function integrateNostrRelays(App) {
     
     // Create nostr integration
     App.nostr = new NostrIntegration(App);
+
+    // Track discovery relay connections displayed in profile UI
+    App.discoveryRelays = new Map();
+    App.discoveryRelayStorageKey = 'discovery_relay_whitelist';
+    App.persistedDiscoveryRelays = [];
     
 
     
@@ -117,6 +122,10 @@ function integrateNostrRelays(App) {
                 this.showGroupListSpinner();
                 await this.nostr.init(this.currentUser);
                 console.log('Nostr integration initialized');
+
+                if (this.configureRelays) {
+                    await this.configureRelays(this.nostr.relayUrls || [], { skipNetwork: true, includePersisted: true });
+                }
 
                 // Fetch the latest profile metadata so avatar images load
                 try {
@@ -399,6 +408,10 @@ function integrateNostrRelays(App) {
                     await this.nostr.init(this.currentUser);
                     console.log('Nostr integration initialized for existing user');
 
+                    if (this.configureRelays) {
+                        await this.configureRelays(this.nostr.relayUrls || [], { skipNetwork: true, includePersisted: true });
+                    }
+
                     // Ensure local profile cache is populated so avatars display
                     try {
                         const profile = await this.nostr.client.fetchUserProfile(this.currentUser.pubkey);
@@ -504,7 +517,23 @@ function integrateNostrRelays(App) {
         if (profileAboutInput) {
             profileAboutInput.value = profile.about || '';
         }
-        
+
+        const summaryName = document.getElementById('profile-summary-name');
+        if (summaryName) {
+            summaryName.textContent = name || 'Display Name';
+        }
+
+        const summaryAbout = document.getElementById('profile-summary-about');
+        if (summaryAbout) {
+            if (profile.about) {
+                summaryAbout.textContent = profile.about;
+                summaryAbout.classList.remove('muted');
+            } else {
+                summaryAbout.textContent = 'Add something about yourself';
+                summaryAbout.classList.add('muted');
+            }
+        }
+
         const profilePubkeyDisplay = document.getElementById('profile-pubkey-display');
         if (profilePubkeyDisplay) {
             // Display as npub by default
@@ -540,13 +569,10 @@ function integrateNostrRelays(App) {
         // Update profile pictures in all locations
         updateProfilePicture('#profile-display .profile-avatar-large');
         updateProfilePicture('.page#page-profile .profile-avatar-large');
-        
-        // Populate relay list if using real relays
-        if (this.nostr && this.nostr.client) {
-            const profileRelayUrls = document.getElementById('profile-relay-urls');
-            if (profileRelayUrls) {
-                profileRelayUrls.value = this.nostr.client.relayManager.getRelays().join('\n');
-            }
+        updateProfilePicture('#profile-details-card .profile-avatar-small');
+
+        if (typeof this.renderDiscoveryRelays === 'function') {
+            this.renderDiscoveryRelays();
         }
         
         // Update Hypertuna configuration if available
@@ -612,10 +638,6 @@ function integrateNostrRelays(App) {
                         </button>
                         <button class="copy-btn" data-copy="hypertuna-seed-display">Copy</button>
                     </div>
-                </div>
-                <div class="form-group">
-                    <label for="hypertuna-gateway-url">Gateway Server Address</label>
-                    <input type="text" id="hypertuna-gateway-url" class="form-input" placeholder="${placeholderGateway}">
                 </div>
                 <button id="btn-update-hypertuna" class="btn btn-primary">Update Hypertuna Settings</button>
             `;
@@ -3061,12 +3083,316 @@ App.setupFollowingModalListeners = function() {
         }
     };
     
+    /**
+     * Normalize a relay URL for display and connection
+     * @param {string} url - Relay URL entered by the user
+     * @returns {{normalized: string, connection: string, display: string}|null}
+     */
+    App.normalizeRelayUrl = function(url) {
+        if (!url) return null;
+
+        let value = url.trim();
+        if (!value) return null;
+
+        if (!/^wss?:\/\//i.test(value)) {
+            value = `wss://${value}`;
+        }
+
+        try {
+            const parsed = new URL(value);
+            const basePath = parsed.pathname && parsed.pathname !== '/' ? parsed.pathname.replace(/\/$/, '') : '';
+            const normalized = `${parsed.protocol}//${parsed.hostname}${parsed.port ? `:${parsed.port}` : ''}${basePath}`;
+            const connection = parsed.toString();
+            const display = normalized || connection;
+
+            return { normalized, connection, display };
+        } catch (error) {
+            console.warn('[App] Invalid relay URL provided:', url, error);
+            return null;
+        }
+    };
+
+    /**
+     * Merge relay URL lists while preserving order and removing duplicates
+     * @param {string[]} primary - Primary list of relay URLs
+     * @param {string[]} secondary - Secondary list of relay URLs to append if missing
+     * @returns {string[]} - Merged array of connection URLs
+     */
+    App.mergeRelayLists = function(primary = [], secondary = []) {
+        const merged = [];
+        const seen = new Set();
+
+        const append = (value) => {
+            const normalized = this.normalizeRelayUrl(value);
+            if (!normalized) return;
+            if (seen.has(normalized.normalized)) return;
+            seen.add(normalized.normalized);
+            merged.push(normalized.connection);
+        };
+
+        primary.forEach(append);
+        secondary.forEach(append);
+
+        return merged;
+    };
+
+    App.loadPersistedDiscoveryRelays = function() {
+        if (typeof localStorage === 'undefined') {
+            return [];
+        }
+
+        try {
+            const raw = localStorage.getItem(this.discoveryRelayStorageKey);
+            if (!raw) return [];
+
+            const parsed = JSON.parse(raw);
+            if (!Array.isArray(parsed)) return [];
+
+            return this.mergeRelayLists(parsed, []);
+        } catch (error) {
+            console.warn('Failed to load discovery relay whitelist:', error);
+            return [];
+        }
+    };
+
+    /**
+     * Replace current discovery relay list with provided URLs
+     * @param {string[]|Array} relayUrls - Array of relay URLs
+     * @param {Object} [options]
+     * @param {boolean} [options.skipRender] - Skip UI render (used internally)
+     */
+    App.setDiscoveryRelays = function(relayUrls = [], { skipRender = false } = {}) {
+        const nextRelays = new Map();
+
+        relayUrls.forEach((entry) => {
+            const value = typeof entry === 'string' ? entry : entry?.connection || entry?.url;
+            const normalized = this.normalizeRelayUrl(value);
+            if (normalized) {
+                nextRelays.set(normalized.normalized, normalized);
+            }
+        });
+
+        this.discoveryRelays = nextRelays;
+
+        if (!skipRender) {
+            this.renderDiscoveryRelays();
+        }
+    };
+
+    App.persistedDiscoveryRelays = App.loadPersistedDiscoveryRelays();
+    if (App.persistedDiscoveryRelays.length > 0 && App.discoveryRelays.size === 0) {
+        App.setDiscoveryRelays(App.persistedDiscoveryRelays);
+    }
+
+    /**
+     * Get discovery relay URLs for connection
+     * @returns {string[]}
+     */
+    App.getDiscoveryRelays = function() {
+        return Array.from(this.discoveryRelays.values()).map(entry => entry.connection);
+    };
+
+    /**
+     * Render discovery relay list UI
+     */
+    App.renderDiscoveryRelays = function() {
+        const listEl = document.getElementById('discovery-relay-list');
+        const emptyState = document.getElementById('discovery-relay-empty');
+        if (!listEl) return;
+
+        const entries = Array.from(this.discoveryRelays.values());
+
+        listEl.innerHTML = '';
+
+        if (entries.length === 0) {
+            if (emptyState) emptyState.classList.remove('hidden');
+            listEl.classList.add('hidden');
+            this.updateDiscoveryRelaySummary();
+            return;
+        }
+
+        if (emptyState) emptyState.classList.add('hidden');
+        listEl.classList.remove('hidden');
+
+        entries.forEach((entry) => {
+            const status = this.nostr?.client?.relayManager?.getRelayStatus(entry.connection) ||
+                this.nostr?.client?.relayManager?.getRelayStatus(entry.normalized) ||
+                'closed';
+            const indicatorStatus = ['open', 'connecting', 'closed', 'error'].includes(status) ? status : 'closed';
+
+            const item = document.createElement('li');
+            item.className = 'relay-list-item';
+            item.dataset.relayUrl = entry.normalized;
+
+            const main = document.createElement('div');
+            main.className = 'relay-item-main';
+
+            const indicator = document.createElement('span');
+            indicator.className = `status-indicator status-${indicatorStatus}`;
+            indicator.setAttribute('aria-hidden', 'true');
+
+            const text = document.createElement('span');
+            text.className = 'relay-url';
+            text.textContent = entry.display;
+
+            main.append(indicator, text);
+
+            const removeBtn = document.createElement('button');
+            removeBtn.className = 'relay-remove-btn';
+            removeBtn.type = 'button';
+            removeBtn.innerHTML = '&times;';
+            removeBtn.setAttribute('aria-label', `Remove relay ${entry.display}`);
+
+            item.append(main, removeBtn);
+            listEl.appendChild(item);
+        });
+
+        this.updateDiscoveryRelaySummary();
+    };
+
+    /**
+     * Update discovery relay summary count text
+     */
+    App.updateDiscoveryRelaySummary = function() {
+        const summaryEl = document.getElementById('discovery-relay-count');
+        if (!summaryEl) return;
+
+        const manager = this.nostr?.client?.relayManager || null;
+        const entries = Array.from(this.discoveryRelays.values());
+
+        let connected = 0;
+        if (manager) {
+            entries.forEach(entry => {
+                const status = manager.getRelayStatus(entry.connection) || manager.getRelayStatus(entry.normalized);
+                if (status === 'open') connected += 1;
+            });
+        }
+
+        const label = connected === 1 ? 'Connected Relay' : 'Connected Relays';
+        summaryEl.textContent = `${connected} ${label}`;
+    };
+
+    /**
+     * Persist discovery relay whitelist to local storage
+     */
+    App.persistDiscoveryRelays = async function() {
+        if (typeof localStorage === 'undefined') {
+            return;
+        }
+
+        const list = this.getDiscoveryRelays();
+
+        try {
+            localStorage.setItem(this.discoveryRelayStorageKey, JSON.stringify(list));
+            this.persistedDiscoveryRelays = list;
+        } catch (error) {
+            console.warn('Failed to persist discovery relay whitelist:', error);
+            throw error;
+        }
+    };
+
+    /**
+     * Add a relay to discovery list and update connections
+     * @param {string} url - Relay URL
+     */
+    App.addDiscoveryRelay = async function(url) {
+        const normalized = this.normalizeRelayUrl(url);
+        if (!normalized) {
+            alert('Please enter a valid relay URL (e.g. wss://relay.example.com).');
+            return;
+        }
+
+        if (this.discoveryRelays.has(normalized.normalized)) {
+            alert('That relay is already in your discovery list.');
+            return;
+        }
+
+        const updated = [...this.getDiscoveryRelays(), normalized.connection];
+        await this.configureRelays(updated);
+    };
+
+    /**
+     * Remove a relay from discovery list
+     * @param {string} normalizedUrl - Normalized relay URL key
+     */
+    App.removeDiscoveryRelay = async function(normalizedUrl) {
+        if (!this.discoveryRelays.has(normalizedUrl)) {
+            return;
+        }
+
+        const remaining = Array.from(this.discoveryRelays.entries())
+            .filter(([key]) => key !== normalizedUrl)
+            .map(([, entry]) => entry.connection);
+
+        await this.configureRelays(remaining);
+    };
+
+    /**
+     * Handler for add relay button/input
+     */
+    App.handleAddDiscoveryRelay = function() {
+        const input = document.getElementById('new-discovery-relay');
+        if (!input) return;
+
+        const value = input.value.trim();
+        if (!value) {
+            input.focus();
+            return;
+        }
+
+        this.addDiscoveryRelay(value)
+            .then(() => {
+                input.value = '';
+                input.focus();
+            })
+            .catch(err => {
+                console.error('Failed to add discovery relay:', err);
+            });
+    };
+
+    /**
+     * Initialize accordion interactions on profile page
+     */
+    App.initializeProfileAccordions = function() {
+        const toggles = document.querySelectorAll('.accordion-toggle');
+        toggles.forEach(toggle => {
+            const card = toggle.closest('.accordion-card');
+            if (!card) return;
+
+            const expanded = !card.classList.contains('collapsed');
+            toggle.setAttribute('aria-expanded', expanded ? 'true' : 'false');
+
+            toggle.addEventListener('click', () => {
+                const isCollapsed = card.classList.toggle('collapsed');
+                toggle.setAttribute('aria-expanded', (!isCollapsed).toString());
+            });
+        });
+    };
+
     // Add method to configure relays
-    App.configureRelays = function(relayUrls) {
-        if (!this.nostr) return;
-        
-        // Update relay URLs
-        this.nostr.updateRelays(relayUrls);
+    App.configureRelays = async function(relayUrls = [], options = {}) {
+        const urls = Array.isArray(relayUrls) ? relayUrls : [];
+        const { skipNetwork = false, skipRender = false, includePersisted = false } = options;
+
+        const finalUrls = includePersisted
+            ? this.mergeRelayLists(urls, this.persistedDiscoveryRelays)
+            : urls;
+
+        this.setDiscoveryRelays(finalUrls, { skipRender });
+
+        try {
+            await this.persistDiscoveryRelays();
+        } catch (err) {
+            console.warn('Failed to persist discovery relays:', err);
+        }
+
+        if (!skipNetwork && this.nostr) {
+            try {
+                await this.nostr.updateRelays(this.getDiscoveryRelays());
+            } catch (err) {
+                console.error('Failed to update discovery relays:', err);
+            }
+        }
     };
     
     // Add method to track Hypertuna ID 
@@ -3106,6 +3432,10 @@ App.setupFollowingModalListeners = function() {
         App.nostr.init(App.currentUser)
             .then(async () => {
                 console.log('Nostr integration initialized with discovery relays');
+
+                if (App.configureRelays) {
+                    await App.configureRelays(App.nostr.relayUrls || [], { skipNetwork: true, includePersisted: true });
+                }
 
                 // Populate profile cache for the logged in user
                 try {

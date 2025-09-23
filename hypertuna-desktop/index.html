@@ -335,24 +335,43 @@
                         <h2>Your Profile</h2>
                     </div>
                     
-                    <div class="profile-section">
-                        <div class="profile-avatar-section">
-                            <div class="profile-avatar-large">
-                                <span>👤</span>
+                    <div class="profile-section accordion-card collapsed" id="profile-details-card">
+                        <button class="accordion-toggle" type="button" data-target="profile-details-card">
+                            <div class="accordion-header">
+                                <div class="accordion-summary">
+                                    <div class="summary-avatar profile-avatar-small">
+                                        <span>👤</span>
+                                    </div>
+                                    <div class="summary-text">
+                                        <div id="profile-summary-name" class="summary-title">Display Name</div>
+                                    </div>
+                                </div>
+                                <span class="accordion-icon" aria-hidden="true"></span>
                             </div>
-                            <button class="btn btn-secondary btn-small">Change Avatar</button>
-                        </div>
-                        
-                        <div class="profile-form">
-                            <div class="form-group">
-                                <label for="profile-name-input">Display Name</label>
-                                <input type="text" id="profile-name-input" class="form-input" placeholder="Enter your display name">
+                        </button>
+                        <div class="accordion-content" id="profile-details-content">
+                            <div class="profile-card-content">
+                                <div class="profile-avatar-section">
+                                    <div class="profile-avatar-large">
+                                        <span>👤</span>
+                                    </div>
+                                    <button class="btn btn-secondary btn-small">Change Avatar</button>
+                                </div>
+
+                                <div class="profile-form">
+                                    <div class="form-group">
+                                        <label for="profile-name-input">Display Name</label>
+                                        <input type="text" id="profile-name-input" class="form-input" placeholder="Enter your display name">
+                                    </div>
+                                    <div class="form-group">
+                                        <label for="profile-about-input">About</label>
+                                        <textarea id="profile-about-input" class="form-textarea" rows="3" placeholder="Tell us about yourself"></textarea>
+                                    </div>
+                                    <div class="button-group align-start">
+                                        <button id="btn-update-profile" class="btn btn-primary">Update Profile</button>
+                                    </div>
+                                </div>
                             </div>
-                            <div class="form-group">
-                                <label for="profile-about-input">About</label>
-                                <textarea id="profile-about-input" class="form-textarea" rows="3" placeholder="Tell us about yourself"></textarea>
-                            </div>
-                            <button id="btn-update-profile" class="btn btn-primary">Update Profile</button>
                         </div>
                     </div>
                     
@@ -390,13 +409,34 @@
                         </div>
                     </div>
                     
-                    <div class="profile-section">
-                        <h3>Network Discovery Relays</h3>
-                        <div class="form-group">
-                            <label for="profile-relay-urls">Connected Relays</label>
-                            <textarea id="profile-relay-urls" class="form-textarea" rows="4" placeholder="wss://relay.damus.io&#10;wss://relay.nostr.band&#10;wss://nos.lol"></textarea>
+                    <div class="profile-section accordion-card collapsed" id="discovery-relays-card">
+                        <button class="accordion-toggle" type="button" data-target="discovery-relays-card">
+                            <div class="accordion-header">
+                                <div class="accordion-heading-text">
+                                    <h3>Network Discovery Relays</h3>
+                                    <span id="discovery-relay-count" class="accordion-subtitle">0 Connected Relays</span>
+                                </div>
+                                <span class="accordion-icon" aria-hidden="true"></span>
+                            </div>
+                        </button>
+                        <div class="accordion-content" id="discovery-relays-content">
+                            <div class="relay-list-container">
+                                <ul id="discovery-relay-list" class="relay-list" aria-live="polite"></ul>
+                                <div class="relay-empty-state hidden" id="discovery-relay-empty">
+                                    <p>Add relays to discover new Hypertuna peers.</p>
+                                </div>
+                            </div>
+                            <div class="relay-actions">
+                                <div class="form-group">
+                                    <label for="new-discovery-relay">Add Relay</label>
+                                    <div class="relay-input-group">
+                                        <input type="text" id="new-discovery-relay" class="form-input" placeholder="wss://relay.example.com">
+                                        <button id="btn-add-relay" class="btn btn-secondary btn-small">Add</button>
+                                    </div>
+                                </div>
+                                <div class="relay-hint muted">Relays added here are saved to your discovery whitelist.</div>
+                            </div>
                         </div>
-                        <button id="btn-update-relays" class="btn btn-secondary">Update Relays</button>
                     </div>
 
                     <div class="profile-section">
@@ -404,63 +444,57 @@
                         <div class="form-group">
                             <span id="worker-status-text">Stopped</span>
                         </div>
+                        <div class="form-group muted">
+                            Gateway: <span id="gateway-status">Not Registered</span>
+                        </div>
                         <div class="button-group">
                             <button id="start-worker" class="btn btn-primary">Start</button>
                             <button id="stop-worker" class="btn btn-secondary">Stop</button>
                         </div>
-                        <div class="form-group">Gateway: <span id="gateway-status">Not Registered</span></div>
                     </div>
 
-                    <div class="profile-section" id="gateway-section">
-                        <div class="gateway-header">
-                            <h3>Hypertuna Gateway</h3>
-                            <div class="gateway-actions">
+                    <div class="profile-section accordion-card collapsed" id="gateway-section">
+                        <button class="accordion-toggle" type="button" data-target="gateway-section">
+                            <div class="accordion-header">
+                                <div class="accordion-heading-text">
+                                    <h3>Hypertuna Gateway</h3>
+                                    <div class="gateway-status-card">
+                                        <div id="gateway-status-indicator" class="status-indicator"></div>
+                                        <div class="status-details">
+                                            <div class="status-item"><span class="label">Status</span><span id="gateway-status-text" class="value">Offline</span></div>
+                                            <div class="status-item"><span class="label">Uptime</span><span id="gateway-uptime" class="value">—</span></div>
+                                            <div class="status-item"><span class="label">Port</span><span id="gateway-port" class="value">—</span></div>
+                                            <div class="status-item"><span class="label">Peers</span><span id="gateway-peers" class="value">0</span></div>
+                                            <div class="status-item"><span class="label">Relays</span><span id="gateway-relays" class="value">0</span></div>
+                                        </div>
+                                    </div>
+                                </div>
+                                <span class="accordion-icon" aria-hidden="true"></span>
+                            </div>
+                        </button>
+                        <div class="accordion-content" id="gateway-section-content">
+                            <div class="form-group">
+                                <label for="hypertuna-gateway-url">Gateway Server Address</label>
+                                <input type="text" id="hypertuna-gateway-url" class="form-input" placeholder="https://localhost:8443">
+                            </div>
+                            <div class="gateway-options">
+                                <label class="toggle-label">
+                                    <input type="checkbox" id="gateway-lan-toggle" class="toggle-checkbox">
+                                    <span class="toggle-switch"></span>
+                                    <span class="toggle-text">Advertise on Local Network</span>
+                                </label>
+                                <p class="toggle-description">Enable LAN IP broadcasting for other devices on your network.</p>
+                                <label class="toggle-label">
+                                    <input type="checkbox" id="gateway-public-toggle" class="toggle-checkbox">
+                                    <span class="toggle-switch"></span>
+                                    <span class="toggle-text">Detect Public IP</span>
+                                </label>
+                                <p class="toggle-description">Detect and advertise your public IP (requires port forwarding).</p>
+                            </div>
+                            <div class="button-group align-start">
                                 <button id="gateway-start" class="btn btn-primary">Start</button>
                                 <button id="gateway-stop" class="btn btn-secondary">Stop</button>
                             </div>
-                        </div>
-                        <div class="gateway-status-card">
-                            <div id="gateway-status-indicator" class="status-indicator"></div>
-                            <div class="status-details">
-                                <div><span class="label">Status</span><span id="gateway-status-text" class="value">Offline</span></div>
-                                <div><span class="label">Uptime</span><span id="gateway-uptime" class="value">—</span></div>
-                                <div><span class="label">Port</span><span id="gateway-port" class="value">—</span></div>
-                                <div><span class="label">Peers</span><span id="gateway-peers" class="value">0</span></div>
-                                <div><span class="label">Relays</span><span id="gateway-relays" class="value">0</span></div>
-                            </div>
-                        </div>
-                        <div class="gateway-options">
-                            <label class="toggle-label">
-                                <input type="checkbox" id="gateway-lan-toggle" class="toggle-checkbox">
-                                <span class="toggle-switch"></span>
-                                <span class="toggle-text">Advertise on Local Network</span>
-                            </label>
-                            <p class="toggle-description">Enable LAN IP broadcasting for other devices on your network.</p>
-                            <label class="toggle-label">
-                                <input type="checkbox" id="gateway-public-toggle" class="toggle-checkbox">
-                                <span class="toggle-switch"></span>
-                                <span class="toggle-text">Detect Public IP</span>
-                            </label>
-                            <p class="toggle-description">Detect and advertise your public IP (requires port forwarding).</p>
-                        </div>
-                        <div class="gateway-health">
-                            <h4>Network Health</h4>
-                            <div class="metric-row">
-                                <span class="metric-label">Hyperswarm</span>
-                                <span class="metric-value" id="gateway-hyperswarm-status">—</span>
-                            </div>
-                            <div class="metric-row">
-                                <span class="metric-label">Gateway</span>
-                                <span class="metric-value" id="gateway-service-status">—</span>
-                            </div>
-                            <div class="metric-row">
-                                <span class="metric-label">Last Check</span>
-                                <span class="metric-value" id="gateway-last-check">—</span>
-                            </div>
-                        </div>
-                        <div class="gateway-logs">
-                            <button id="gateway-toggle-logs" class="btn btn-secondary">Show Logs</button>
-                            <div id="gateway-logs-container" class="gateway-logs-container hidden"></div>
                         </div>
                     </div>
 
@@ -930,16 +964,36 @@
                   input.type = input.type === 'password' ? 'text' : 'password';
               });
               
-              document.getElementById('btn-update-relays').addEventListener('click', () => {
-                  const relayUrls = document.getElementById('profile-relay-urls').value
-                      .split('\n')
-                      .map(url => url.trim())
-                      .filter(url => url.length > 0);
+              const addRelayBtn = document.getElementById('btn-add-relay');
+              if (addRelayBtn) {
+                  addRelayBtn.addEventListener('click', () => {
+                      this.handleAddDiscoveryRelay();
+                  });
+              }
 
-                  if (this.nostr) {
-                      this.configureRelays(relayUrls);
-                  }
-              });
+              const relayInput = document.getElementById('new-discovery-relay');
+              if (relayInput) {
+                  relayInput.addEventListener('keydown', (event) => {
+                      if (event.key === 'Enter') {
+                          event.preventDefault();
+                          this.handleAddDiscoveryRelay();
+                      }
+                  });
+              }
+
+              const relayList = document.getElementById('discovery-relay-list');
+              if (relayList) {
+                  relayList.addEventListener('click', (event) => {
+                      const button = event.target.closest('.relay-remove-btn');
+                      if (!button) return;
+
+                      const listItem = button.closest('li');
+                      const relayKey = listItem?.dataset?.relayUrl;
+                      if (relayKey) {
+                          this.removeDiscoveryRelay(relayKey).catch(err => console.error('Failed to remove relay:', err));
+                      }
+                  });
+              }
 
               // REMOVED: Worker button event listeners - handled by app.js
               // The app.js module now handles all worker button event listeners
@@ -1293,12 +1347,8 @@
                   profilePrivkeyDisplay.value = this.currentUser.privateKey;
               }
               
-              // Populate relay list if using real relays
-              if (this.nostr && this.nostr.client) {
-                  const profileRelayUrls = document.getElementById('profile-relay-urls');
-                  if (profileRelayUrls) {
-                      profileRelayUrls.value = this.nostr.client.relayManager.getRelays().join('\n');
-                  }
+              if (typeof this.renderDiscoveryRelays === 'function') {
+                  this.renderDiscoveryRelays();
               }
           },
           
@@ -1590,7 +1640,11 @@
         if (App.setupListToggle) {
             App.setupListToggle();
         }
-        
+
+        if (App.initializeProfileAccordions) {
+            App.initializeProfileAccordions();
+        }
+
         // Check for explicit logout flag
         const explicitLogout = localStorage.getItem('explicit_logout') === 'true';
 
@@ -1602,9 +1656,15 @@
         ];
 
         if (App.currentUser && !explicitLogout) {
-            document.getElementById('relay-list').value = defaultRelays.join('\n');
-            document.getElementById('profile-relay-urls').value = defaultRelays.join('\n');
-            
+            if (App.configureRelays) {
+                await App.configureRelays(defaultRelays, { includePersisted: true });
+            }
+
+            const relayListInput = document.getElementById('relay-list');
+            if (relayListInput) {
+                relayListInput.value = defaultRelays.join('\n');
+            }
+
             // Auto-connect for returning users
             setTimeout(async () => {
                 console.log('[Index] Auto-connecting for returning user...');

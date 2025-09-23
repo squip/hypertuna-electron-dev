@@ -143,11 +143,17 @@ class NostrIntegration {
         this.client.on('relay:connect', ({ relayUrl }) => {
             console.log(`Connected to relay: ${relayUrl}`);
             this._updateRelayStatus();
+            if (typeof this.app.renderDiscoveryRelays === 'function') {
+                this.app.renderDiscoveryRelays();
+            }
         });
         
         this.client.on('relay:disconnect', ({ relayUrl }) => {
             console.log(`Disconnected from relay: ${relayUrl}`);
             this._updateRelayStatus();
+            if (typeof this.app.renderDiscoveryRelays === 'function') {
+                this.app.renderDiscoveryRelays();
+            }
         });
         
         // Group events - with throttling to prevent excessive updates
@@ -315,16 +321,39 @@ class NostrIntegration {
         this.relayUrls = urls;
         
         // First, disconnect from any relays not in the new list
-        const currentRelays = this.client.relayManager.getRelays();
+        const relayManager = this.client.relayManager;
+        const desiredMap = new Map();
+
+        urls.forEach((entry) => {
+            const { cleanUrl } = relayManager.parseRelayUrl(entry);
+            let connectionUrl = entry;
+
+            if (!/^wss?:\/\//i.test(connectionUrl)) {
+                connectionUrl = cleanUrl.startsWith('wss://') || cleanUrl.startsWith('ws://')
+                    ? cleanUrl
+                    : `wss://${cleanUrl}`;
+            }
+
+            const normalizedKey = cleanUrl.startsWith('wss://') || cleanUrl.startsWith('ws://')
+                ? cleanUrl
+                : `wss://${cleanUrl}`;
+
+            desiredMap.set(normalizedKey, connectionUrl);
+        });
+
+        const currentRelays = relayManager.getRelays();
         currentRelays.forEach(url => {
-            if (!urls.includes(url)) {
-                this.client.relayManager.removeRelay(url);
+            if (!desiredMap.has(url)) {
+                relayManager.removeRelay(url);
             }
         });
-        
-        // Connect to new relays
-        const promiseArray = urls.map(url => this.client.relayManager.addRelay(url));
-        await Promise.allSettled(promiseArray);
+
+        const connectPromises = [];
+        desiredMap.forEach((connectionUrl) => {
+            connectPromises.push(relayManager.addTypedRelay(connectionUrl, 'discovery'));
+        });
+
+        await Promise.allSettled(connectPromises);
         
         this._updateRelayStatus();
     }

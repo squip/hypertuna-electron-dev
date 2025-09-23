@@ -1033,14 +1033,146 @@ members-list,.member-list {
     box-shadow: var(--shadow-md);
 }
 
+.profile-section.accordion-card {
+    padding: 0;
+    overflow: hidden;
+}
+
+.accordion-toggle {
+    width: 100%;
+    padding: var(--space-lg);
+    background: none;
+    border: none;
+    text-align: left;
+    cursor: pointer;
+    display: block;
+}
+
+.accordion-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-lg);
+}
+
+.accordion-heading-text {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-xs);
+}
+
+.accordion-summary {
+    display: flex;
+    align-items: center;
+    gap: var(--space-md);
+    margin-top: var(--space-sm);
+}
+
+.accordion-subtitle {
+    font-size: 0.875rem;
+    color: var(--text-secondary);
+}
+
+.accordion-icon {
+    width: 1.25rem;
+    height: 1.25rem;
+    border: 2px solid var(--border-color);
+    border-radius: var(--radius-full);
+    position: relative;
+    flex-shrink: 0;
+}
+
+.accordion-icon::before,
+.accordion-icon::after {
+    content: '';
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    width: 60%;
+    height: 2px;
+    background-color: var(--text-secondary);
+    transform: translate(-50%, -50%);
+    transition: transform var(--transition-fast);
+}
+
+.accordion-icon::after {
+    transform: translate(-50%, -50%) rotate(90deg);
+}
+
+.accordion-card:not(.collapsed) .accordion-icon::after {
+    transform: translate(-50%, -50%) rotate(0deg);
+}
+
+.accordion-content {
+    padding: 0 var(--space-xl) var(--space-xl);
+    display: block;
+}
+
+.accordion-card.collapsed .accordion-content {
+    display: none;
+}
+
+.profile-card-content {
+    display: flex;
+    gap: var(--space-xl);
+    align-items: flex-start;
+    flex-wrap: wrap;
+}
+
 .profile-avatar-section {
-    text-align: center;
-    margin-bottom: var(--space-xl);
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-md);
+    margin-bottom: 0;
+    align-items: flex-start;
 }
 
 .profile-form {
-    max-width: 24rem;
-    margin: 0 auto;
+    flex: 1;
+    min-width: 16rem;
+}
+
+.profile-card-content .profile-avatar-large {
+    margin: 0;
+}
+
+.profile-avatar-small {
+    width: 3rem;
+    height: 3rem;
+    border-radius: var(--radius-full);
+    background: var(--surface-hover);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 1.5rem;
+    flex-shrink: 0;
+}
+
+.summary-title {
+    font-weight: 600;
+    color: var(--text-primary);
+}
+
+.summary-subtitle {
+    font-size: 0.875rem;
+}
+
+.muted {
+    color: var(--text-secondary);
+}
+
+.button-group {
+    display: flex;
+    gap: var(--space-sm);
+    margin-top: var(--space-md);
+}
+
+.button-group.align-start {
+    justify-content: flex-start;
+}
+
+.button-group.align-end {
+    justify-content: flex-end;
 }
 
 .keys-section {
@@ -1978,7 +2110,6 @@ members-list,.member-list {
     border: 1px solid rgba(255, 255, 255, 0.08);
     border-radius: var(--radius-md);
     padding: var(--space-md);
-    margin-top: var(--space-md);
 }
 
 .gateway-status-card .status-indicator {
@@ -2000,28 +2131,136 @@ members-list,.member-list {
 }
 
 .gateway-status-card .status-details {
-    display: grid;
-    gap: 6px;
-  }
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-md);
+}
 
-.gateway-status-card .status-details .label {
-    display: block;
-    font-size: 12px;
+.gateway-status-card .status-item {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    min-width: 4.5rem;
+}
+
+.gateway-status-card .status-item .label {
+    font-size: 0.75rem;
     color: var(--text-muted);
     text-transform: uppercase;
     letter-spacing: 0.05em;
 }
 
-.gateway-status-card .status-details .value {
-    font-size: 14px;
+.gateway-status-card .status-item .value {
+    font-size: 0.875rem;
     color: var(--text-primary);
-    margin-left: var(--space-xs);
 }
 
 .gateway-options {
     margin-top: var(--space-md);
     display: grid;
     gap: var(--space-sm);
+}
+
+.relay-list-container {
+    margin-bottom: var(--space-lg);
+}
+
+.relay-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-sm);
+}
+
+.relay-list-item {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-md);
+    padding: var(--space-sm) var(--space-md);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: var(--radius-md);
+    background: rgba(255, 255, 255, 0.02);
+}
+
+.relay-item-main {
+    display: flex;
+    align-items: center;
+    gap: var(--space-sm);
+    flex: 1;
+    min-width: 0;
+}
+
+.relay-url {
+    font-family: var(--font-mono);
+    font-size: 0.875rem;
+    color: var(--text-primary);
+    overflow-wrap: anywhere;
+}
+
+.relay-remove-btn {
+    width: 2rem;
+    height: 2rem;
+    border-radius: var(--radius-full);
+    border: none;
+    background: var(--surface-hover);
+    color: var(--text-secondary);
+    cursor: pointer;
+    transition: background-color var(--transition-fast);
+}
+
+.relay-remove-btn:hover {
+    background: var(--border-color);
+    color: var(--text-primary);
+}
+
+.relay-empty-state {
+    text-align: center;
+    padding: var(--space-md);
+    border: 1px dashed var(--border-color);
+    border-radius: var(--radius-md);
+}
+
+.relay-input-group {
+    display: flex;
+    gap: var(--space-sm);
+    align-items: center;
+}
+
+.relay-actions {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-sm);
+}
+
+.relay-hint {
+    font-size: 0.8125rem;
+}
+
+.status-indicator.status-open {
+    background: var(--success-color);
+    box-shadow: 0 0 10px rgba(54, 179, 126, 0.4);
+}
+
+.status-indicator.status-connecting {
+    background: var(--warning-color);
+    box-shadow: 0 0 10px rgba(255, 214, 102, 0.4);
+}
+
+.status-indicator.status-closed,
+.status-indicator.status-error {
+    background: var(--error-color);
+    box-shadow: 0 0 10px rgba(255, 68, 68, 0.4);
+}
+
+.accordion-card.collapsed .relay-list-item {
+    pointer-events: none;
+}
+
+.accordion-card.collapsed .accordion-toggle {
+    padding-bottom: var(--space-lg);
 }
 
 .gateway-health {
