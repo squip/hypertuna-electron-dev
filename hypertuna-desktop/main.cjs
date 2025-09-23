@@ -6,11 +6,38 @@ const { spawn } = require('child_process');
 let mainWindow = null;
 let workerProcess = null;
 let pendingWorkerMessages = [];
+let gatewayStatusCache = null;
+let gatewayLogsCache = [];
+let gatewayOptionsCache = { detectLanAddresses: false, detectPublicIp: false };
 
 const userDataPath = app.getPath('userData');
 const storagePath = path.join(userDataPath, 'hypertuna-data');
 const logFilePath = path.join(storagePath, 'desktop-console.log');
 const gatewaySettingsPath = path.join(storagePath, 'gateway-settings.json');
+const DEFAULT_CERT_ALLOWLIST = new Set(['relay.nostr.band', 'relay.damus.io', 'nos.lol']);
+const envAllowlist = (process.env.NOSTR_CERT_ALLOWLIST || '')
+  .split(',')
+  .map((h) => h.trim())
+  .filter(Boolean);
+for (const host of envAllowlist) {
+  DEFAULT_CERT_ALLOWLIST.add(host);
+}
+
+app.on('certificate-error', (event, webContents, url, error, certificate, callback) => {
+  try {
+    const { hostname } = new URL(url);
+    if (DEFAULT_CERT_ALLOWLIST.has(hostname) || Array.from(DEFAULT_CERT_ALLOWLIST).some((allowed) => allowed.startsWith('.') ? hostname.endsWith(allowed) : hostname === allowed)) {
+      event.preventDefault();
+      callback(true);
+      return;
+    }
+  } catch (err) {
+    console.warn('[Main] Failed to evaluate certificate exception for URL', url, err);
+  }
+
+  callback(false);
+});
+
 
 async function ensureStorageDir() {
   try {
@@ -77,8 +104,31 @@ async function startWorkerProcess() {
     });
 
     pendingWorkerMessages = [];
+    gatewayStatusCache = null;
+    gatewayLogsCache = [];
 
     workerProcess.on('message', (message) => {
+      if (message && typeof message === 'object') {
+        if (message.type === 'gateway-status') {
+          gatewayStatusCache = message.status || null;
+        } else if (message.type === 'gateway-log') {
+          if (message.entry) {
+            gatewayLogsCache.push(message.entry);
+            if (gatewayLogsCache.length > 500) {
+              gatewayLogsCache = gatewayLogsCache.slice(-500);
+            }
+          }
+        } else if (message.type === 'gateway-logs') {
+          gatewayLogsCache = Array.isArray(message.logs) ? message.logs.slice(-500) : [];
+        } else if (message.type === 'gateway-stopped') {
+          gatewayStatusCache = message.status || { running: false };
+        } else if (message.type === 'gateway-options-set') {
+          if (message.options && typeof message.options === 'object') {
+            gatewayOptionsCache = { ...gatewayOptionsCache, ...message.options };
+          }
+        }
+      }
+
       if (mainWindow) {
         mainWindow.webContents.send('worker-message', message);
       } else {
@@ -97,6 +147,8 @@ async function startWorkerProcess() {
       console.log(`[Main] Worker exited with code=${code} signal=${signal}`);
       workerProcess = null;
       pendingWorkerMessages = [];
+      gatewayStatusCache = null;
+      gatewayLogsCache = [];
       if (mainWindow) {
         mainWindow.webContents.send('worker-exit', code ?? signal ?? 0);
       }
@@ -150,6 +202,20 @@ async function stopWorkerProcess() {
   }
 }
 
+function sendGatewayCommand(type, payload = {}) {
+  if (!workerProcess) {
+    return { success: false, error: 'Worker not running' };
+  }
+
+  try {
+    workerProcess.send({ type, ...payload });
+    return { success: true };
+  } catch (error) {
+    console.error('[Main] Failed to send gateway command', error);
+    return { success: false, error: error.message };
+  }
+}
+
 ipcMain.handle('start-worker', async () => {
   return startWorkerProcess();
 });
@@ -170,6 +236,39 @@ ipcMain.handle('send-to-worker', async (_event, message) => {
     console.error('[Main] Failed to send message to worker', error);
     return { success: false, error: error.message };
   }
+});
+
+ipcMain.handle('gateway-start', async (_event, options) => {
+  return sendGatewayCommand('start-gateway', { options });
+});
+
+ipcMain.handle('gateway-stop', async () => {
+  return sendGatewayCommand('stop-gateway');
+});
+
+ipcMain.handle('gateway-get-status', async () => {
+  if (workerProcess) {
+    workerProcess.send({ type: 'get-gateway-status' });
+  }
+  return { success: true, status: gatewayStatusCache };
+});
+
+ipcMain.handle('gateway-get-logs', async () => {
+  if (workerProcess) {
+    workerProcess.send({ type: 'get-gateway-logs' });
+  }
+  return { success: true, logs: gatewayLogsCache };
+});
+
+ipcMain.handle('gateway-get-options', async () => {
+  if (workerProcess) {
+    workerProcess.send({ type: 'get-gateway-options' });
+  }
+  return { success: true, options: gatewayOptionsCache };
+});
+
+ipcMain.handle('gateway-set-options', async (_event, options) => {
+  return sendGatewayCommand('set-gateway-options', { options });
 });
 
 ipcMain.handle('read-config', async () => {

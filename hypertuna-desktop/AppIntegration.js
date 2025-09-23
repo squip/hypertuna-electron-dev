@@ -138,6 +138,9 @@ function integrateNostrRelays(App) {
                                 this.updateHypertunaDisplay();
                             }
                         }
+                        if (window.refreshGatewayStatus) {
+                            await window.refreshGatewayStatus({ fetchOptions: false });
+                        }
                     } catch (err) {
                         console.error('Failed to start worker:', err);
                     }

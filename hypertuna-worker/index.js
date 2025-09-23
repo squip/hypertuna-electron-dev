@@ -8,6 +8,7 @@ import { promises as fs } from 'node:fs'
 import { join } from 'node:path'
 import crypto from 'node:crypto'
 import b4a from 'b4a'
+import GatewayService from './gateway/GatewayService.mjs'
 import {
   getAllRelayProfiles,
   getRelayProfileByKey,
@@ -37,7 +38,7 @@ import {
 import { ensureMirrorsForProviders, stopAllMirrors } from './mirror-sync-manager.mjs';
 import { NostrUtils } from './nostr-utils.js';
 import { getRelayKeyFromPublicIdentifier } from './relay-lookup-utils.mjs';
-import { loadGatewaySettings, getCachedGatewaySettings } from '../shared/config/GatewaySettings.mjs';
+import { loadGatewaySettings, getCachedGatewaySettings, updateGatewaySettings } from '../shared/config/GatewaySettings.mjs';
 
 const pearRuntime = globalThis?.Pear
 const __dirname = process.env.APP_DIR || pearRuntime?.config?.dir || process.cwd()
@@ -53,6 +54,124 @@ function buildGatewayWebsocketBase(config) {
   const protocol = getGatewayWebsocketProtocol(config)
   const host = config?.proxy_server_address || 'localhost'
   return `${protocol}://${host}`
+}
+
+function deriveGatewayHostFromStatus(status) {
+  try {
+    const hostnameUrl = status?.urls?.hostname ? new URL(status.urls.hostname) : null
+    if (hostnameUrl) {
+      return {
+        httpUrl: `http://${hostnameUrl.host}`,
+        proxyHost: hostnameUrl.host,
+        wsProtocol: hostnameUrl.protocol === 'wss:' ? 'wss' : 'ws'
+      }
+    }
+  } catch (_) {}
+  const port = status?.port || gatewayOptions.port || 8443
+  const host = `${gatewayOptions.hostname || '127.0.0.1'}:${port}`
+  return {
+    httpUrl: `http://${host}`,
+    proxyHost: host,
+    wsProtocol: 'ws'
+  }
+}
+
+async function initializeGatewayOptionsFromSettings() {
+  try {
+    const settings = await loadGatewaySettings()
+    if (settings) {
+      gatewayOptions.detectLanAddresses = !!settings.advertiseLan
+      gatewayOptions.detectPublicIp = !!settings.detectPublicIp
+      gatewayOptions.listenHost = gatewayOptions.detectLanAddresses ? '0.0.0.0' : '127.0.0.1'
+    }
+  } catch (error) {
+    console.warn('[Worker] Failed to load gateway option defaults:', error)
+  }
+}
+
+async function startGatewayService(options = {}) {
+  if (!gatewayService) {
+    gatewayService = new GatewayService()
+    gatewayService.on('log', (entry) => {
+      sendMessage({ type: 'gateway-log', entry })
+    })
+    gatewayService.on('status', async (status) => {
+      gatewayStatusCache = status
+      sendMessage({ type: 'gateway-status', status })
+      if (status?.running) {
+        const { httpUrl, proxyHost, wsProtocol } = deriveGatewayHostFromStatus(status)
+        if (!gatewaySettingsApplied) {
+          try {
+            await updateGatewaySettings({
+              gatewayUrl: httpUrl,
+              proxyHost,
+              proxyWebsocketProtocol: wsProtocol,
+              advertiseLan: !!gatewayOptions.detectLanAddresses,
+              detectPublicIp: !!gatewayOptions.detectPublicIp
+            })
+            gatewaySettingsApplied = true
+          } catch (error) {
+            console.error('[Worker] Failed to update gateway settings:', error)
+          }
+        }
+      }
+    })
+  }
+
+  const mergedOptions = { ...gatewayOptions, ...options }
+  mergedOptions.listenHost = mergedOptions.detectLanAddresses ? '0.0.0.0' : '127.0.0.1'
+
+  const needsRestart = gatewayService?.isRunning && (
+    mergedOptions.port !== gatewayOptions.port ||
+    mergedOptions.hostname !== gatewayOptions.hostname ||
+    mergedOptions.listenHost !== gatewayOptions.listenHost ||
+    mergedOptions.detectLanAddresses !== gatewayOptions.detectLanAddresses ||
+    mergedOptions.detectPublicIp !== gatewayOptions.detectPublicIp
+  )
+
+  if (needsRestart) {
+    await gatewayService.stop().catch((err) => {
+      console.warn('[Worker] Gateway stop during restart failed:', err)
+    })
+  }
+
+  if (gatewayService.isRunning && !needsRestart) {
+    gatewayOptions = mergedOptions
+    return
+  }
+
+  try {
+    gatewaySettingsApplied = false
+    await gatewayService.start(mergedOptions)
+    gatewayOptions = mergedOptions
+  } catch (error) {
+    console.error('[Worker] Failed to start gateway service:', error)
+    throw error
+  }
+}
+
+async function stopGatewayService() {
+  if (!gatewayService) return
+  try {
+    await gatewayService.stop()
+  } catch (error) {
+    console.error('[Worker] Failed to stop gateway service:', error)
+    throw error
+  }
+}
+
+function getGatewayStatus() {
+  if (gatewayService) {
+    return gatewayService.getStatus()
+  }
+  return gatewayStatusCache || { running: false }
+}
+
+function getGatewayLogs() {
+  if (gatewayService) {
+    return gatewayService.getLogs()
+  }
+  return []
 }
 
 // Variable to store the relay server module
@@ -71,6 +190,11 @@ let healthIntervalHandle = null
 // Store configuration received from the parent process
 let configReceived = false
 let storedParentConfig = null
+
+let gatewayService = null
+let gatewayStatusCache = null
+let gatewaySettingsApplied = false
+let gatewayOptions = { port: 8443, hostname: '127.0.0.1', listenHost: '127.0.0.1', detectLanAddresses: false, detectPublicIp: false }
 
 async function appendFilekeyDbEntry (relayKey, fileHash) {
   if (!config?.driveKey || !config?.nostr_pubkey_hex) {
@@ -731,6 +855,63 @@ async function handleMessageObject(message) {
       break
     }
 
+    case 'start-gateway': {
+      try {
+        await startGatewayService(message.options || {})
+        sendMessage({ type: 'gateway-started', status: getGatewayStatus() })
+      } catch (err) {
+        sendMessage({ type: 'gateway-error', message: err.message })
+      }
+      break
+    }
+
+    case 'stop-gateway': {
+      try {
+        await stopGatewayService()
+        sendMessage({ type: 'gateway-stopped', status: getGatewayStatus() })
+      } catch (err) {
+        sendMessage({ type: 'gateway-error', message: err.message })
+      }
+      break
+    }
+
+    case 'get-gateway-status': {
+      sendMessage({ type: 'gateway-status', status: getGatewayStatus() })
+      break
+    }
+
+    case 'get-gateway-logs': {
+      sendMessage({ type: 'gateway-logs', logs: getGatewayLogs() })
+      break
+    }
+
+    case 'set-gateway-options': {
+      gatewayOptions = { ...gatewayOptions, ...(message.options || {}) }
+      try {
+        await updateGatewaySettings({
+          advertiseLan: !!gatewayOptions.detectLanAddresses,
+          detectPublicIp: !!gatewayOptions.detectPublicIp
+        })
+      } catch (err) {
+        console.warn('[Worker] Failed to persist gateway options:', err?.message || err)
+      }
+      if (gatewayService?.isRunning) {
+        try {
+          await startGatewayService(gatewayOptions)
+        } catch (err) {
+          sendMessage({ type: 'gateway-error', message: err.message })
+          break
+        }
+      }
+      sendMessage({ type: 'gateway-options-set', options: gatewayOptions })
+      break
+    }
+
+    case 'get-gateway-options': {
+      sendMessage({ type: 'gateway-options-set', options: gatewayOptions })
+      break
+    }
+
     case 'upload-file': {
       try {
         const { relayKey, identifier: idFromMsg, publicIdentifier, fileHash, metadata, buffer } = message.data || {}
@@ -1103,6 +1284,8 @@ async function cleanup() {
     await relayServer.shutdownRelayServer()
   }
 
+  try { await stopGatewayService() } catch (_) {}
+
   // Stop all mirror watchers
   try { await stopAllMirrors() } catch (_) {}
   
@@ -1120,6 +1303,8 @@ async function main() {
       
       // Load or create configuration
       config = await loadOrCreateConfig()
+
+      await initializeGatewayOptionsFromSettings()
       
       // Wait for config from parent if available
       let parentConfig = storedParentConfig
@@ -1235,6 +1420,13 @@ async function main() {
 
         console.log('[Worker] Sent status message with initialized=true')
       }, 500)
+
+      try {
+        await startGatewayService()
+      } catch (gatewayError) {
+        console.error('[Worker] Failed to auto-start gateway:', gatewayError)
+        sendMessage({ type: 'gateway-error', message: gatewayError.message })
+      }
       
     } catch (error) {
       console.error('[Worker] Failed to start relay server:', error)

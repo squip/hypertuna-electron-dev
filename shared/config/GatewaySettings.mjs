@@ -1,7 +1,9 @@
 const DEFAULT_SETTINGS = Object.freeze({
   gatewayUrl: 'https://hypertuna.com',
   proxyHost: 'hypertuna.com',
-  proxyWebsocketProtocol: 'wss'
+  proxyWebsocketProtocol: 'wss',
+  advertiseLan: false,
+  detectPublicIp: false
 });
 
 const LOCAL_STORAGE_KEY = 'hypertuna_gateway_settings';
@@ -42,6 +44,14 @@ function normalizeSettings(raw = {}) {
     if (trimmed === 'ws' || trimmed === 'wss') {
       normalized.proxyWebsocketProtocol = trimmed;
     }
+  }
+
+  if (typeof raw.advertiseLan === 'boolean') {
+    normalized.advertiseLan = raw.advertiseLan;
+  }
+
+  if (typeof raw.detectPublicIp === 'boolean') {
+    normalized.detectPublicIp = raw.detectPublicIp;
   }
 
   return normalized;

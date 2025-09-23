@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta http-equiv="X-UA-Compatible" content="IE=edge">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Hypertuna Gateway Desktop</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div class="app-shell">
+    <header class="app-header">
+      <div>
+        <h1>Hypertuna Gateway</h1>
+        <p class="subtitle">Local control panel for the Pear / Hypertuna gateway service.</p>
+      </div>
+      <div class="header-actions">
+        <button id="startButton" class="button button--primary">Start Gateway</button>
+        <button id="stopButton" class="button">Stop Gateway</button>
+      </div>
+    </header>
+
+    <section class="status-card">
+      <div class="status-indicator" id="statusIndicator"></div>
+      <div class="status-meta">
+        <div class="status-row">
+          <span class="label">Status</span>
+          <span class="value" id="statusLabel">Offline</span>
+        </div>
+        <div class="status-row">
+          <span class="label">Uptime</span>
+          <span class="value" id="uptimeValue">—</span>
+        </div>
+        <div class="status-row">
+          <span class="label">PID</span>
+          <span class="value" id="pidValue">—</span>
+        </div>
+        <div class="status-row">
+          <span class="label">Port</span>
+          <span class="value" id="portValue">—</span>
+        </div>
+      </div>
+    </section>
+
+    <div class="message" id="statusMessage" hidden></div>
+
+    <section class="card config-card">
+      <div>
+        <h2 class="card-title">Gateway Configuration</h2>
+        <p class="card-subtitle">Choose the credentials file the gateway should load on start.</p>
+      </div>
+      <div class="config-info">
+        <div class="config-path" id="configPathValue">—</div>
+        <button id="chooseConfigButton" class="button button--ghost">Choose File</button>
+      </div>
+    </section>
+
+    <main class="grid">
+      <section class="card">
+        <h2 class="card-title">Network Health</h2>
+        <div class="metric-row">
+          <span class="metric-label">Gateway</span>
+          <span class="metric-value" id="healthStatusValue">—</span>
+        </div>
+        <div class="metric-row">
+          <span class="metric-label">Peers Online</span>
+          <span class="metric-value" id="healthPeersValue">—</span>
+        </div>
+        <div class="metric-row">
+          <span class="metric-label">Relays Active</span>
+          <span class="metric-value" id="healthRelaysValue">—</span>
+        </div>
+        <div class="metric-row">
+          <span class="metric-label">Updated</span>
+          <span class="metric-value" id="healthUpdatedAt">—</span>
+        </div>
+      </section>
+
+      <section class="card">
+        <h2 class="card-title">Connections Snapshot</h2>
+        <div class="connections" id="connectionsList">
+          <p class="empty">No active peers yet. Start the gateway to begin collecting data.</p>
+        </div>
+      </section>
+    </main>
+
+    <section class="card logs-card">
+      <div class="logs-header">
+        <h2 class="card-title">Gateway Logs</h2>
+        <span class="logs-hint">Streaming stdout / stderr</span>
+      </div>
+      <div class="logs" id="logsContainer"></div>
+    </section>
+  </div>
+
+  <script src="index.js"></script>
+</body>
+</html>

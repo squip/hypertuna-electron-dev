@@ -1958,6 +1958,126 @@ members-list,.member-list {
 .key-format-toggle:hover {
     color: var(--primary-dark);
 }
+.gateway-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-md);
+}
+
+.gateway-actions {
+    display: flex;
+    gap: var(--space-sm);
+}
+
+.gateway-status-card {
+    display: flex;
+    gap: var(--space-lg);
+    align-items: center;
+    background: rgba(255, 255, 255, 0.04);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: var(--radius-md);
+    padding: var(--space-md);
+    margin-top: var(--space-md);
+}
+
+.gateway-status-card .status-indicator {
+    width: 12px;
+    height: 12px;
+    border-radius: 50%;
+    background: var(--error-color);
+    box-shadow: 0 0 10px rgba(255, 68, 68, 0.4);
+}
+
+.gateway-status-card .status-indicator.active {
+    background: var(--success-color);
+    box-shadow: 0 0 10px rgba(54, 179, 126, 0.4);
+}
+
+.gateway-status-card .status-indicator.pending {
+    background: var(--warning-color);
+    box-shadow: 0 0 10px rgba(255, 214, 102, 0.4);
+}
+
+.gateway-status-card .status-details {
+    display: grid;
+    gap: 6px;
+  }
+
+.gateway-status-card .status-details .label {
+    display: block;
+    font-size: 12px;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+}
+
+.gateway-status-card .status-details .value {
+    font-size: 14px;
+    color: var(--text-primary);
+    margin-left: var(--space-xs);
+}
+
+.gateway-options {
+    margin-top: var(--space-md);
+    display: grid;
+    gap: var(--space-sm);
+}
+
+.gateway-health {
+    margin-top: var(--space-md);
+    padding: var(--space-md);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: var(--radius-md);
+    background: rgba(255, 255, 255, 0.02);
+    display: grid;
+    gap: var(--space-sm);
+}
+
+.gateway-health h4 {
+    margin: 0;
+    font-size: 15px;
+    color: var(--text-secondary);
+}
+
+.gateway-logs {
+    margin-top: var(--space-md);
+}
+
+.gateway-logs-container {
+    margin-top: var(--space-sm);
+    max-height: 220px;
+    overflow-y: auto;
+    background: rgba(0, 0, 0, 0.35);
+    border-radius: var(--radius-sm);
+    padding: var(--space-sm);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.gateway-logs-container.hidden {
+    display: none;
+}
+
+.gateway-log-entry {
+    font-family: var(--font-mono);
+    font-size: 12px;
+    color: var(--text-muted);
+    margin-bottom: 4px;
+    white-space: pre-wrap;
+}
+
+.gateway-log-entry.info {
+    color: var(--text-secondary);
+}
+
+.gateway-log-entry.error {
+    color: var(--error-color);
+}
+
+.gateway-log-entry.warn {
+    color: var(--warning-color);
+}
+
 
 
 

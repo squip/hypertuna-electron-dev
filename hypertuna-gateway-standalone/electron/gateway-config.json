@@ -1,0 +1,14 @@
+{
+  "npub": "ep7nqcbwxrmwdwunertzzclvfa6v2tz3hpvzk4lh6wfy7pt2hvxq",
+  "nsec": "b0c878615bb133c2ff0ffce2dddcef06c28504b876c309052e26fec0c2eabd5a",
+  "pubkeyhex": "23fed80836bc5961da8d24679c8975283d5d4f3b3beb957167f58b8fbe7a3d6f",
+  "name": "19 TUNAFISH GATEWAY",
+  "about": "STARGATE TUNA",
+  "gateway_kind_10002_relays": [
+    "wss://relay.damus.io"
+  ],
+  "gateway_kind_10002_lastUpdate": 1758601971,
+  "gateway_kind_30000_directory_id": "25820b47e647a567",
+  "gateway_kind_30000_directory_relays": [],
+  "gateway_kind_30000_directory_lastUpdate": 0
+}

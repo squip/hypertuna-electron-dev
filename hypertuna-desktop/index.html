@@ -411,6 +411,59 @@
                         <div class="form-group">Gateway: <span id="gateway-status">Not Registered</span></div>
                     </div>
 
+                    <div class="profile-section" id="gateway-section">
+                        <div class="gateway-header">
+                            <h3>Hypertuna Gateway</h3>
+                            <div class="gateway-actions">
+                                <button id="gateway-start" class="btn btn-primary">Start</button>
+                                <button id="gateway-stop" class="btn btn-secondary">Stop</button>
+                            </div>
+                        </div>
+                        <div class="gateway-status-card">
+                            <div id="gateway-status-indicator" class="status-indicator"></div>
+                            <div class="status-details">
+                                <div><span class="label">Status</span><span id="gateway-status-text" class="value">Offline</span></div>
+                                <div><span class="label">Uptime</span><span id="gateway-uptime" class="value">—</span></div>
+                                <div><span class="label">Port</span><span id="gateway-port" class="value">—</span></div>
+                                <div><span class="label">Peers</span><span id="gateway-peers" class="value">0</span></div>
+                                <div><span class="label">Relays</span><span id="gateway-relays" class="value">0</span></div>
+                            </div>
+                        </div>
+                        <div class="gateway-options">
+                            <label class="toggle-label">
+                                <input type="checkbox" id="gateway-lan-toggle" class="toggle-checkbox">
+                                <span class="toggle-switch"></span>
+                                <span class="toggle-text">Advertise on Local Network</span>
+                            </label>
+                            <p class="toggle-description">Enable LAN IP broadcasting for other devices on your network.</p>
+                            <label class="toggle-label">
+                                <input type="checkbox" id="gateway-public-toggle" class="toggle-checkbox">
+                                <span class="toggle-switch"></span>
+                                <span class="toggle-text">Detect Public IP</span>
+                            </label>
+                            <p class="toggle-description">Detect and advertise your public IP (requires port forwarding).</p>
+                        </div>
+                        <div class="gateway-health">
+                            <h4>Network Health</h4>
+                            <div class="metric-row">
+                                <span class="metric-label">Hyperswarm</span>
+                                <span class="metric-value" id="gateway-hyperswarm-status">—</span>
+                            </div>
+                            <div class="metric-row">
+                                <span class="metric-label">Gateway</span>
+                                <span class="metric-value" id="gateway-service-status">—</span>
+                            </div>
+                            <div class="metric-row">
+                                <span class="metric-label">Last Check</span>
+                                <span class="metric-value" id="gateway-last-check">—</span>
+                            </div>
+                        </div>
+                        <div class="gateway-logs">
+                            <button id="gateway-toggle-logs" class="btn btn-secondary">Show Logs</button>
+                            <div id="gateway-logs-container" class="gateway-logs-container hidden"></div>
+                        </div>
+                    </div>
+
                     <div class="profile-section">
                       <button id="btn-logout-profile" class="btn btn-secondary btn-block">Logout</button>
                   </div>

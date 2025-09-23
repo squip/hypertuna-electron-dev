@@ -24,6 +24,11 @@ let initializedRelays = new Set() // Track which relays are ready
 let relayJoinResolvers = new Map();
 let workerListenersAttached = false;
 let healthPollingInterval = null;
+let gatewayStatusInfo = { running: false };
+let gatewayLogs = [];
+let gatewayLogVisible = false;
+let gatewayOptionsState = { detectLanAddresses: false, detectPublicIp: false };
+let gatewayUptimeTimer = null;
 const DEFAULT_API_URL = 'http://localhost:1945';
 
 // Store worker messages that may arrive before AppIntegration sets up handlers
@@ -53,8 +58,58 @@ let clearLogsButton = null
 let exportLogsButton = null
 let joinRelayButton = null
 let newGroupFileSharing = null
+let gatewayStartButton = null
+let gatewayStopButton = null
+let gatewayStatusIndicatorEl = null
+let gatewayStatusTextEl = null
+let gatewayUptimeEl = null
+let gatewayPortEl = null
+let gatewayPeersEl = null
+let gatewayRelaysEl = null
+let gatewayHyperswarmEl = null
+let gatewayServiceStatusEl = null
+let gatewayLastCheckEl = null
+let gatewayLogsContainer = null
+let gatewayToggleLogsButton = null
+let gatewayLanToggle = null
+let gatewayPublicToggle = null
 
 // Log functions
+function formatDuration(ms) {
+  if (!Number.isFinite(ms) || ms <= 0) return '—'
+  const totalSeconds = Math.floor(ms / 1000)
+  const hours = Math.floor(totalSeconds / 3600)
+  const minutes = Math.floor((totalSeconds % 3600) / 60)
+  const seconds = totalSeconds % 60
+  if (hours > 0) return `${hours}h ${minutes.toString().padStart(2, '0')}m`
+  if (minutes > 0) return `${minutes}m ${seconds.toString().padStart(2, '0')}s`
+  return `${seconds}s`
+}
+
+function formatRelativeTime(value) {
+  if (!value) return '—'
+  const timestamp = typeof value === 'string' ? Date.parse(value) : value
+  if (!Number.isFinite(timestamp)) return '—'
+  const diff = Date.now() - timestamp
+  if (diff < 0) return 'just now'
+  if (diff < 60_000) return `${Math.max(1, Math.floor(diff / 1000))}s ago`
+  if (diff < 3_600_000) return `${Math.floor(diff / 60_000)}m ago`
+  if (diff < 86_400_000) return `${Math.floor(diff / 3_600_000)}h ago`
+  return new Date(timestamp).toLocaleString()
+}
+
+function applyGatewayOptionsToUI() {
+  if (gatewayLanToggle) gatewayLanToggle.checked = !!gatewayOptionsState.detectLanAddresses
+  if (gatewayPublicToggle) gatewayPublicToggle.checked = !!gatewayOptionsState.detectPublicIp
+}
+
+function persistGatewayOptions() {
+  if (typeof localStorage === 'undefined') return
+  try {
+    localStorage.setItem('hypertuna_gateway_options', JSON.stringify(gatewayOptionsState))
+  } catch (_) {}
+}
+
 function addLog(message, type = 'info') {
   const timestamp = new Date().toLocaleTimeString()
   const logEntry = {
@@ -63,25 +118,231 @@ function addLog(message, type = 'info') {
     type
   }
   logs.push(logEntry)
-  
-  // Keep only last 1000 logs
+
   if (logs.length > 1000) {
     logs = logs.slice(-1000)
   }
-  
-  // Update UI if container exists
+
   if (logsContainer) {
     const logElement = document.createElement('div')
     logElement.className = `log-entry ${type}`
     logElement.textContent = `[${timestamp}] ${message}`
     logsContainer.appendChild(logElement)
-    
-    // Auto-scroll to bottom
     logsContainer.scrollTop = logsContainer.scrollHeight
   }
-  
-  // Also log to console for debugging
+
   console.log(`[Log ${type}] ${message}`)
+}
+
+function loadGatewayOptionsFromStorage() {
+  if (typeof localStorage === 'undefined') return
+  try {
+    const stored = localStorage.getItem('hypertuna_gateway_options')
+    if (stored) {
+      const parsed = JSON.parse(stored)
+      if (parsed && typeof parsed === 'object') {
+        gatewayOptionsState = {
+          ...gatewayOptionsState,
+          detectLanAddresses: !!parsed.detectLanAddresses,
+          detectPublicIp: !!parsed.detectPublicIp
+        }
+      }
+    }
+  } catch (_) {}
+}
+
+async function syncGatewayOptions() {
+  if (!isElectron || !electronAPI?.setGatewayOptions) return
+  try {
+    const response = await electronAPI.setGatewayOptions(gatewayOptionsState)
+    if (response && response.success === false) {
+      if (response.error && response.error.includes('Worker not running')) {
+        return
+      }
+      throw new Error(response.error || 'Gateway options update failed')
+    }
+  } catch (error) {
+    console.error('[App] Failed to sync gateway options:', error)
+    addLog(`Gateway options error: ${error.message}`, 'error')
+  }
+}
+
+function updateGatewayUI(status) {
+  gatewayStatusInfo = status || { running: false }
+  const running = !!gatewayStatusInfo.running
+
+  if (gatewayStatusIndicatorEl) {
+    gatewayStatusIndicatorEl.classList.remove('active', 'pending')
+    if (running) {
+      const healthStatus = gatewayStatusInfo.health?.status
+      if (healthStatus && healthStatus !== 'healthy') {
+        gatewayStatusIndicatorEl.classList.add('pending')
+      } else {
+        gatewayStatusIndicatorEl.classList.add('active')
+      }
+    }
+  }
+
+  if (gatewayStatusTextEl) {
+    gatewayStatusTextEl.textContent = running ? 'Online' : 'Offline'
+  }
+
+  if (gatewayStartButton) gatewayStartButton.disabled = running
+  if (gatewayStopButton) gatewayStopButton.disabled = !running
+
+  if (gatewayPortEl) gatewayPortEl.textContent = gatewayStatusInfo.port ?? '—'
+  if (gatewayPeersEl) gatewayPeersEl.textContent = gatewayStatusInfo.peers ?? 0
+  if (gatewayRelaysEl) gatewayRelaysEl.textContent = gatewayStatusInfo.relays ?? 0
+
+  const services = gatewayStatusInfo.health?.services || {}
+  if (gatewayHyperswarmEl) gatewayHyperswarmEl.textContent = services.hyperswarmStatus || (running ? 'connected' : 'offline')
+  if (gatewayServiceStatusEl) gatewayServiceStatusEl.textContent = services.gatewayStatus || (running ? 'online' : 'offline')
+  if (gatewayLastCheckEl) gatewayLastCheckEl.textContent = formatRelativeTime(gatewayStatusInfo.health?.lastCheck)
+
+  if (gatewayUptimeTimer) {
+    clearInterval(gatewayUptimeTimer)
+    gatewayUptimeTimer = null
+  }
+
+  if (gatewayUptimeEl) {
+    if (running && gatewayStatusInfo.startedAt) {
+      const update = () => {
+        const diff = Date.now() - gatewayStatusInfo.startedAt
+        gatewayUptimeEl.textContent = formatDuration(diff)
+      }
+      update()
+      gatewayUptimeTimer = setInterval(update, 1000)
+    } else {
+      gatewayUptimeEl.textContent = '—'
+    }
+  }
+}
+
+function renderGatewayLogs() {
+  if (!gatewayLogsContainer) return
+  gatewayLogsContainer.innerHTML = ''
+  const entries = gatewayLogs.slice(-200)
+  for (const entry of entries) {
+    const row = document.createElement('div')
+    row.className = `gateway-log-entry ${entry.level || 'info'}`
+    const time = entry.timestamp ? new Date(entry.timestamp).toLocaleTimeString() : ''
+    row.textContent = time ? `[${time}] ${entry.message}` : entry.message
+    gatewayLogsContainer.appendChild(row)
+  }
+  gatewayLogsContainer.scrollTop = gatewayLogsContainer.scrollHeight
+}
+
+async function refreshGatewayStatus({ fetchOptions = true } = {}) {
+  if (!isElectron || !electronAPI?.getGatewayStatus) return
+  try {
+    const requests = [electronAPI.getGatewayStatus(), electronAPI.getGatewayLogs()]
+    if (fetchOptions && electronAPI.getGatewayOptions) {
+      requests.push(electronAPI.getGatewayOptions())
+    }
+    const results = await Promise.all(requests)
+    const statusResult = results[0]
+    const logsResult = results[1]
+    const optionsResult = results[2]
+
+    if (statusResult && 'status' in statusResult) {
+      updateGatewayUI(statusResult.status || { running: false })
+    }
+
+    if (Array.isArray(logsResult?.logs)) {
+      gatewayLogs = logsResult.logs.slice(-500)
+      if (gatewayLogVisible) {
+        renderGatewayLogs()
+      }
+    }
+
+    if (optionsResult?.options) {
+      gatewayOptionsState = {
+        ...gatewayOptionsState,
+        detectLanAddresses: !!optionsResult.options.detectLanAddresses,
+        detectPublicIp: !!optionsResult.options.detectPublicIp
+      }
+      applyGatewayOptionsToUI()
+      persistGatewayOptions()
+    }
+  } catch (error) {
+    console.error('[App] Failed to refresh gateway status:', error)
+  }
+}
+
+async function handleGatewayStart() {
+  if (!isElectron || !electronAPI?.startGateway) return
+  if (gatewayStartButton) gatewayStartButton.disabled = true
+  try {
+    await syncGatewayOptions()
+    addLog('Starting local gateway...', 'status')
+    const response = await electronAPI.startGateway(gatewayOptionsState)
+    if (response && response.success === false) {
+      throw new Error(response.error || 'Gateway start failed')
+    }
+    await refreshGatewayStatus({ fetchOptions: false })
+  } catch (error) {
+    console.error('[App] Failed to start gateway:', error)
+    addLog(`Failed to start gateway: ${error.message}`, 'error')
+  } finally {
+    if (gatewayStartButton) gatewayStartButton.disabled = false
+  }
+}
+
+async function handleGatewayStop() {
+  if (!isElectron || !electronAPI?.stopGateway) return
+  if (gatewayStopButton) gatewayStopButton.disabled = true
+  try {
+    addLog('Stopping local gateway...', 'status')
+    const response = await electronAPI.stopGateway()
+    if (response && response.success === false) {
+      throw new Error(response.error || 'Gateway stop failed')
+    }
+    await refreshGatewayStatus({ fetchOptions: false })
+  } catch (error) {
+    console.error('[App] Failed to stop gateway:', error)
+    addLog(`Failed to stop gateway: ${error.message}`, 'error')
+  } finally {
+    if (gatewayStopButton) gatewayStopButton.disabled = false
+  }
+}
+
+async function initializeGatewayControls() {
+  loadGatewayOptionsFromStorage()
+  applyGatewayOptionsToUI()
+  persistGatewayOptions()
+
+  if (!isElectron) return
+
+  try {
+    if (electronAPI.getGatewayOptions) {
+      const optionsResult = await electronAPI.getGatewayOptions()
+      if (optionsResult?.options) {
+        gatewayOptionsState = {
+          ...gatewayOptionsState,
+          detectLanAddresses: !!optionsResult.options.detectLanAddresses,
+          detectPublicIp: !!optionsResult.options.detectPublicIp
+        }
+        applyGatewayOptionsToUI()
+        persistGatewayOptions()
+      }
+    }
+  } catch (error) {
+    console.error('[App] Failed to load gateway options:', error)
+  }
+
+  await syncGatewayOptions()
+  await refreshGatewayStatus({ fetchOptions: false })
+}
+
+function handleGatewayLogEntry(entry) {
+  if (!entry) return
+  gatewayLogs.push(entry)
+  if (gatewayLogs.length > 500) {
+    gatewayLogs = gatewayLogs.slice(-500)
+  }
+  if (gatewayLogVisible) {
+    renderGatewayLogs()
+  }
 }
 
 function attachWorkerEventListeners() {
@@ -571,6 +832,51 @@ async function handleWorkerMessage(message) {
       updateHealthStatus(healthState) // Update display
       break
 
+    case 'gateway-status':
+      if (message.status) {
+        updateGatewayUI(message.status)
+      }
+      break
+
+    case 'gateway-log':
+      handleGatewayLogEntry(message.entry)
+      break
+
+    case 'gateway-logs':
+      if (Array.isArray(message.logs)) {
+        gatewayLogs = message.logs.slice(-500)
+        if (gatewayLogVisible) renderGatewayLogs()
+      }
+      break
+
+    case 'gateway-started':
+      addLog('Local gateway started', 'status')
+      if (message.status) updateGatewayUI(message.status)
+      break
+
+    case 'gateway-stopped':
+      addLog('Local gateway stopped', 'status')
+      if (message.status) updateGatewayUI(message.status)
+      break
+
+    case 'gateway-error':
+      if (message.message) {
+        addLog(`Gateway error: ${message.message}`, 'error')
+      }
+      break
+
+    case 'gateway-options-set':
+      if (message.options) {
+        gatewayOptionsState = {
+          ...gatewayOptionsState,
+          detectLanAddresses: !!message.options.detectLanAddresses,
+          detectPublicIp: !!message.options.detectPublicIp
+        }
+        applyGatewayOptionsToUI()
+        persistGatewayOptions()
+      }
+      break
+
       
     default:
       addLog(`Unknown worker message: ${JSON.stringify(message)}`, 'info')
@@ -1055,13 +1361,45 @@ function setupEventListeners() {
     console.log('[App] Join relay button listener added')
   }
 
-  if (newGroupFileSharing) {
-    newGroupFileSharing.addEventListener('change', (e) => {
-      if (e.target.checked) {
-        alert('Authorized members of this relay will be able to upload file attachments to their nostr events. Published file attachments will automatically sync across other relay member peers when connected. This setting cannot be disabled once the relay is created.')
+  if (gatewayStartButton) {
+    gatewayStartButton.addEventListener('click', (e) => {
+      e.preventDefault()
+      handleGatewayStart()
+    })
+  }
+
+  if (gatewayStopButton) {
+    gatewayStopButton.addEventListener('click', (e) => {
+      e.preventDefault()
+      handleGatewayStop()
+    })
+  }
+
+  if (gatewayToggleLogsButton && gatewayLogsContainer) {
+    gatewayToggleLogsButton.addEventListener('click', () => {
+      gatewayLogVisible = !gatewayLogVisible
+      gatewayLogsContainer.classList.toggle('hidden', !gatewayLogVisible)
+      gatewayToggleLogsButton.textContent = gatewayLogVisible ? 'Hide Logs' : 'Show Logs'
+      if (gatewayLogVisible) {
+        renderGatewayLogs()
       }
     })
-    console.log('[App] New group file sharing listener added')
+  }
+
+  if (gatewayLanToggle) {
+    gatewayLanToggle.addEventListener('change', () => {
+      gatewayOptionsState.detectLanAddresses = !!gatewayLanToggle.checked
+      persistGatewayOptions()
+      syncGatewayOptions()
+    })
+  }
+
+  if (gatewayPublicToggle) {
+    gatewayPublicToggle.addEventListener('change', () => {
+      gatewayOptionsState.detectPublicIp = !!gatewayPublicToggle.checked
+      persistGatewayOptions()
+      syncGatewayOptions()
+    })
   }
   
   // Input field event listeners
@@ -1122,6 +1460,21 @@ function initializeDOMElements() {
   exportLogsButton = document.getElementById('export-logs')
   joinRelayButton = document.getElementById('join-relay')
   newGroupFileSharing = document.getElementById('new-group-file-sharing')
+  gatewayStartButton = document.getElementById('gateway-start')
+  gatewayStopButton = document.getElementById('gateway-stop')
+  gatewayStatusIndicatorEl = document.getElementById('gateway-status-indicator')
+  gatewayStatusTextEl = document.getElementById('gateway-status-text')
+  gatewayUptimeEl = document.getElementById('gateway-uptime')
+  gatewayPortEl = document.getElementById('gateway-port')
+  gatewayPeersEl = document.getElementById('gateway-peers')
+  gatewayRelaysEl = document.getElementById('gateway-relays')
+  gatewayHyperswarmEl = document.getElementById('gateway-hyperswarm-status')
+  gatewayServiceStatusEl = document.getElementById('gateway-service-status')
+  gatewayLastCheckEl = document.getElementById('gateway-last-check')
+  gatewayLogsContainer = document.getElementById('gateway-logs-container')
+  gatewayToggleLogsButton = document.getElementById('gateway-toggle-logs')
+  gatewayLanToggle = document.getElementById('gateway-lan-toggle')
+  gatewayPublicToggle = document.getElementById('gateway-public-toggle')
   
   // Log element status
   const elements = {
@@ -1135,7 +1488,22 @@ function initializeDOMElements() {
     clearLogsButton,
     exportLogsButton,
     joinRelayButton,
-    newGroupFileSharing
+    newGroupFileSharing,
+    gatewayStartButton,
+    gatewayStopButton,
+    gatewayStatusIndicatorEl,
+    gatewayStatusTextEl,
+    gatewayUptimeEl,
+    gatewayPortEl,
+    gatewayPeersEl,
+    gatewayRelaysEl,
+    gatewayHyperswarmEl,
+    gatewayServiceStatusEl,
+    gatewayLastCheckEl,
+    gatewayLogsContainer,
+    gatewayToggleLogsButton,
+    gatewayLanToggle,
+    gatewayPublicToggle
   }
   
   console.log('[App] Element initialization results:');
@@ -1145,6 +1513,12 @@ function initializeDOMElements() {
   
   // Set up event listeners
   setupEventListeners();
+
+  if (isElectron) {
+    initializeGatewayControls().catch((error) => {
+      console.error('[App] Failed to initialize gateway controls:', error);
+    })
+  }
   
   // Initialize UI state
   updateWorkerStatus('stopped', 'Not Started');
@@ -1212,5 +1586,6 @@ window.joinRelayInstance = joinRelayInstance;
 window.joinRelayFromInvite = joinRelayFromInvite;
 window.disconnectRelayInstance = disconnectRelay;
 window.debugButtonState = debugButtonState;
+window.refreshGatewayStatus = refreshGatewayStatus;
 
 console.log('[App] app.js loading completed at:', new Date().toISOString());

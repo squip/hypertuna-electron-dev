@@ -1,0 +1,730 @@
+import express from 'express';
+import WebSocket from 'ws';
+import url from 'node:url';
+import crypto from 'node:crypto';
+import { EventEmitter } from 'node:events';
+
+import LocalGatewayServer from './LocalGatewayServer.mjs';
+import {
+  EnhancedHyperswarmPool,
+  checkPeerHealthWithHyperswarm,
+  forwardRequestToPeer,
+  forwardMessageToPeerHyperswarm,
+  getEventsFromPeerHyperswarm,
+  forwardJoinRequestToPeer,
+  forwardCallbackToPeer,
+  requestFileFromPeer
+} from './HyperswarmClient.mjs';
+
+const MAX_LOG_ENTRIES = 500;
+const DEFAULT_PORT = 8443;
+
+class MessageQueue {
+  constructor() {
+    this.queue = [];
+    this.processing = false;
+  }
+
+  async enqueue(message, handler) {
+    this.queue.push({ message, handler });
+    if (!this.processing) {
+      this.processing = true;
+      while (this.queue.length) {
+        const { message: msg, handler: cb } = this.queue.shift();
+        try {
+          await cb(msg);
+        } catch (error) {
+          // eslint-disable-next-line no-console
+          console.error('[GatewayService] Message handler error:', error);
+        }
+      }
+      this.processing = false;
+    }
+  }
+}
+
+class PeerHealthManager {
+  constructor(cleanupThreshold = 5 * 60 * 1000) {
+    this.healthChecks = new Map();
+    this.checkLocks = new Map();
+    this.failureCount = new Map();
+    this.cleanupThreshold = cleanupThreshold;
+    this.circuitBreakerThreshold = 3;
+    this.circuitBreakerTimeout = 5 * 60 * 1000;
+    this.metrics = {
+      totalChecks: 0,
+      failedChecks: 0,
+      recoveredPeers: 0,
+      lastMetricsReset: Date.now()
+    };
+  }
+
+  async checkPeerHealth(peer, connectionPool) {
+    if (this.checkLocks.get(peer.publicKey)) {
+      return this.isPeerHealthy(peer.publicKey);
+    }
+
+    this.checkLocks.set(peer.publicKey, true);
+    const now = Date.now();
+    this.metrics.totalChecks++;
+
+    try {
+      if (peer.mode === 'hyperswarm') {
+        const connection = connectionPool.connections.get(peer.publicKey);
+        if (connection && connection.connected) {
+          try {
+            const isHealthy = await checkPeerHealthWithHyperswarm(peer, connectionPool);
+            if (isHealthy) {
+              peer.lastSeen = now;
+              this.healthChecks.set(peer.publicKey, {
+                lastCheck: now,
+                status: 'healthy',
+                responseTime: Date.now() - now
+              });
+
+              if (this.failureCount.get(peer.publicKey)) {
+                this.metrics.recoveredPeers++;
+                this.failureCount.delete(peer.publicKey);
+              }
+              return true;
+            }
+          } catch (_) {
+            // fall through to full check
+          }
+        }
+      }
+
+      const healthy = await checkPeerHealthWithHyperswarm(peer, connectionPool);
+      if (healthy) {
+        peer.lastSeen = now;
+        this.healthChecks.set(peer.publicKey, {
+          lastCheck: now,
+          status: 'healthy',
+          responseTime: Date.now() - now
+        });
+        this.failureCount.delete(peer.publicKey);
+        return true;
+      }
+
+      await this.recordFailure(peer.publicKey);
+      return false;
+    } catch (error) {
+      this.healthChecks.set(peer.publicKey, {
+        lastCheck: now,
+        status: 'unhealthy',
+        error: error.message
+      });
+      await this.recordFailure(peer.publicKey);
+      return false;
+    } finally {
+      this.checkLocks.delete(peer.publicKey);
+    }
+  }
+
+  async recordFailure(publicKey) {
+    const failures = (this.failureCount.get(publicKey) || 0) + 1;
+    this.failureCount.set(publicKey, failures);
+
+    if (failures >= this.circuitBreakerThreshold) {
+      this.healthChecks.set(publicKey, {
+        ...(this.healthChecks.get(publicKey) || {}),
+        status: 'circuit-broken',
+        circuitBroken: true,
+        circuitBrokenAt: Date.now()
+      });
+    }
+  }
+
+  isPeerHealthy(publicKey) {
+    const check = this.healthChecks.get(publicKey);
+    if (!check) return false;
+
+    const now = Date.now();
+    if (check.circuitBroken) {
+      if (now - (check.circuitBrokenAt || 0) > this.circuitBreakerTimeout) {
+        check.circuitBroken = false;
+        check.circuitBrokenAt = null;
+        this.healthChecks.set(publicKey, check);
+        return true;
+      }
+      return false;
+    }
+
+    return check.status === 'healthy' && (now - check.lastCheck) < this.cleanupThreshold;
+  }
+}
+
+function generateConnectionKey() {
+  return crypto.randomBytes(16).toString('hex');
+}
+
+export class GatewayService extends EventEmitter {
+  constructor(options = {}) {
+    super();
+    this.options = options;
+    this.server = null;
+    this.wss = null;
+    this.app = null;
+    this.gatewayServer = null;
+    this.connectionPool = new EnhancedHyperswarmPool();
+    this.peerHealthManager = new PeerHealthManager();
+    this.activePeers = [];
+    this.activeRelays = new Map();
+    this.wsConnections = new Map();
+    this.messageQueues = new Map();
+    this.logs = [];
+    this.isRunning = false;
+    this.startedAt = null;
+    this.config = null;
+    this.healthState = {
+      startTime: null,
+      lastCheck: null,
+      status: 'offline',
+      activeRelaysCount: 0,
+      metrics: {
+        totalRequests: 0,
+        successfulRequests: 0,
+        failedRequests: 0,
+        lastMetricsReset: Date.now()
+      },
+      services: {
+        hyperswarmStatus: 'disconnected',
+        protocolStatus: 'disconnected',
+        gatewayStatus: 'offline'
+      }
+    };
+    this.healthInterval = null;
+    this.eventCheckTimers = new Map();
+  }
+
+  log(level, message) {
+    const entry = {
+      id: `${Date.now()}-${Math.random().toString(16).slice(2, 8)}`,
+      level,
+      message,
+      timestamp: new Date().toISOString()
+    };
+    this.logs.push(entry);
+    if (this.logs.length > MAX_LOG_ENTRIES) {
+      this.logs.shift();
+    }
+    this.emit('log', entry);
+  }
+
+  async start(config = {}) {
+    if (this.isRunning) {
+      return;
+    }
+
+    const port = Number(config.port) || DEFAULT_PORT;
+    const hostname = config.hostname || 'localhost';
+    const listenHost = config.listenHost || '127.0.0.1';
+    const detectLan = !!config.detectLanAddresses;
+    const detectPublicIp = !!config.detectPublicIp;
+
+    this.log('info', `Starting gateway on port ${port}`);
+
+    global.joinSessions = global.joinSessions || new Map();
+
+    this.app = express();
+    this.app.use(express.json({ limit: '2mb' }));
+
+    this.gatewayServer = new LocalGatewayServer({
+      hostname,
+      port,
+      listenHost,
+      detectLanAddresses: detectLan,
+      detectPublicIp
+    });
+
+    await this.gatewayServer.init();
+
+    this.setupRoutes();
+
+    const { server, wss } = this.gatewayServer.startServer(
+      (ws, req) => this.handleGatewayWebSocketConnection(ws, req),
+      this.app,
+      () => this.log('info', `Gateway listening on port ${port}`)
+    );
+
+    this.server = server;
+    this.wss = wss;
+    await this.connectionPool.initialize();
+    this.config = {
+      hostname,
+      port,
+      listenHost,
+      detectLanAddresses: detectLan,
+      detectPublicIp,
+      urls: this.gatewayServer.getServerUrls()
+    };
+
+    this.isRunning = true;
+    this.startedAt = Date.now();
+    this.healthState.startTime = this.startedAt;
+    this.healthState.services.gatewayStatus = 'online';
+    this.healthState.services.hyperswarmStatus = 'connected';
+
+    this.healthInterval = setInterval(() => {
+      this.healthState.lastCheck = Date.now();
+      this.emit('status', this.getStatus());
+    }, 30000);
+
+    this.emit('status', this.getStatus());
+  }
+
+  async stop() {
+    if (!this.isRunning) return;
+
+    this.log('info', 'Stopping gateway');
+
+    if (this.healthInterval) {
+      clearInterval(this.healthInterval);
+      this.healthInterval = null;
+    }
+
+    for (const timer of this.eventCheckTimers.values()) {
+      clearTimeout(timer);
+    }
+    this.eventCheckTimers.clear();
+
+    for (const { ws } of this.wsConnections.values()) {
+      try { ws.close(); } catch (_) {}
+    }
+    this.wsConnections.clear();
+
+    await this.connectionPool.destroy();
+
+    if (this.wss) {
+      await new Promise(resolve => this.wss.close(resolve));
+      this.wss = null;
+    }
+
+    if (this.server) {
+      await new Promise(resolve => this.server.close(resolve));
+      this.server = null;
+    }
+
+    this.app = null;
+    this.isRunning = false;
+    this.startedAt = null;
+    this.healthState.status = 'offline';
+    this.healthState.services.gatewayStatus = 'offline';
+
+    this.emit('status', this.getStatus());
+  }
+
+  getStatus() {
+    return {
+      running: this.isRunning,
+      port: this.config?.port || DEFAULT_PORT,
+      hostname: this.config?.hostname || 'localhost',
+      startedAt: this.startedAt,
+      urls: this.config?.urls || this.gatewayServer?.getServerUrls() || null,
+      health: this.healthState,
+      peers: this.activePeers.length,
+      relays: this.activeRelays.size
+    };
+  }
+
+  getDiagnostics() {
+    const peerList = this.activePeers.map(peer => ({
+      publicKey: peer.publicKey,
+      status: this.peerHealthManager.isPeerHealthy(peer.publicKey) ? 'healthy' : 'unknown',
+      relayCount: peer.relays?.size || 0,
+      lastSeen: peer.lastSeen,
+      mode: peer.mode
+    }));
+
+    const relays = Array.from(this.activeRelays.entries()).map(([identifier, relay]) => ({
+      identifier,
+      peers: Array.from(relay.peers)
+    }));
+
+    return {
+      peers: {
+        totalActive: peerList.length,
+        list: peerList
+      },
+      relays: {
+        totalActive: relays.length,
+        list: relays
+      }
+    };
+  }
+
+  getLogs() {
+    return [...this.logs];
+  }
+
+  setupRoutes() {
+    if (!this.app) return;
+
+    this.app.get('/', (_req, res) => {
+      res.json({
+        status: this.isRunning ? 'ok' : 'offline',
+        peers: this.activePeers.length,
+        relays: this.activeRelays.size,
+        timestamp: new Date().toISOString()
+      });
+    });
+
+    this.app.get('/health', (_req, res) => {
+      res.json({
+        status: this.isRunning ? 'healthy' : 'offline',
+        mode: 'hyperswarm',
+        timestamp: new Date().toISOString()
+      });
+    });
+
+    this.app.get('/debug/connections', (_req, res) => {
+      res.json(this.getDiagnostics());
+    });
+
+    this.app.post('/register', async (req, res) => {
+      try {
+        const { publicKey, relays, mode = 'hyperswarm', address } = req.body || {};
+        if (!publicKey) {
+          return res.status(400).json({ error: 'Public key is required' });
+        }
+
+        let peer = this.activePeers.find(p => p.publicKey === publicKey);
+        if (!peer) {
+          peer = {
+            publicKey,
+            lastSeen: Date.now(),
+            relays: new Set(),
+            status: 'registered',
+            registeredAt: Date.now(),
+            mode
+          };
+          this.activePeers.push(peer);
+        } else {
+          peer.lastSeen = Date.now();
+          peer.status = 'registered';
+          peer.mode = mode;
+        }
+
+        if (Array.isArray(relays)) {
+          relays.forEach(entry => {
+            const identifier = typeof entry === 'string' ? entry : entry.identifier;
+            if (!identifier) return;
+
+            peer.relays.add(identifier);
+            if (!this.activeRelays.has(identifier)) {
+              this.activeRelays.set(identifier, {
+                peers: new Set(),
+                status: 'active',
+                createdAt: Date.now(),
+                lastActive: Date.now()
+              });
+            }
+            const relayData = this.activeRelays.get(identifier);
+            relayData.peers.add(publicKey);
+            relayData.lastActive = Date.now();
+          });
+        }
+
+        peer.address = address || null;
+        peer.lastSeen = Date.now();
+        this.healthState.activeRelaysCount = this.activeRelays.size;
+
+        // Attempt to establish connection asynchronously
+        setTimeout(async () => {
+          try {
+            await this.connectionPool.getConnection(publicKey);
+            peer.status = 'connected';
+            await this.peerHealthManager.checkPeerHealth(peer, this.connectionPool);
+            this.emit('status', this.getStatus());
+          } catch (error) {
+            this.log('warn', `Failed to connect to peer ${publicKey.slice(0, 8)}: ${error.message}`);
+          }
+        }, 1000);
+
+        this.emit('status', this.getStatus());
+
+        res.json({
+          message: 'Registered successfully (Hyperswarm mode)',
+          status: 'active',
+          mode: 'hyperswarm',
+          timestamp: new Date().toISOString()
+        });
+      } catch (error) {
+        this.log('error', `Registration failed: ${error.message}`);
+        res.status(500).json({ error: error.message });
+      }
+    });
+
+    this.app.post('/callback/finalize-auth/:identifier', async (req, res) => {
+      const identifier = req.params.identifier;
+      try {
+        const { pubkey } = req.body || {};
+        if (!pubkey) {
+          return res.status(400).json({ error: 'Missing pubkey' });
+        }
+
+        const sessionKey = `${pubkey}-${identifier}`;
+        const session = global.joinSessions?.get(sessionKey);
+        if (!session || !session.token) {
+          return res.status(400).json({ error: 'Session not found or verification not completed' });
+        }
+
+        const peer = this.activePeers.find(p => p.publicKey === session.peerPublicKey);
+        if (!peer) {
+          return res.status(503).json({ error: 'Peer no longer available' });
+        }
+
+        const result = await forwardCallbackToPeer(
+          peer,
+          '/finalize-auth',
+          {
+            pubkey,
+            token: session.token,
+            identifier
+          },
+          this.connectionPool
+        );
+
+        global.joinSessions.delete(sessionKey);
+        res.json(result);
+      } catch (error) {
+        this.log('error', `Finalize auth error: ${error.message}`);
+        res.status(500).json({ error: 'Finalization failed', message: error.message });
+      }
+    });
+
+    this.app.get('/drive/:identifier/:file', async (req, res) => {
+      const { identifier, file } = req.params;
+      try {
+        const peer = await this.findHealthyPeerForRelay(identifier);
+        if (!peer) {
+          return res.status(503).json({ error: 'No healthy peers available for this relay' });
+        }
+
+        const stream = await requestFileFromPeer(peer, identifier, file, this.connectionPool);
+        Object.entries(stream.headers).forEach(([key, value]) => res.setHeader(key, value));
+        res.status(stream.statusCode);
+        stream.pipe(res);
+        peer.lastSeen = Date.now();
+      } catch (error) {
+        this.log('error', `Drive file error: ${error.message}`);
+        res.status(500).json({ error: 'Internal Server Error', message: error.message });
+      }
+    });
+
+    this.app.use(async (req, res, next) => {
+      if (req.path === '/health' || req.path === '/register' || req.path.startsWith('/callback')) {
+        return next();
+      }
+
+      if (this.activePeers.length === 0) {
+        return res.status(503).json({
+          status: 'error',
+          message: 'No peers available',
+          timestamp: new Date().toISOString()
+        });
+      }
+
+      const hyperswarmPeers = this.activePeers.filter(p => p.mode === 'hyperswarm');
+      if (!hyperswarmPeers.length) {
+        return res.status(503).json({ error: 'No Hyperswarm peers available' });
+      }
+
+      const targetPeer = hyperswarmPeers[Math.floor(Math.random() * hyperswarmPeers.length)];
+      try {
+        const response = await forwardRequestToPeer(targetPeer, {
+          method: req.method,
+          path: req.url,
+          headers: req.headers,
+          body: req.body ? Buffer.from(JSON.stringify(req.body)) : undefined
+        }, this.connectionPool);
+
+        Object.entries(response.headers || {}).forEach(([key, value]) => {
+          if (value !== undefined) {
+            res.setHeader(key, value);
+          }
+        });
+        res.status(response.statusCode || 200);
+        res.send(response.body || Buffer.alloc(0));
+      } catch (error) {
+        this.log('error', `Forward request error: ${error.message}`);
+        res.status(502).json({ error: error.message });
+      }
+    });
+  }
+
+  handleGatewayWebSocketConnection(ws, req) {
+    const pathname = url.parse(req.url).pathname || '';
+    const parts = pathname.split('/').filter(Boolean);
+    const identifier = parts.length >= 2 ? `${parts[0]}:${parts[1]}` : parts[0];
+    const parsedUrl = url.parse(req.url, true);
+    const authToken = parsedUrl.query.token || null;
+
+    if (this.activeRelays.has(identifier)) {
+      this.handleWebSocket(ws, identifier, authToken);
+    } else {
+      ws.close(1008, 'Invalid relay key');
+    }
+  }
+
+  handleWebSocket(ws, identifier, authToken = null) {
+    const connectionKey = generateConnectionKey();
+    this.wsConnections.set(connectionKey, {
+      ws,
+      relayKey: identifier,
+      authToken
+    });
+
+    const messageQueue = new MessageQueue();
+    this.messageQueues.set(connectionKey, messageQueue);
+
+    ws.on('message', async (message) => {
+      await messageQueue.enqueue(message, async (msg) => {
+        const connData = this.wsConnections.get(connectionKey);
+        if (!connData) {
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify(['NOTICE', 'Internal server error: connection data missing']));
+          }
+          return;
+        }
+
+        const healthyPeer = await this.findHealthyPeerForRelay(identifier);
+        if (!healthyPeer) {
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify(['NOTICE', 'No healthy peers available for this relay']));
+          }
+          return;
+        }
+
+        try {
+          const responses = await forwardMessageToPeerHyperswarm(
+            healthyPeer.publicKey,
+            identifier,
+            msg,
+            connectionKey,
+            this.connectionPool,
+            connData.authToken
+          );
+
+          for (const response of responses) {
+            if (!response) continue;
+            if (response[0] === 'OK' && response[2] === false) {
+              const errorMsg = response[3] || '';
+              if (errorMsg.includes('Authentication') && ws.readyState === WebSocket.OPEN) {
+                ws.close(4403, 'Authentication failed');
+                return;
+              }
+            }
+            if (ws.readyState === WebSocket.OPEN) {
+              ws.send(JSON.stringify(response));
+            }
+          }
+        } catch (error) {
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify(['NOTICE', `Error: ${error.message}`]));
+          }
+        }
+      });
+    });
+
+    ws.on('close', () => {
+      this.cleanupConnection(connectionKey);
+    });
+
+    ws.on('error', () => {
+      this.cleanupConnection(connectionKey);
+    });
+
+    this.startEventChecking(connectionKey);
+  }
+
+  cleanupConnection(connectionKey) {
+    const data = this.wsConnections.get(connectionKey);
+    if (!data) return;
+
+    this.wsConnections.delete(connectionKey);
+    this.messageQueues.delete(connectionKey);
+    const timer = this.eventCheckTimers.get(connectionKey);
+    if (timer) {
+      clearTimeout(timer);
+      this.eventCheckTimers.delete(connectionKey);
+    }
+  }
+
+  async startEventChecking(connectionKey) {
+    const loop = async () => {
+      const connectionData = this.wsConnections.get(connectionKey);
+      if (!connectionData) {
+        this.eventCheckTimers.delete(connectionKey);
+        return;
+      }
+
+      const { ws, relayKey: identifier, authToken } = connectionData;
+      if (ws.readyState !== WebSocket.OPEN) {
+        this.cleanupConnection(connectionKey);
+        return;
+      }
+
+      try {
+        const healthyPeer = await this.findHealthyPeerForRelay(identifier, true);
+        if (!healthyPeer) {
+          ws.send(JSON.stringify(['NOTICE', 'Gateway temporarily unavailable - no healthy peers']));
+        } else {
+          const events = await getEventsFromPeerHyperswarm(
+            healthyPeer.publicKey,
+            identifier,
+            connectionKey,
+            this.connectionPool,
+            authToken
+          );
+
+          for (const event of events) {
+            if (ws.readyState === WebSocket.OPEN) {
+              ws.send(JSON.stringify(event));
+            }
+          }
+        }
+      } catch (error) {
+        this.log('warn', `Event check failed: ${error.message}`);
+      }
+
+      const timer = setTimeout(loop, 10000);
+      this.eventCheckTimers.set(connectionKey, timer);
+    };
+
+    const timer = setTimeout(loop, 1000);
+    this.eventCheckTimers.set(connectionKey, timer);
+  }
+
+  async findHealthyPeerForRelay(identifier, allowRetry = false) {
+    const relay = this.activeRelays.get(identifier);
+    if (!relay) return null;
+
+    const peerKeys = Array.from(relay.peers);
+    if (!peerKeys.length) return null;
+
+    for (const publicKey of peerKeys) {
+      const peer = this.activePeers.find(p => p.publicKey === publicKey);
+      if (!peer) continue;
+      const healthy = this.peerHealthManager.isPeerHealthy(publicKey);
+      if (healthy) {
+        return peer;
+      }
+    }
+
+    if (allowRetry) {
+      for (const publicKey of peerKeys) {
+        const peer = this.activePeers.find(p => p.publicKey === publicKey);
+        if (!peer) continue;
+        const healthy = await this.peerHealthManager.checkPeerHealth(peer, this.connectionPool);
+        if (healthy) {
+          return peer;
+        }
+      }
+    }
+
+    return null;
+  }
+}
+
+export default GatewayService;
