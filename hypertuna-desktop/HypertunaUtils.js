@@ -7,6 +7,12 @@
 
 import { NostrUtils } from './NostrUtils.js';
 import { ConfigLogger } from './ConfigLogger.js';
+import {
+    loadGatewaySettings,
+    updateGatewaySettings,
+    getCachedGatewaySettings,
+    deriveGatewayProxyHost
+} from '../shared/config/GatewaySettings.mjs';
 
 // Import hypercore-crypto library
 // Note: Make sure to add "hypercore-crypto": "^3.5.0" to your package.json dependencies
@@ -20,11 +26,33 @@ export class HypertunaUtils {
      * Default context string for key derivation
      */
     static DEFAULT_CONTEXT = 'hypertuna-relay-peer';
-    
-    /**
-     * Default gateway URL
-     */
-    static DEFAULT_GATEWAY_URL = 'https://hypertuna.com';
+
+    static async getGatewaySettings() {
+        return loadGatewaySettings();
+    }
+
+    static getCachedGatewaySettings() {
+        return getCachedGatewaySettings();
+    }
+
+    static async getDefaultGatewayUrl() {
+        const settings = await loadGatewaySettings();
+        return settings.gatewayUrl;
+    }
+
+    static getCachedGatewayUrl() {
+        const settings = getCachedGatewaySettings();
+        return settings.gatewayUrl;
+    }
+
+    static getGatewayHost(value) {
+        return deriveGatewayProxyHost(value);
+    }
+
+    static async persistGatewaySettings(gatewayUrl) {
+        const proxyHost = deriveGatewayProxyHost(gatewayUrl);
+        return updateGatewaySettings({ gatewayUrl, proxyHost });
+    }
     
     /**
      * LocalStorage key for Hypertuna configuration
@@ -231,20 +259,13 @@ export class HypertunaUtils {
      * @param {string} gatewayUrl - Gateway URL (optional)
      * @returns {Promise<Object>} - Hypertuna configuration
      */
-    static async generateHypertunaConfig(privateKeyHex, publicKeyHex, gatewayUrl = this.DEFAULT_GATEWAY_URL) {
+    static async generateHypertunaConfig(privateKeyHex, publicKeyHex, gatewayUrl) {
+        const effectiveGatewayUrl = gatewayUrl || await this.getDefaultGatewayUrl();
+        const cachedSettings = this.getCachedGatewaySettings();
+        const proxyHost = this.getGatewayHost(effectiveGatewayUrl) || cachedSettings.proxyHost;
         try {
             // Derive the keypair for Hypertuna relay
             const derivedKeypair = await this.deriveHypertunaKeypair(privateKeyHex);
-            
-            // Extract the hostname from the gateway URL
-            let hostname = gatewayUrl;
-            try {
-                const url = new URL(gatewayUrl);
-                hostname = url.hostname;
-            } catch (e) {
-                // If URL parsing fails, just use the raw value
-                console.warn('Failed to parse gateway URL, using raw value');
-            }
             
             // Generate bech32 encoded values
             const nostr_npub = NostrUtils.hexToNpub(publicKeyHex);
@@ -267,8 +288,8 @@ export class HypertunaUtils {
                 swarmPublicKey: derivedKeypair.publicKey,
                 
                 // Server configuration
-                proxy_server_address: hostname,
-                gatewayUrl: gatewayUrl,
+                proxy_server_address: proxyHost,
+                gatewayUrl: effectiveGatewayUrl,
                 registerWithGateway: true,
                 registerInterval: 300000
             };
@@ -298,8 +319,8 @@ export class HypertunaUtils {
                 swarmPublicKey: fallbackKeypair.publicKey,
                 
                 // Server configuration
-                proxy_server_address: new URL(gatewayUrl).hostname || 'hypertuna.com',
-                gatewayUrl: gatewayUrl,
+                proxy_server_address: proxyHost,
+                gatewayUrl: effectiveGatewayUrl,
                 registerWithGateway: true,
                 registerInterval: 300000
             };
@@ -516,15 +537,16 @@ export class HypertunaUtils {
      * @param {string} gatewayUrl - Gateway URL (optional)
      * @returns {Promise<Object>} - Hypertuna configuration
      */
-    static async setupUserConfig(user, gatewayUrl = this.DEFAULT_GATEWAY_URL) {
+    static async setupUserConfig(user, gatewayUrl) {
         if (!user || !user.privateKey || !user.pubkey) {
             throw new Error('Invalid user object');
         }
         
+        const effectiveGatewayUrl = gatewayUrl || await this.getDefaultGatewayUrl();
         const config = await this.generateHypertunaConfig(
             user.privateKey,
             user.pubkey,
-            gatewayUrl
+            effectiveGatewayUrl
         );
         
         await this.saveConfig(config);

@@ -10,6 +10,7 @@ let pendingWorkerMessages = [];
 const userDataPath = app.getPath('userData');
 const storagePath = path.join(userDataPath, 'hypertuna-data');
 const logFilePath = path.join(storagePath, 'desktop-console.log');
+const gatewaySettingsPath = path.join(storagePath, 'gateway-settings.json');
 
 async function ensureStorageDir() {
   try {
@@ -190,6 +191,31 @@ ipcMain.handle('write-config', async (_event, config) => {
     return { success: true };
   } catch (error) {
     console.error('[Main] Failed to write config', error);
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('read-gateway-settings', async () => {
+  try {
+    await ensureStorageDir();
+    const data = await fs.readFile(gatewaySettingsPath, 'utf8');
+    return { success: true, data: JSON.parse(data) };
+  } catch (error) {
+    if (error && error.code === 'ENOENT') {
+      return { success: true, data: null };
+    }
+    console.error('[Main] Failed to read gateway settings', error);
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('write-gateway-settings', async (_event, settings) => {
+  try {
+    await ensureStorageDir();
+    await fs.writeFile(gatewaySettingsPath, JSON.stringify(settings, null, 2), 'utf8');
+    return { success: true };
+  } catch (error) {
+    console.error('[Main] Failed to write gateway settings', error);
     return { success: false, error: error.message };
   }
 });

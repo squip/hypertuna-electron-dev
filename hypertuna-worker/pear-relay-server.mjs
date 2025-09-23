@@ -45,6 +45,7 @@ import {
 } from './hypertuna-relay-profile-manager-bare.mjs';
 
 import { getFile } from './hyperdrive-manager.mjs';
+import { loadGatewaySettings, getCachedGatewaySettings } from '../shared/config/GatewaySettings.mjs';
 
 
 // Global state
@@ -80,6 +81,17 @@ export async function initializeRelayServer(customConfig = {}) {
   console.log('[RelayServer] Initializing with Hyperswarm support...');
   console.log('[RelayServer] Timestamp:', new Date().toISOString());
   
+  const fallbackGatewaySettings = getCachedGatewaySettings();
+  let gatewaySettings = fallbackGatewaySettings;
+  try {
+    gatewaySettings = await loadGatewaySettings();
+  } catch (error) {
+    console.error('[RelayServer] Failed to load gateway settings, using cached defaults:', error);
+  }
+
+  const defaultGatewayUrl = gatewaySettings.gatewayUrl || fallbackGatewaySettings.gatewayUrl;
+  const defaultProxyHost = gatewaySettings.proxyHost || fallbackGatewaySettings.proxyHost;
+
   // Merge with defaults
   config = {
     userKey: customConfig.userKey,  // Preserve user key
@@ -89,8 +101,8 @@ export async function initializeRelayServer(customConfig = {}) {
     proxy_privateKey: customConfig.proxy_privateKey || generateHexKey(),
     proxy_publicKey: customConfig.proxy_publicKey || generateHexKey(),
     proxy_seed: customConfig.proxy_seed || generateHexKey(),
-    proxy_server_address: customConfig.proxy_server_address || 'hypertuna.com',
-    gatewayUrl: customConfig.gatewayUrl || 'https://hypertuna.com',
+    proxy_server_address: customConfig.proxy_server_address || defaultProxyHost,
+    gatewayUrl: customConfig.gatewayUrl || defaultGatewayUrl,
     registerWithGateway: customConfig.registerWithGateway ?? true,
     registerInterval: customConfig.registerInterval || 60000,
     relays: customConfig.relays || [],

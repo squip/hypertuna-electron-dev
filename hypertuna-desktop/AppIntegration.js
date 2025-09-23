@@ -557,23 +557,25 @@ function integrateNostrRelays(App) {
     /**
      * New method to update Hypertuna configuration display
      */
-    App.updateHypertunaDisplay = function() {
+    App.updateHypertunaDisplay = async function() {
         if (!this.currentUser || !this.currentUser.hypertunaConfig) return;
-        
-        const config = this.currentUser.hypertunaConfig;
-        
-        // Find or create the Hypertuna section in the profile page
-        let hypertunaSection = document.getElementById('hypertuna-config-section');
-        
-        if (!hypertunaSection) {
-            // Create the section if it doesn't exist
-            const profilePage = document.querySelector('#page-profile .profile-container');
-            if (!profilePage) return;
-            
-            hypertunaSection = document.createElement('div');
-            hypertunaSection.id = 'hypertuna-config-section';
-            hypertunaSection.className = 'profile-section';
-            hypertunaSection.innerHTML = `
+
+        try {
+            const config = this.currentUser.hypertunaConfig;
+            const gatewaySettings = await HypertunaUtils.getGatewaySettings();
+            const placeholderGateway = gatewaySettings.gatewayUrl;
+
+            // Find or create the Hypertuna section in the profile page
+            let hypertunaSection = document.getElementById('hypertuna-config-section');
+
+            if (!hypertunaSection) {
+                const profilePage = document.querySelector('#page-profile .profile-container');
+                if (!profilePage) return;
+
+                hypertunaSection = document.createElement('div');
+                hypertunaSection.id = 'hypertuna-config-section';
+                hypertunaSection.className = 'profile-section';
+                hypertunaSection.innerHTML = `
                 <h3>Hypertuna Relay Node Configuration</h3>
                 <div class="form-group">
                     <label>Peer Public Key</label>
@@ -610,70 +612,72 @@ function integrateNostrRelays(App) {
                 </div>
                 <div class="form-group">
                     <label for="hypertuna-gateway-url">Gateway Server Address</label>
-                    <input type="text" id="hypertuna-gateway-url" class="form-input" placeholder="https://hypertuna.com">
+                    <input type="text" id="hypertuna-gateway-url" class="form-input" placeholder="${placeholderGateway}">
                 </div>
                 <button id="btn-update-hypertuna" class="btn btn-primary">Update Hypertuna Settings</button>
             `;
-            
-            // Add the section before the last section (relay configuration)
-            const relaySection = profilePage.querySelector('.profile-section:last-child');
-            if (relaySection) {
-                profilePage.insertBefore(hypertunaSection, relaySection);
-            } else {
-                profilePage.appendChild(hypertunaSection);
-            }
-            
-            // Add event listeners for the toggle buttons
-            document.getElementById('btn-toggle-hypertuna-privkey').addEventListener('click', () => {
-                const input = document.getElementById('hypertuna-privkey-display');
-                input.type = input.type === 'password' ? 'text' : 'password';
-            });
-            
-            document.getElementById('btn-toggle-hypertuna-seed').addEventListener('click', () => {
-                const input = document.getElementById('hypertuna-seed-display');
-                input.type = input.type === 'password' ? 'text' : 'password';
-            });
-            
-            // Add event listener for the update button
-            document.getElementById('btn-update-hypertuna').addEventListener('click', () => {
-                this.updateHypertunaSettings();
-            });
-            
-            // Add event listeners for copy buttons
-            hypertunaSection.querySelectorAll('.copy-btn').forEach(btn => {
-                btn.addEventListener('click', () => {
-                    const targetId = btn.dataset.copy;
-                    const target = document.getElementById(targetId);
-                    if (target) {
-                        const isPassword = target.type === 'password';
-                        if (isPassword) target.type = 'text';
-                        target.select();
-                        document.execCommand('copy');
-                        if (isPassword) target.type = 'password';
-                        
-                        // Show feedback
-                        const originalText = btn.textContent;
-                        btn.textContent = 'Copied!';
-                        setTimeout(() => {
-                            btn.textContent = originalText;
-                        }, 2000);
-                    }
+
+                const relaySection = profilePage.querySelector('.profile-section:last-child');
+                if (relaySection) {
+                    profilePage.insertBefore(hypertunaSection, relaySection);
+                } else {
+                    profilePage.appendChild(hypertunaSection);
+                }
+
+                document.getElementById('btn-toggle-hypertuna-privkey').addEventListener('click', () => {
+                    const input = document.getElementById('hypertuna-privkey-display');
+                    input.type = input.type === 'password' ? 'text' : 'password';
                 });
-            });
+
+                document.getElementById('btn-toggle-hypertuna-seed').addEventListener('click', () => {
+                    const input = document.getElementById('hypertuna-seed-display');
+                    input.type = input.type === 'password' ? 'text' : 'password';
+                });
+
+                document.getElementById('btn-update-hypertuna').addEventListener('click', () => {
+                    this.updateHypertunaSettings().catch((error) => {
+                        console.error('[App] Failed to update Hypertuna settings:', error);
+                    });
+                });
+
+                hypertunaSection.querySelectorAll('.copy-btn').forEach(btn => {
+                    btn.addEventListener('click', () => {
+                        const targetId = btn.dataset.copy;
+                        const target = document.getElementById(targetId);
+                        if (target) {
+                            const isPassword = target.type === 'password';
+                            if (isPassword) target.type = 'text';
+                            target.select();
+                            document.execCommand('copy');
+                            if (isPassword) target.type = 'password';
+
+                            const originalText = btn.textContent;
+                            btn.textContent = 'Copied!';
+                            setTimeout(() => {
+                                btn.textContent = originalText;
+                            }, 2000);
+                        }
+                    });
+                });
+            }
+
+            const pubkeyInput = document.getElementById('hypertuna-pubkey-display');
+            if (pubkeyInput) pubkeyInput.value = config.swarmPublicKey || '';
+
+            const privkeyInput = document.getElementById('hypertuna-privkey-display');
+            if (privkeyInput) privkeyInput.value = config.proxy_privateKey || '';
+
+            const seedInput = document.getElementById('hypertuna-seed-display');
+            if (seedInput) seedInput.value = config.proxy_seed || '';
+
+            const gatewayInput = document.getElementById('hypertuna-gateway-url');
+            if (gatewayInput) {
+                gatewayInput.placeholder = placeholderGateway;
+                gatewayInput.value = config.gatewayUrl || placeholderGateway;
+            }
+        } catch (error) {
+            console.error('[App] Failed to update Hypertuna display:', error);
         }
-        
-        // Populate the fields with the current configuration
-        const pubkeyInput = document.getElementById('hypertuna-pubkey-display');
-        if (pubkeyInput) pubkeyInput.value = config.swarmPublicKey;
-        
-        const privkeyInput = document.getElementById('hypertuna-privkey-display');
-        if (privkeyInput) privkeyInput.value = config.proxy_privateKey || config.proxy_privateKey;
-        
-        const seedInput = document.getElementById('hypertuna-seed-display');
-        if (seedInput) seedInput.value = config.proxy_seed;
-        
-        const gatewayInput = document.getElementById('hypertuna-gateway-url');
-        if (gatewayInput) gatewayInput.value = config.gatewayUrl;
     };
 
     /**
@@ -738,53 +742,74 @@ App.syncHypertunaConfigToFile = async function() {
         
         if (!this.currentUser || !this.currentUser.hypertunaConfig) return;
         
-        const gatewayUrl = document.getElementById('hypertuna-gateway-url').value.trim();
-        
+        const gatewayInput = document.getElementById('hypertuna-gateway-url');
+        const gatewayUrl = gatewayInput ? gatewayInput.value.trim() : '';
+
         if (!gatewayUrl) {
             alert('Please enter a valid gateway URL');
             return;
         }
         
-        // Extract the hostname from the gateway URL
-        let hostname;
         try {
-            const url = new URL(gatewayUrl);
-            hostname = url.hostname;
-        } catch (e) {
-            console.warn('Failed to parse gateway URL, using raw value');
-            hostname = gatewayUrl;
-        }
-        
-        // Update the configuration
-        this.currentUser.hypertunaConfig.gatewayUrl = gatewayUrl;
-        this.currentUser.hypertunaConfig.proxy_server_address = hostname;
-        
-        // Save the updated configuration
-        try {
-            localStorage.setItem('hypertuna_config', JSON.stringify(this.currentUser.hypertunaConfig));
+            const updatedSettings = await HypertunaUtils.persistGatewaySettings(gatewayUrl);
+            const normalizedGatewayUrl = updatedSettings.gatewayUrl;
+            const proxyHost = updatedSettings.proxyHost;
+
+            this.currentUser.hypertunaConfig.gatewayUrl = normalizedGatewayUrl;
+            this.currentUser.hypertunaConfig.proxy_server_address = proxyHost;
+
+            await HypertunaUtils.saveConfig(this.currentUser.hypertunaConfig);
+
+            try {
+                localStorage.setItem('hypertuna_config', JSON.stringify(this.currentUser.hypertunaConfig));
+                ConfigLogger.log('UPDATE', {
+                    module: 'AppIntegration',
+                    method: 'updateHypertunaSettings',
+                    filepath: 'localStorage',
+                    key: 'hypertuna_config',
+                    success: true,
+                    dataSize: ConfigLogger.getDataSize(this.currentUser.hypertunaConfig)
+                });
+            } catch (e) {
+                ConfigLogger.log('UPDATE', {
+                    module: 'AppIntegration',
+                    method: 'updateHypertunaSettings',
+                    filepath: 'localStorage',
+                    key: 'hypertuna_config',
+                    success: false,
+                    error: e.message
+                });
+            }
+
+            this.saveUserToLocalStorage();
+
+            if (gatewayInput) {
+                gatewayInput.value = normalizedGatewayUrl;
+                gatewayInput.placeholder = normalizedGatewayUrl;
+            }
+
             ConfigLogger.log('UPDATE', {
                 module: 'AppIntegration',
                 method: 'updateHypertunaSettings',
-                filepath: 'localStorage',
-                key: 'hypertuna_config',
-                success: true,
-                dataSize: ConfigLogger.getDataSize(this.currentUser.hypertunaConfig)
+                target: 'gateway-settings',
+                success: true
             });
-        } catch (e) {
+
+            await this.updateHypertunaDisplay();
+
+            alert('Hypertuna configuration updated successfully');
+        } catch (error) {
             ConfigLogger.log('UPDATE', {
                 module: 'AppIntegration',
                 method: 'updateHypertunaSettings',
-                filepath: 'localStorage',
-                key: 'hypertuna_config',
+                target: 'gateway-settings',
                 success: false,
-                error: e.message
+                error: error.message
             });
+
+            console.error('[App] Failed to persist Hypertuna settings:', error);
+            alert(`Failed to update Hypertuna settings: ${error.message}`);
         }
-        
-        // Save the user data with the updated configuration
-        this.saveUserToLocalStorage();
-        
-        alert('Hypertuna configuration updated successfully');
     };
     
  
@@ -1864,7 +1889,8 @@ App.syncHypertunaConfigToFile = async function() {
             );
 
             // Send the event to the gateway
-            const gatewayUrl = this.currentUser.hypertunaConfig?.gatewayUrl || HypertunaUtils.DEFAULT_GATEWAY_URL;
+            const gatewaySettings = await HypertunaUtils.getGatewaySettings();
+            const gatewayUrl = this.currentUser.hypertunaConfig?.gatewayUrl || gatewaySettings.gatewayUrl;
             const response = await fetch(`${gatewayUrl}/post/join/${this.currentGroupId}`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },

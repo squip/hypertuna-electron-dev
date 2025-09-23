@@ -38,6 +38,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
   onWorkerStderr: registerListener('worker-stderr'),
   readConfig: () => ipcRenderer.invoke('read-config'),
   writeConfig: (config) => ipcRenderer.invoke('write-config', config),
+  readGatewaySettings: () => ipcRenderer.invoke('read-gateway-settings'),
+  writeGatewaySettings: (settings) => ipcRenderer.invoke('write-gateway-settings', settings),
   getStoragePath: () => ipcRenderer.invoke('get-storage-path'),
   getLogFilePath: () => ipcRenderer.invoke('get-log-file-path'),
   appendLogLine: (line) => ipcRenderer.invoke('append-log-line', line),

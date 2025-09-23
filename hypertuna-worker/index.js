@@ -37,6 +37,7 @@ import {
 import { ensureMirrorsForProviders, stopAllMirrors } from './mirror-sync-manager.mjs';
 import { NostrUtils } from './nostr-utils.js';
 import { getRelayKeyFromPublicIdentifier } from './relay-lookup-utils.mjs';
+import { loadGatewaySettings, getCachedGatewaySettings } from '../shared/config/GatewaySettings.mjs';
 
 const pearRuntime = globalThis?.Pear
 const __dirname = process.env.APP_DIR || pearRuntime?.config?.dir || process.cwd()
@@ -173,10 +174,15 @@ async function loadOrCreateConfig(customDir = null) {
 
   configPath = join(configDir, 'relay-config.json')
 
+  const gatewaySettings = await loadGatewaySettings()
+  const cachedGatewaySettings = getCachedGatewaySettings()
+  const defaultGatewayUrl = gatewaySettings.gatewayUrl || cachedGatewaySettings.gatewayUrl
+  const defaultProxyHost = gatewaySettings.proxyHost || cachedGatewaySettings.proxyHost
+
   const defaultConfig = {
     port: 1945,
-    gatewayUrl: 'https://hypertuna.com',
-    proxy_server_address: 'hypertuna.com',
+    gatewayUrl: defaultGatewayUrl,
+    proxy_server_address: defaultProxyHost,
     registerWithGateway: true,
     registerInterval: 300000,
     relays: [],
