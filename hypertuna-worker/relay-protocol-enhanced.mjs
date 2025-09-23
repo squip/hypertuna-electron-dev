@@ -51,10 +51,11 @@ const httpResponseEncoding = {
 };
 
 export class RelayProtocol extends EventEmitter {
-  constructor(stream, isServer = false) {
+  constructor(stream, isServer = false, handshakeData = {}) {
     super();
     
     this.isServer = isServer;
+    this.handshakeData = handshakeData || {};
     this.mux = Protomux.from(stream);
     this.channel = null;
     this.requests = new Map(); // For tracking pending requests
@@ -114,6 +115,10 @@ export class RelayProtocol extends EventEmitter {
       isServer: this.isServer,
       capabilities: ['http', 'websocket', 'health']
     };
+
+    if (this.handshakeData && typeof this.handshakeData === 'object') {
+      Object.assign(handshake, this.handshakeData);
+    }
     this.channel.open(handshake);
   }
   

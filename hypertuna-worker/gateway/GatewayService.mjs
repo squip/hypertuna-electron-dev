@@ -166,7 +166,10 @@ export class GatewayService extends EventEmitter {
     this.wss = null;
     this.app = null;
     this.gatewayServer = null;
-    this.connectionPool = new EnhancedHyperswarmPool();
+    this.connectionPool = new EnhancedHyperswarmPool({
+      onProtocol: this._onProtocolCreated.bind(this),
+      onHandshake: this._onProtocolHandshake.bind(this)
+    });
     this.peerHealthManager = new PeerHealthManager();
     this.activePeers = [];
     this.activeRelays = new Map();
@@ -195,6 +198,28 @@ export class GatewayService extends EventEmitter {
     };
     this.healthInterval = null;
     this.eventCheckTimers = new Map();
+    this.peerHandshakes = new Map();
+  }
+
+  _onProtocolCreated({ publicKey, protocol, context = {} }) {
+    if (!protocol) return;
+    const isServer = !!context.isServer;
+    if (!isServer) return;
+
+    protocol.handle('/gateway/register', async (request) => {
+      return this._handleGatewayRegisterRequest(publicKey, request);
+    });
+  }
+
+  _onProtocolHandshake({ publicKey, handshake, context = {} }) {
+    if (!handshake) return;
+    this.peerHandshakes.set(publicKey, handshake);
+
+    if (handshake.role === 'relay' || handshake.isGateway === false) {
+      this.healthState.services.hyperswarmStatus = 'connected';
+      this.healthState.services.protocolStatus = 'connected';
+      this.emit('status', this.getStatus());
+    }
   }
 
   log(level, message) {
@@ -383,75 +408,12 @@ export class GatewayService extends EventEmitter {
 
     this.app.post('/register', async (req, res) => {
       try {
-        const { publicKey, relays, mode = 'hyperswarm', address } = req.body || {};
-        if (!publicKey) {
-          return res.status(400).json({ error: 'Public key is required' });
-        }
-
-        let peer = this.activePeers.find(p => p.publicKey === publicKey);
-        if (!peer) {
-          peer = {
-            publicKey,
-            lastSeen: Date.now(),
-            relays: new Set(),
-            status: 'registered',
-            registeredAt: Date.now(),
-            mode
-          };
-          this.activePeers.push(peer);
-        } else {
-          peer.lastSeen = Date.now();
-          peer.status = 'registered';
-          peer.mode = mode;
-        }
-
-        if (Array.isArray(relays)) {
-          relays.forEach(entry => {
-            const identifier = typeof entry === 'string' ? entry : entry.identifier;
-            if (!identifier) return;
-
-            peer.relays.add(identifier);
-            if (!this.activeRelays.has(identifier)) {
-              this.activeRelays.set(identifier, {
-                peers: new Set(),
-                status: 'active',
-                createdAt: Date.now(),
-                lastActive: Date.now()
-              });
-            }
-            const relayData = this.activeRelays.get(identifier);
-            relayData.peers.add(publicKey);
-            relayData.lastActive = Date.now();
-          });
-        }
-
-        peer.address = address || null;
-        peer.lastSeen = Date.now();
-        this.healthState.activeRelaysCount = this.activeRelays.size;
-
-        // Attempt to establish connection asynchronously
-        setTimeout(async () => {
-          try {
-            await this.connectionPool.getConnection(publicKey);
-            peer.status = 'connected';
-            await this.peerHealthManager.checkPeerHealth(peer, this.connectionPool);
-            this.emit('status', this.getStatus());
-          } catch (error) {
-            this.log('warn', `Failed to connect to peer ${publicKey.slice(0, 8)}: ${error.message}`);
-          }
-        }, 1000);
-
-        this.emit('status', this.getStatus());
-
-        res.json({
-          message: 'Registered successfully (Hyperswarm mode)',
-          status: 'active',
-          mode: 'hyperswarm',
-          timestamp: new Date().toISOString()
-        });
+        const result = await this.registerPeerMetadata(req.body || {}, { source: 'http' });
+        res.json(result);
       } catch (error) {
+        const statusCode = error.message === 'Public key is required' ? 400 : 500;
         this.log('error', `Registration failed: ${error.message}`);
-        res.status(500).json({ error: error.message });
+        res.status(statusCode).json({ error: error.message });
       }
     });
 
@@ -551,6 +513,124 @@ export class GatewayService extends EventEmitter {
         res.status(502).json({ error: error.message });
       }
     });
+  }
+
+  async registerPeerMetadata(data = {}, options = {}) {
+    const { skipConnect = false, source = 'unknown' } = options;
+    const { publicKey, relays, mode = 'hyperswarm', address } = data;
+
+    if (!publicKey) {
+      throw new Error('Public key is required');
+    }
+
+    let peer = this.activePeers.find(p => p.publicKey === publicKey);
+    if (!peer) {
+      peer = {
+        publicKey,
+        lastSeen: Date.now(),
+        relays: new Set(),
+        status: 'registered',
+        registeredAt: Date.now(),
+        mode
+      };
+      this.activePeers.push(peer);
+    } else {
+      peer.lastSeen = Date.now();
+      peer.status = 'registered';
+      peer.mode = mode;
+    }
+
+    if (Array.isArray(relays)) {
+      relays.forEach(entry => {
+        const identifier = typeof entry === 'string' ? entry : entry?.identifier;
+        if (!identifier) return;
+
+        peer.relays.add(identifier);
+        if (!this.activeRelays.has(identifier)) {
+          this.activeRelays.set(identifier, {
+            peers: new Set(),
+            status: 'active',
+            createdAt: Date.now(),
+            lastActive: Date.now()
+          });
+        }
+        const relayData = this.activeRelays.get(identifier);
+        relayData.peers.add(publicKey);
+        relayData.lastActive = Date.now();
+      });
+    }
+
+    peer.address = address || null;
+    peer.lastSeen = Date.now();
+
+    this.healthState.activeRelaysCount = this.activeRelays.size;
+    this.healthState.services.hyperswarmStatus = 'connected';
+
+    this.emit('status', this.getStatus());
+
+    const connectAndCheck = async () => {
+      try {
+        await this.connectionPool.getConnection(publicKey);
+        peer.status = 'connected';
+        await this.peerHealthManager.checkPeerHealth(peer, this.connectionPool);
+        this.emit('status', this.getStatus());
+      } catch (error) {
+        this.log('warn', `Failed to connect to peer ${publicKey.slice(0, 8)} (${source}): ${error.message}`);
+      }
+    };
+
+    setTimeout(connectAndCheck, skipConnect ? 0 : 1000);
+
+    return {
+      message: 'Registered successfully (Hyperswarm mode)',
+      status: 'active',
+      mode,
+      timestamp: new Date().toISOString(),
+      relayCount: peer.relays.size,
+      relays: Array.from(peer.relays)
+    };
+  }
+
+  async _handleGatewayRegisterRequest(publicKey, request) {
+    try {
+      let payload = {};
+      if (request.body && request.body.length) {
+        payload = JSON.parse(request.body.toString());
+      }
+
+      if (!payload.publicKey) {
+        payload.publicKey = publicKey;
+      }
+
+      const result = await this.registerPeerMetadata(payload, {
+        source: 'hyperswarm',
+        skipConnect: true
+      });
+
+      const responseBody = {
+        status: 'ok',
+        acknowledgedAt: new Date().toISOString(),
+        publicKey,
+        relayCount: result.relayCount,
+        relays: result.relays,
+        subnetHash: this.config?.subnetHash || null
+      };
+
+      this.log('info', `Hyperswarm registration acknowledged for peer ${publicKey.slice(0, 8)}...`);
+
+      return {
+        statusCode: 200,
+        headers: { 'content-type': 'application/json' },
+        body: Buffer.from(JSON.stringify(responseBody))
+      };
+    } catch (error) {
+      this.log('error', `Hyperswarm registration failed for peer ${publicKey.slice(0, 8)}: ${error.message}`);
+      return {
+        statusCode: 400,
+        headers: { 'content-type': 'application/json' },
+        body: Buffer.from(JSON.stringify({ error: error.message }))
+      };
+    }
   }
 
   handleGatewayWebSocketConnection(ws, req) {

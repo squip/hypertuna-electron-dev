@@ -234,7 +234,9 @@ export async function initializeRelayServer(customConfig = {}) {
       console.log('[RelayServer] Periodic registration check...');
       if (gatewayConnection) {
         console.log('[RelayServer] Gateway connected, performing registration');
-        registerWithGateway();
+        registerWithGateway().catch((error) => {
+          console.error('[RelayServer] Periodic gateway registration failed:', error.message);
+        });
       } else {
         console.log('[RelayServer] No gateway connection for periodic registration');
         console.log('[RelayServer] Connected peers:', Array.from(connectedPeers.keys()).map(k => k.substring(0, 8) + '...'));
@@ -247,10 +249,14 @@ export async function initializeRelayServer(customConfig = {}) {
   console.log('[RelayServer] Initialization complete');
   console.log('[RelayServer] ========================================');
   
-  // Trigger initial registration via HTTP after a delay
+  // Trigger initial registration via Hyperswarm after a delay
   setTimeout(async () => {
-    console.log('[RelayServer] Performing initial HTTP registration with gateway...');
-    await registerWithGateway();
+    console.log('[RelayServer] Performing initial Hyperswarm registration with gateway...');
+    try {
+      await registerWithGateway();
+    } catch (error) {
+      console.error('[RelayServer] Initial gateway registration failed:', error.message);
+    }
   }, 2000); // Give everything time to stabilize
   
   return true;
@@ -358,8 +364,15 @@ function handlePeerConnection(stream, peerInfo) {
     keepAliveInterval: null // Add keepalive tracking
   });
   
+  const handshakeInfo = {
+    role: 'relay',
+    relayPublicKey: config?.swarmPublicKey,
+    relayCount: healthState?.activeRelaysCount || 0,
+    proxyAddress: config?.proxy_server_address || null
+  };
+
   // Create relay protocol handler
-  const protocol = new RelayProtocol(stream, true);
+  const protocol = new RelayProtocol(stream, true, handshakeInfo);
   
   // Store protocol reference
   const peerData = connectedPeers.get(publicKey);
@@ -375,8 +388,13 @@ function handlePeerConnection(stream, peerInfo) {
     healthState.services.protocolStatus = 'connected';
     
     // Check if this is the gateway
-    if (handshake && handshake.isGateway) {
+    const isGatewayHandshake = handshake && (handshake.role === 'gateway' || handshake.isGateway);
+
+    if (isGatewayHandshake) {
       console.log('[RelayServer] >>> GATEWAY IDENTIFIED FROM HANDSHAKE <<<');
+      if (!config.gatewayPublicKey) {
+        config.gatewayPublicKey = publicKey;
+      }
       setGatewayConnection(protocol, publicKey);
       
       // Start keepalive for gateway connection
@@ -513,15 +531,31 @@ async function processPendingRegistrations() {
   console.log('[RelayServer] ----------------------------------------');
   console.log(`[RelayServer] Processing ${pendingRegistrations.length} pending registrations`);
   
+  let processedCount = 0;
   while (pendingRegistrations.length > 0) {
     const registration = pendingRegistrations.shift();
     console.log('[RelayServer] Processing pending registration:', registration ? 'with profile' : 'general update');
-    await registerWithGateway(registration);
+    try {
+      await registerWithGateway(registration, { skipQueue: true });
+      processedCount++;
+    } catch (error) {
+      console.error('[RelayServer] Pending registration failed:', error.message);
+      pendingRegistrations.unshift(registration);
+      console.log('[RelayServer] Will retry pending registrations later');
+      return;
+    }
   }
   
-  // Also do a fresh registration with current state
-  console.log('[RelayServer] Sending fresh registration with current state');
-  await registerWithGateway();
+  if (processedCount > 0) {
+    console.log('[RelayServer] Sending fresh registration with current state');
+    try {
+      await registerWithGateway(null, { skipQueue: true });
+    } catch (error) {
+      console.error('[RelayServer] Failed to send catch-up registration:', error.message);
+      pendingRegistrations.unshift(null);
+    }
+  }
+
   console.log('[RelayServer] ----------------------------------------');
 }
 
@@ -667,21 +701,15 @@ function setupProtocolHandlers(protocol) {
           });
         }
         
-        // ALWAYS register with gateway via HTTP if enabled
+        // ALWAYS register with gateway via Hyperswarm if enabled
         if (config.registerWithGateway) {
-          console.log('[RelayServer] Registering new relay with gateway via HTTP');
+          console.log('[RelayServer] Registering new relay with gateway via Hyperswarm');
           try {
             await registerWithGateway(result.profile);
             console.log('[RelayServer] Successfully registered new relay with gateway');
           } catch (regError) {
             console.error('[RelayServer] Failed to register new relay with gateway:', regError.message);
             // Don't fail the relay creation, just log the error
-          }
-          
-          // Still queue for P2P registration if gateway connects later
-          if (!gatewayConnection) {
-            console.log('[RelayServer] Queueing for P2P registration when gateway connects');
-            pendingRegistrations.push(result.profile);
           }
         }
         
@@ -750,9 +778,9 @@ function setupProtocolHandlers(protocol) {
           });
         }
         
-        // ALWAYS register with gateway via HTTP if enabled
+        // ALWAYS register with gateway via Hyperswarm if enabled
         if (config.registerWithGateway) {
-          console.log('[RelayServer] Registering joined relay with gateway via HTTP');
+          console.log('[RelayServer] Registering joined relay with gateway via Hyperswarm');
           try {
             // For join, we register all relays since we don't have specific profile for joined relay
             await registerWithGateway();
@@ -760,12 +788,6 @@ function setupProtocolHandlers(protocol) {
           } catch (regError) {
             console.error('[RelayServer] Failed to register joined relay with gateway:', regError.message);
             // Don't fail the relay join, just log the error
-          }
-          
-          // Still queue for P2P registration if gateway connects later
-          if (!gatewayConnection) {
-            console.log('[RelayServer] Queueing for P2P registration when gateway connects');
-            pendingRegistrations.push(null); // null means register all relays
           }
         }
         
@@ -1034,7 +1056,11 @@ function setupProtocolHandlers(protocol) {
             // Update gateway if connected
             if (config.registerWithGateway && gatewayConnection) {
                 console.log('[RelayServer] Updating gateway after relay disconnect');
-                await registerWithGateway();
+                try {
+                    await registerWithGateway();
+                } catch (regError) {
+                    console.error('[RelayServer] Failed to notify gateway of relay disconnect:', regError.message);
+                }
             }
             
             updateMetrics(true);
@@ -1695,131 +1721,132 @@ function updateMetrics(success = true) {
   }
 }
 
-// Register with gateway using HTTP
-async function registerWithGateway(relayProfileInfo = null) {
+// Register with gateway using Hyperswarm
+async function registerWithGateway(relayProfileInfo = null, options = {}) {
+  const { skipQueue = false } = options || {};
+
   console.log('[RelayServer] ========================================');
-  console.log('[RelayServer] GATEWAY REGISTRATION ATTEMPT (HTTP)');
+  console.log('[RelayServer] GATEWAY REGISTRATION ATTEMPT (Hyperswarm)');
   console.log('[RelayServer] Timestamp:', new Date().toISOString());
-  
+
   if (!config.registerWithGateway) {
-      console.log('[RelayServer] Gateway registration is DISABLED in config');
-      console.log('[RelayServer] ========================================');
-      return;
+    console.log('[RelayServer] Gateway registration is DISABLED in config');
+    console.log('[RelayServer] ========================================');
+    return { skipped: true };
   }
-  
+
+  const publicKey = config.swarmPublicKey;
+  if (!publicKey) {
+    console.warn('[RelayServer] Cannot register with gateway - swarm public key unavailable');
+    return { skipped: true };
+  }
+
   try {
-      const activeRelays = await getActiveRelays();
-      const profiles = await getRelayProfiles();
-      const publicKey = config.swarmPublicKey;
-      
-      // Build relay list with public identifiers
-      const relayList = [];
-      const gatewayBase = buildGatewayWebsocketBase(config);
-      for (const relay of activeRelays) {
-          const profile = profiles.find(p => p.relay_key === relay.relayKey);
-          if (profile) {
-              relayList.push({
-                  identifier: profile.public_identifier || relay.relayKey,
-                  name: profile.name || 'Unnamed Relay',
-                  connectionUrl: profile.public_identifier ? 
-                      `${gatewayBase}/${profile.public_identifier.replace(':', '/')}` :
-                      `${gatewayBase}/${relay.relayKey}`
-              });
-          }
-      }
-      
-      const advertisedAddress = config.proxy_server_address && config.proxy_server_address.includes(':')
-          ? config.proxy_server_address
-          : `${config.proxy_server_address}:${config.port}`;
+    const activeRelays = await getActiveRelays();
+    const profiles = await getRelayProfiles();
 
-      const registrationData = {
-          publicKey,  // Hyperswarm public key for P2P connection
-          relays: relayList, // List with public identifiers
-          address: advertisedAddress,
-          mode: 'hyperswarm',
-          timestamp: new Date().toISOString()
-      };
-      
-      if (relayProfileInfo) {
-          // If registering a specific relay, include its public identifier
-          registrationData.newRelay = {
-              identifier: relayProfileInfo.public_identifier || relayProfileInfo.relay_key,
-              name: relayProfileInfo.name,
-              description: relayProfileInfo.description
-          };
-      }
-      
-      console.log('[RelayServer] Sending HTTP registration to gateway');
-      console.log('[RelayServer] Registration URL:', `${config.gatewayUrl}/register`);
-      console.log('[RelayServer] Registration data:', {
-          publicKey: publicKey.substring(0, 8) + '...',
-          relayCount: registrationData.relays.length,
-          address: registrationData.address,
-          hasNewRelay: !!registrationData.newRelay,
-          mode: registrationData.mode
+    const relayList = [];
+    const gatewayBase = buildGatewayWebsocketBase(config);
+    for (const relay of activeRelays) {
+      const profile = profiles.find(p => p.relay_key === relay.relayKey);
+      if (!profile) continue;
+
+      relayList.push({
+        identifier: profile.public_identifier || relay.relayKey,
+        name: profile.name || 'Unnamed Relay',
+        connectionUrl: profile.public_identifier ?
+          `${gatewayBase}/${profile.public_identifier.replace(':', '/')}` :
+          `${gatewayBase}/${relay.relayKey}`
       });
-      
-      // Make HTTP request to gateway
-      const postData = JSON.stringify(registrationData);
-      
-      const url = new URL(config.gatewayUrl);
-      const { client, defaultPort, isHttps } = resolveHttpClient(url);
-      const options = {
-          hostname: url.hostname,
-          port: url.port || defaultPort,
-          path: '/register',
-          method: 'POST',
-          headers: {
-              'Content-Type': 'application/json',
-              'Content-Length': b4a.byteLength(postData)
-          }
+    }
+
+    const advertisedAddress = config.proxy_server_address && config.proxy_server_address.includes(':')
+      ? config.proxy_server_address
+      : `${config.proxy_server_address}:${config.port}`;
+
+    const registrationData = {
+      publicKey,
+      relays: relayList,
+      address: advertisedAddress,
+      mode: 'hyperswarm',
+      timestamp: new Date().toISOString()
+    };
+
+    if (relayProfileInfo) {
+      registrationData.newRelay = {
+        identifier: relayProfileInfo.public_identifier || relayProfileInfo.relay_key,
+        name: relayProfileInfo.name,
+        description: relayProfileInfo.description
       };
-      if (isHttps) {
-          options.rejectUnauthorized = false; // For self-signed certs
+    }
+
+    if (!gatewayConnection) {
+      console.log('[RelayServer] Gateway connection unavailable - queuing registration for later processing');
+      if (!skipQueue) {
+        pendingRegistrations.push(relayProfileInfo || null);
+        console.log(`[RelayServer] Pending registrations queued: ${pendingRegistrations.length}`);
       }
+      console.log('[RelayServer] ========================================');
+      return { queued: true };
+    }
 
-      const response = await new Promise((resolve, reject) => {
-          const req = client.request(options, (res) => {
-              let data = '';
-              res.on('data', (chunk) => data += chunk.toString());
-              res.on('end', () => {
-                  try {
-                      resolve(JSON.parse(data));
-                  } catch (e) {
-                      resolve(data);
-                  }
-              });
-          });
+    console.log('[RelayServer] Sending Hyperswarm registration payload to gateway');
+    console.log('[RelayServer] Registration data:', {
+      publicKey: publicKey.substring(0, 8) + '...',
+      relayCount: registrationData.relays.length,
+      address: registrationData.address,
+      hasNewRelay: !!registrationData.newRelay,
+      mode: registrationData.mode
+    });
 
-          req.on('error', reject);
-          req.write(postData);
-          req.end();
+    const response = await gatewayConnection.sendRequest({
+      method: 'POST',
+      path: '/gateway/register',
+      headers: { 'content-type': 'application/json' },
+      body: b4a.from(JSON.stringify(registrationData))
+    });
+
+    if (response.statusCode !== 200) {
+      throw new Error(`Gateway responded with status ${response.statusCode}`);
+    }
+
+    let ack = null;
+    const responseBody = response.body?.length ? response.body.toString() : '';
+    if (responseBody) {
+      try {
+        ack = JSON.parse(responseBody);
+      } catch (parseError) {
+        console.warn('[RelayServer] Failed to parse gateway registration acknowledgement:', parseError.message);
+      }
+    }
+
+    console.log('[RelayServer] Gateway registration acknowledged:', ack || { statusCode: response.statusCode });
+
+    if (ack && ack.subnetHash) {
+      config.subnetHash = ack.subnetHash;
+      await saveConfig(config);
+      console.log(`[RelayServer] Stored subnet hash: ${config.subnetHash.substring(0, 8)}...`);
+    }
+
+    if (global.sendMessage) {
+      global.sendMessage({
+        type: 'gateway-registered',
+        data: ack || { statusCode: response.statusCode }
       });
+    }
 
-      console.log('[RelayServer] Gateway HTTP registration response:', response);
-      console.log('[RelayServer] Registration SUCCESSFUL');
-
-      // Store subnet hash from gateway response if provided
-      if (response && response.subnetHash) {
-          config.subnetHash = response.subnetHash;
-          await saveConfig(config);
-          console.log(`[RelayServer] Stored subnet hash: ${config.subnetHash.substring(0, 8)}...`);
-      }
-
-      // Notify parent process
-      if (global.sendMessage) {
-          console.log('[RelayServer] Notifying worker of successful registration');
-          global.sendMessage({
-              type: 'gateway-registered',
-              data: response
-          });
-      }
+    console.log('[RelayServer] Registration SUCCESSFUL');
+    console.log('[RelayServer] ========================================');
+    return { acknowledged: true, ack };
   } catch (error) {
-      console.error('[RelayServer] Gateway HTTP registration FAILED:', error.message);
-      console.error('[RelayServer] Error stack:', error.stack);
+    console.error('[RelayServer] Gateway registration via Hyperswarm FAILED:', error.message);
+    if (!skipQueue) {
+      pendingRegistrations.push(relayProfileInfo || null);
+      console.log('[RelayServer] Registration re-queued due to failure');
+    }
+    console.log('[RelayServer] ========================================');
+    throw error;
   }
-  
-  console.log('[RelayServer] ========================================');
 }
 
 // Export relay management functions for worker access
@@ -1881,7 +1908,7 @@ export async function createRelay(options) {
       }
     }
 
-    // ALWAYS register with gateway via HTTP if enabled
+    // ALWAYS register with gateway via Hyperswarm if enabled
     let registrationStatus = 'disabled';
     if (config.registerWithGateway) {
       try {
@@ -1910,7 +1937,7 @@ export async function joinRelay(options) {
   if (result.success) {
     await updateHealthState();
     
-    // ALWAYS register with gateway via HTTP if enabled
+    // ALWAYS register with gateway via Hyperswarm if enabled
     let registrationStatus = 'disabled';
     if (config.registerWithGateway) {
       try {
@@ -2203,7 +2230,11 @@ export async function disconnectRelay(relayKey) {
     
     // Update gateway if connected
     if (config.registerWithGateway && gatewayConnection) {
-      await registerWithGateway();
+      try {
+        await registerWithGateway();
+      } catch (regError) {
+        console.error('[RelayServer] Failed to notify gateway after relay disconnect (adapter):', regError.message);
+      }
     }
   }
   

@@ -40,6 +40,7 @@ class HyperswarmConnection {
 
         this.stream = connection;
         this.protocol = new RelayProtocolWithGateway(connection, false);
+        this.pool._configureProtocol(this.publicKey, this.protocol, { isServer: false, connection: this });
 
         await new Promise((resolve, reject) => {
           const timeout = setTimeout(() => {
@@ -201,6 +202,7 @@ class RelayProtocolWithGateway extends RelayProtocol {
       version: '2.0',
       isServer: this.isServer,
       isGateway: true,
+      role: 'gateway',
       capabilities: ['http', 'websocket', 'health']
     };
     this.channel.open(handshake);
@@ -208,13 +210,14 @@ class RelayProtocolWithGateway extends RelayProtocol {
 }
 
 class EnhancedHyperswarmPool {
-  constructor() {
+  constructor(options = {}) {
     this.connections = new Map();
     this.swarm = null;
     this.initialized = false;
     this.swarmKeyPair = null;
     this.topicDiscovery = null;
     this.peerDiscoveries = new Map();
+    this.options = options || {};
   }
   
   async initialize() {
@@ -234,6 +237,7 @@ class EnhancedHyperswarmPool {
       conn.stream = connection;
       conn.protocol = new RelayProtocolWithGateway(connection, true);
       conn.connected = true;
+      this._configureProtocol(publicKey, conn.protocol, { isServer: true, peerInfo, connection: conn });
       this.connections.set(publicKey, conn);
     });
 
@@ -261,6 +265,31 @@ class EnhancedHyperswarmPool {
     }
     await connection.connect();
     return connection;
+  }
+
+  _configureProtocol(publicKey, protocol, context = {}) {
+    if (!protocol) return;
+
+    if (this.options.onProtocol) {
+      try {
+        this.options.onProtocol({ publicKey, protocol, context });
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.warn('[EnhancedHyperswarmPool] onProtocol handler error:', err);
+      }
+    }
+
+    if (this.options.onHandshake) {
+      const onOpen = (handshake) => {
+        try {
+          this.options.onHandshake({ publicKey, protocol, handshake, context });
+        } catch (err) {
+          // eslint-disable-next-line no-console
+          console.warn('[EnhancedHyperswarmPool] onHandshake handler error:', err);
+        }
+      };
+      protocol.once('open', onOpen);
+    }
   }
   
   async destroy() {

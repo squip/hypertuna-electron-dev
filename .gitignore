@@ -45,6 +45,7 @@ hypertuna-desktop/node_modules/
 hypertuna-desktop/test/
 hypertuna-desktop/package-lock.json
 legacy-pear-codebase/
+hyperswarm-documentation/
 jspm_packages/
 
 # Snowpack dependency directory (https://snowpack.dev/)
