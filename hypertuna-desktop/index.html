@@ -367,7 +367,7 @@
                                         <label for="profile-about-input">About</label>
                                         <textarea id="profile-about-input" class="form-textarea" rows="3" placeholder="Tell us about yourself"></textarea>
                                     </div>
-                                    <div class="button-group align-center">
+                                    <div class="button-group align-start">
                                         <button id="btn-update-profile" class="btn btn-primary">Update Profile</button>
                                     </div>
                                 </div>
@@ -439,15 +439,46 @@
                         </div>
                     </div>
 
-                    <div class="profile-section">
-                        <h3>Hypertuna Relay Node</h3>
-                        <div class="status-stack">
-                            <span id="worker-status-text">Stopped</span>
-                            <span class="status-subtext muted">Gateway: <span id="gateway-status">Not Registered</span></span>
-                        </div>
-                        <div class="button-group align-start">
-                            <button id="start-worker" class="btn btn-primary">Start</button>
-                            <button id="stop-worker" class="btn btn-secondary">Stop</button>
+                    <div class="profile-section accordion-card collapsed" id="relay-node-card">
+                        <button class="accordion-toggle" type="button" data-target="relay-node-card">
+                            <div class="accordion-header">
+                                <div class="accordion-heading-text">
+                                    <h3>Hypertuna Relay Node</h3>
+                                    <div class="relay-summary">
+                                        <span id="worker-status-text" class="relay-status-text">Stopped</span>
+                                        <span class="status-subtext muted">Gateway: <span id="gateway-status">Not Registered</span></span>
+                                    </div>
+                                </div>
+                                <span class="accordion-icon" aria-hidden="true"></span>
+                            </div>
+                        </button>
+                        <div class="accordion-content" id="relay-node-content">
+                            <div class="relay-node-content">
+                                <div class="form-group">
+                                    <label>Peer Public Key</label>
+                                    <div class="key-display">
+                                        <input type="text" id="hypertuna-pubkey-display" class="form-input" readonly>
+                                        <button class="copy-btn" data-copy="hypertuna-pubkey-display">Copy</button>
+                                    </div>
+                                </div>
+                                <div class="form-group">
+                                    <label>Peer Private Key</label>
+                                    <div class="key-display">
+                                        <input type="password" id="hypertuna-privkey-display" class="form-input" readonly>
+                                        <button id="btn-toggle-hypertuna-privkey" class="icon-btn">
+                                            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                                <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path>
+                                                <circle cx="12" cy="12" r="3"></circle>
+                                            </svg>
+                                        </button>
+                                        <button class="copy-btn" data-copy="hypertuna-privkey-display">Copy</button>
+                                    </div>
+                                </div>
+                                <div class="button-group align-start">
+                                    <button id="start-worker" class="btn btn-primary">Start</button>
+                                    <button id="stop-worker" class="btn btn-secondary">Stop</button>
+                                </div>
+                            </div>
                         </div>
                     </div>
 

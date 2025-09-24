@@ -594,112 +594,53 @@ function integrateNostrRelays(App) {
             const gatewaySettings = await HypertunaUtils.getGatewaySettings();
             const placeholderGateway = gatewaySettings.gatewayUrl;
 
-            // Find or create the Hypertuna section in the profile page
-            let hypertunaSection = document.getElementById('hypertuna-config-section');
-
-            if (!hypertunaSection) {
-                const profilePage = document.querySelector('#page-profile .profile-container');
-                if (!profilePage) return;
-
-                hypertunaSection = document.createElement('div');
-                hypertunaSection.id = 'hypertuna-config-section';
-                hypertunaSection.className = 'profile-section';
-                hypertunaSection.innerHTML = `
-                <h3>Hypertuna Relay Node Configuration</h3>
-                <div class="form-group">
-                    <label>Peer Public Key</label>
-                    <div class="key-display">
-                        <input type="text" id="hypertuna-pubkey-display" class="form-input" readonly>
-                        <button class="copy-btn" data-copy="hypertuna-pubkey-display">Copy</button>
-                    </div>
-                </div>
-                <div class="form-group">
-                    <label>Peer Private Key</label>
-                    <div class="key-display">
-                        <input type="password" id="hypertuna-privkey-display" class="form-input" readonly>
-                        <button id="btn-toggle-hypertuna-privkey" class="icon-btn">
-                            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                                <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path>
-                                <circle cx="12" cy="12" r="3"></circle>
-                            </svg>
-                        </button>
-                        <button class="copy-btn" data-copy="hypertuna-privkey-display">Copy</button>
-                    </div>
-                </div>
-                <div class="form-group hidden">
-                    <label>Proxy Seed</label>
-                    <div class="key-display">
-                        <input type="password" id="hypertuna-seed-display" class="form-input" readonly>
-                        <button id="btn-toggle-hypertuna-seed" class="icon-btn">
-                            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                                <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path>
-                                <circle cx="12" cy="12" r="3"></circle>
-                            </svg>
-                        </button>
-                        <button class="copy-btn" data-copy="hypertuna-seed-display">Copy</button>
-                    </div>
-                </div>
-                <button id="btn-update-hypertuna" class="btn btn-primary">Update Hypertuna Settings</button>
-            `;
-
-                const relaySection = profilePage.querySelector('.profile-section:last-child');
-                if (relaySection) {
-                    profilePage.insertBefore(hypertunaSection, relaySection);
-                } else {
-                    profilePage.appendChild(hypertunaSection);
-                }
-
-                document.getElementById('btn-toggle-hypertuna-privkey').addEventListener('click', () => {
-                    const input = document.getElementById('hypertuna-privkey-display');
-                    input.type = input.type === 'password' ? 'text' : 'password';
-                });
-
-                document.getElementById('btn-toggle-hypertuna-seed').addEventListener('click', () => {
-                    const input = document.getElementById('hypertuna-seed-display');
-                    input.type = input.type === 'password' ? 'text' : 'password';
-                });
-
-                document.getElementById('btn-update-hypertuna').addEventListener('click', () => {
-                    this.updateHypertunaSettings().catch((error) => {
-                        console.error('[App] Failed to update Hypertuna settings:', error);
-                    });
-                });
-
-                hypertunaSection.querySelectorAll('.copy-btn').forEach(btn => {
-                    btn.addEventListener('click', () => {
-                        const targetId = btn.dataset.copy;
-                        const target = document.getElementById(targetId);
-                        if (target) {
-                            const isPassword = target.type === 'password';
-                            if (isPassword) target.type = 'text';
-                            target.select();
-                            document.execCommand('copy');
-                            if (isPassword) target.type = 'password';
-
-                            const originalText = btn.textContent;
-                            btn.textContent = 'Copied!';
-                            setTimeout(() => {
-                                btn.textContent = originalText;
-                            }, 2000);
-                        }
-                    });
-                });
+            const pubkeyInput = document.getElementById('hypertuna-pubkey-display');
+            if (pubkeyInput) {
+                pubkeyInput.value = config.swarmPublicKey || '';
             }
 
-            const pubkeyInput = document.getElementById('hypertuna-pubkey-display');
-            if (pubkeyInput) pubkeyInput.value = config.swarmPublicKey || '';
-
             const privkeyInput = document.getElementById('hypertuna-privkey-display');
-            if (privkeyInput) privkeyInput.value = config.proxy_privateKey || '';
-
-            const seedInput = document.getElementById('hypertuna-seed-display');
-            if (seedInput) seedInput.value = config.proxy_seed || '';
+            if (privkeyInput) {
+                privkeyInput.value = config.proxy_privateKey || '';
+            }
 
             const gatewayInput = document.getElementById('hypertuna-gateway-url');
             if (gatewayInput) {
                 gatewayInput.placeholder = placeholderGateway;
                 gatewayInput.value = config.gatewayUrl || placeholderGateway;
             }
+
+            const togglePrivBtn = document.getElementById('btn-toggle-hypertuna-privkey');
+            if (togglePrivBtn && !togglePrivBtn.dataset.bound) {
+                togglePrivBtn.addEventListener('click', () => {
+                    const input = document.getElementById('hypertuna-privkey-display');
+                    if (!input) return;
+                    input.type = input.type === 'password' ? 'text' : 'password';
+                });
+                togglePrivBtn.dataset.bound = 'true';
+            }
+
+            document.querySelectorAll('#relay-node-card .copy-btn').forEach(btn => {
+                if (btn.dataset.bound === 'true') return;
+                btn.addEventListener('click', () => {
+                    const targetId = btn.dataset.copy;
+                    const target = document.getElementById(targetId);
+                    if (!target) return;
+
+                    const isPassword = target.type === 'password';
+                    if (isPassword) target.type = 'text';
+                    target.select();
+                    document.execCommand('copy');
+                    if (isPassword) target.type = 'password';
+
+                    const originalText = btn.textContent;
+                    btn.textContent = 'Copied!';
+                    setTimeout(() => {
+                        btn.textContent = originalText;
+                    }, 2000);
+                });
+                btn.dataset.bound = 'true';
+            });
         } catch (error) {
             console.error('[App] Failed to update Hypertuna display:', error);
         }
