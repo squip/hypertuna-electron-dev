@@ -2902,15 +2902,12 @@ async fetchMultipleProfiles(pubkeys) {
             this.user.privateKey
         );
         
-        // Publish the event
+        // Publish the event once across all relays
         await this.relayManager.publish(event);
-        
-        // Update local user data
-        this.user = {
-            ...this.user,
-            ...profile
-        };
-        
+
+        // Apply the same processing path as remotely received events
+        this._processProfileEvent(event);
+
         return event;
     }
 

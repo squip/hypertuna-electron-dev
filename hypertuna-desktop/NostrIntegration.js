@@ -632,79 +632,45 @@ class NostrIntegration {
      * Replace the existing updateProfile method with this one
      */
     async updateProfile(profile) {
-        try {
-            // Create the profile event
-            const event = await this.client.updateProfile(profile);
-            
-            // Retry publishing if needed
-            let attempts = 0;
-            const maxAttempts = 3;
-            let lastError = null;
-            
-            while (attempts < maxAttempts) {
-                try {
-                    // Publish with retry logic
-                    const result = await this.publishEvent(event);
-                    console.log("Profile update published:", result);
-                    
-                    // Wait a bit to ensure all relays receive the update
-                    await new Promise(resolve => setTimeout(resolve, 1000));
-                    
-                    return event;
-                } catch (error) {
-                    attempts++;
-                    lastError = error;
-                    console.warn(`Profile update attempt ${attempts} failed:`, error);
-                    
-                    if (attempts >= maxAttempts) {
-                        break;
-                    }
-                    
-                    // Exponential backoff for retries
-                    const waitTime = Math.pow(2, attempts) * 1000; // 2s, 4s, 8s...
-                    console.log(`Retrying in ${waitTime}ms...`);
-                    await new Promise(resolve => setTimeout(resolve, waitTime));
-                }
-            }
-            
-            // If all retries failed, throw an error
-            if (lastError) {
-                throw lastError;
-            } else {
-                throw new Error("Failed to update profile after multiple attempts");
-            }
-        } catch (error) {
-            console.error("Error updating profile:", error);
-            throw error;
-        }
-    }
-
-    /**
-     * Improved publishEvent method with retry logic
-     */
-    async publishEvent(event) {
-        // Implement retry logic for more reliable event publishing
-        let attempts = 0;
         const maxAttempts = 3;
-        
-        while (attempts < maxAttempts) {
+        let attempt = 0;
+        let lastError = null;
+
+        while (attempt < maxAttempts) {
             try {
-                const result = await this.client.relayManager.publish(event);
-                return result;
+                const event = await this.client.updateProfile(profile);
+                console.log("Profile update published:", {
+                    id: event.id,
+                    kind: event.kind,
+                    created_at: event.created_at
+                });
+
+                // Give relays a brief moment to propagate the change
+                await new Promise(resolve => setTimeout(resolve, 1000));
+
+                return event;
             } catch (error) {
-                attempts++;
-                console.warn(`Publish attempt ${attempts} failed:`, error);
-                
-                if (attempts >= maxAttempts) {
-                    throw error;
+                attempt++;
+                lastError = error;
+                console.warn(`Profile update attempt ${attempt} failed:`, error);
+
+                if (attempt >= maxAttempts) {
+                    break;
                 }
-                
-                // Exponential backoff for retries
-                const waitTime = Math.pow(2, attempts) * 500; // 1s, 2s, 4s...
+
+                const waitTime = Math.pow(2, attempt) * 1000; // 2s, 4s, 8s...
+                console.log(`Retrying in ${waitTime}ms...`);
                 await new Promise(resolve => setTimeout(resolve, waitTime));
             }
         }
+
+        console.error("Error updating profile:", lastError);
+        if (lastError) {
+            throw lastError;
+        }
+        throw new Error("Failed to update profile after multiple attempts");
     }
+
 }
 
 export default NostrIntegration;
