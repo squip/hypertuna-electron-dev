@@ -27,11 +27,18 @@ import {
 } from './pending-auth.mjs';
 import {
   initializeHyperdrive,
+  initializePfpHyperdrive,
   ensureRelayFolder,
   storeFile,
   getFile,
   fileExists,
   fetchFileFromDrive,
+  storePfpFile,
+  getPfpFile,
+  pfpFileExists,
+  fetchPfpFileFromDrive,
+  getPfpDriveKey,
+  mirrorPfpDrive,
   watchDrive,
   getReplicationHealth
 } from './hyperdrive-manager.mjs';
@@ -321,19 +328,28 @@ async function loadOrCreateConfig(customDir = null) {
     registerWithGateway: true,
     registerInterval: 300000,
     relays: [],
-    driveKey: null
+    driveKey: null,
+    pfpDriveKey: null
   }
 
   try {
     const configData = await fs.readFile(configPath, 'utf8')
     console.log('[Worker] Loaded existing config from:', configPath)
     const loadedConfig = JSON.parse(configData)
+    let needsPersist = false
     if (!('driveKey' in loadedConfig)) {
       loadedConfig.driveKey = null
-      await fs.writeFile(configPath, JSON.stringify(loadedConfig, null, 2))
+      needsPersist = true
+    }
+    if (!('pfpDriveKey' in loadedConfig)) {
+      loadedConfig.pfpDriveKey = null
+      needsPersist = true
     }
     if (!('proxy_websocket_protocol' in loadedConfig) || !loadedConfig.proxy_websocket_protocol) {
       loadedConfig.proxy_websocket_protocol = defaultConfig.proxy_websocket_protocol
+      needsPersist = true
+    }
+    if (needsPersist) {
       await fs.writeFile(configPath, JSON.stringify(loadedConfig, null, 2))
     }
     return { ...defaultConfig, ...loadedConfig }
@@ -594,6 +610,23 @@ async function reconcileRelayFiles() {
     }
 
     seenFileHashes.set(relayKey, seen)
+  }
+}
+
+async function syncRemotePfpMirrors() {
+  if (!gatewayService?.getPeersWithPfpDrive) return
+  const peers = gatewayService.getPeersWithPfpDrive()
+  if (!Array.isArray(peers) || peers.length === 0) return
+
+  const localPfpKey = getPfpDriveKey()
+  for (const peer of peers) {
+    try {
+      if (!peer?.pfpDriveKey) continue
+      if (localPfpKey && peer.pfpDriveKey === localPfpKey) continue
+      await mirrorPfpDrive(peer.pfpDriveKey)
+    } catch (err) {
+      console.warn('[Worker] PFP mirror failed for peer', peer?.pfpDriveKey, err?.message || err)
+    }
   }
 }
 
@@ -936,6 +969,22 @@ async function handleMessageObject(message) {
       } catch (err) {
         console.error('[Worker] upload-file error:', err)
         sendMessage({ type: 'error', message: `upload-file failed: ${err.message}` })
+      }
+      break
+    }
+
+    case 'upload-pfp': {
+      try {
+        const { owner, fileHash, metadata, buffer } = message.data || {}
+        if (!fileHash || !buffer) throw new Error('Missing fileHash or buffer')
+        const ownerKey = typeof owner === 'string' ? owner.trim() : ''
+        console.log(`[UploadPfp] begin owner=${ownerKey || 'root'} fileHash=${fileHash} bufLen=${buffer?.length}`)
+        const data = b4a.from(buffer, 'base64')
+        await storePfpFile(ownerKey, fileHash, data, metadata || null)
+        sendMessage({ type: 'upload-pfp-complete', owner: ownerKey, fileHash })
+      } catch (err) {
+        console.error('[Worker] upload-pfp error:', err)
+        sendMessage({ type: 'error', message: `upload-pfp failed: ${err.message}` })
       }
       break
     }
@@ -1358,19 +1407,28 @@ async function main() {
     global.userConfig = global.userConfig || { storage: config.storage };
 
     const hadDriveKey = !!config.driveKey;
+    const hadPfpDriveKey = !!config.pfpDriveKey;
     const hyperdriveConfig = { ...config, storage: global.userConfig.storage };
     await initializeHyperdrive(hyperdriveConfig);
     config.driveKey = hyperdriveConfig.driveKey;
-    if (!hadDriveKey && config.driveKey) {
+
+    const pfpConfig = { ...config, storage: global.userConfig.storage, pfpDriveKey: config.pfpDriveKey }
+    await initializePfpHyperdrive(pfpConfig);
+    config.pfpDriveKey = pfpConfig.pfpDriveKey;
+
+    if ((!hadDriveKey && config.driveKey) || (!hadPfpDriveKey && config.pfpDriveKey)) {
       try {
         await fs.writeFile(configPath, JSON.stringify(config, null, 2));
       } catch (err) {
-        console.error('[Worker] Failed to persist driveKey:', err);
+        console.error('[Worker] Failed to persist hyperdrive keys:', err);
       }
     }
 
     if (config.driveKey) {
       sendMessage({ type: 'drive-key', driveKey: config.driveKey });
+    }
+    if (config.pfpDriveKey) {
+      sendMessage({ type: 'pfp-drive-key', driveKey: config.pfpDriveKey });
     }
 
     startDriveWatcher()
@@ -1443,6 +1501,7 @@ async function main() {
         // Keep the legacy reconcilation for now, and also refresh mirrors to discover new providers
         reconcileRelayFiles().catch(err => console.error('[Worker] File reconciliation error:', err))
         ensureMirrorsForAllRelays().catch(err => console.error('[Worker] Mirror refresh error:', err))
+        syncRemotePfpMirrors().catch(err => console.error('[Worker] PFP mirror error:', err))
       }
     }, 60000)
 

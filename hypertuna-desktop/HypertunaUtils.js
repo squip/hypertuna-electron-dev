@@ -54,6 +54,28 @@ export class HypertunaUtils {
         return deriveGatewayWebsocketProtocol(value);
     }
 
+    static resolvePfpUrl(url, isHypertunaPfp = false) {
+        if (!url) return url;
+        if (!isHypertunaPfp) return url;
+
+        const cachedSettings = this.getCachedGatewaySettings();
+        const base = (cachedSettings.gatewayUrl || this.getCachedGatewayUrl() || '').replace(/\/$/, '');
+        if (!base) return url;
+
+        try {
+            const parsed = new URL(url, base);
+            if (!parsed.pathname.startsWith('/pfp/')) {
+                return url;
+            }
+            return `${base}${parsed.pathname}${parsed.search || ''}`;
+        } catch (_) {
+            if (url.startsWith('/pfp/')) {
+                return `${base}${url}`;
+            }
+        }
+        return url;
+    }
+
     static async persistGatewaySettings(gatewayUrl) {
         const proxyHost = deriveGatewayProxyHost(gatewayUrl);
         const proxyWebsocketProtocol = deriveGatewayWebsocketProtocol(gatewayUrl);
@@ -535,6 +557,10 @@ export class HypertunaUtils {
 
             if (typeof config.driveKey === 'undefined') {
                 config.driveKey = null;
+            }
+
+            if (typeof config.pfpDriveKey === 'undefined') {
+                config.pfpDriveKey = null;
             }
 
             if (!config.proxy_server_address && gatewaySettings.proxyHost) {

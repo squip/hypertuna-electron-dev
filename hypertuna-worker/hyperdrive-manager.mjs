@@ -10,9 +10,13 @@ import crypto from 'node:crypto'
 let store = null
 let drive = null
 let localDriveKeyHex = null
+let pfpDrive = null
+let pfpDriveKeyHex = null
+let pfpStore = null
 let storageDir = null
 let replicationSwarm = null
 const topicCache = new Map() // key -> { discovery, refCount, lastUsed, readyPromise, timer }
+const pfpTopicCache = new Map()
 let replicationConnectionsOpen = 0
 let replicationConnectionsTotal = 0
 
@@ -78,6 +82,14 @@ export function getCorestore() {
 
 export function getLocalDrive() {
   return drive
+}
+
+export function getPfpDrive() {
+  return pfpDrive
+}
+
+function getPfpTopicCache() {
+  return pfpTopicCache
 }
 
 function isHex64 (s) {
@@ -179,6 +191,75 @@ export async function initializeHyperdrive(config) {
   }
 }
 
+function ensureHexKey(key) {
+  if (!key || typeof key !== 'string') return null
+  return /^[a-fA-F0-9]{64}$/.test(key) ? key.toLowerCase() : null
+}
+
+async function announceDriveOnSwarm(targetDrive, cache) {
+  if (!targetDrive) return
+  const swarm = await ensureReplicationSwarm()
+  const done = targetDrive.findingPeers()
+  const discovery = swarm.join(targetDrive.discoveryKey)
+  await discovery.flushed().then(done, done)
+  const key = b4a.toString(targetDrive.discoveryKey, 'hex')
+  cache.set(key, { discovery })
+  console.log(`[Hyperdrive] announced drive key=${targetDrive.key.toString('hex')} dkey=${key}`)
+}
+
+function releaseAnnouncedDrive(cache, targetDrive) {
+  try {
+    const key = targetDrive ? b4a.toString(targetDrive.discoveryKey, 'hex') : null
+    if (!key) return
+    const entry = cache.get(key)
+    if (entry?.discovery) {
+      try { entry.discovery.destroy() } catch (_) {}
+      cache.delete(key)
+    }
+  } catch (_) {}
+}
+
+async function getPfpStore(config) {
+  if (!store) {
+    storageDir = config.storage
+    store = new Corestore(storageDir)
+  }
+  if (!pfpStore) {
+    pfpStore = store.namespace('pfp')
+    try {
+      await pfpStore.ready?.()
+    } catch (_) {}
+  }
+  return pfpStore
+}
+
+function ensurePfpPath(owner) {
+  if (!owner) return ''
+  const trimmed = String(owner).trim()
+  if (!trimmed) return ''
+  return trimmed.startsWith('/') ? trimmed.replace(/\/+/g, '/') : `/${trimmed}`
+}
+
+function buildPfpFilePath(owner, fileHash) {
+  const prefix = ensurePfpPath(owner)
+  const normalizedHash = fileHash.startsWith('/') ? fileHash.slice(1) : fileHash
+  return prefix ? `${prefix}/${normalizedHash}` : `/${normalizedHash}`
+}
+
+export async function initializePfpHyperdrive(config) {
+  if (!config || !config.storage) throw new Error('Missing config storage for pfp hyperdrive')
+
+  const existingKey = ensureHexKey(config.pfpDriveKey)
+  const coreStore = await getPfpStore(config)
+  pfpDrive = existingKey ? new Hyperdrive(coreStore, existingKey) : new Hyperdrive(coreStore)
+  await pfpDrive.ready()
+  pfpDriveKeyHex = pfpDrive.key.toString('hex')
+  config.pfpDriveKey = pfpDriveKeyHex
+  console.log(`[Hyperdrive] pfp drive ready key=${pfpDriveKeyHex} dkey=${b4a.toString(pfpDrive.discoveryKey, 'hex')}`)
+
+  await announceDriveOnSwarm(pfpDrive, getPfpTopicCache())
+}
+
 function isClosingCoreError (err) {
   const msg = err?.message || ''
   const code = err?.code || ''
@@ -217,6 +298,22 @@ async function restartLocalHyperdrive () {
   }
 }
 
+async function restartPfpHyperdrive () {
+  if (!storageDir || !pfpDriveKeyHex) return false
+  try {
+    store = new Corestore(storageDir)
+    const reopened = new Hyperdrive(store, pfpDriveKeyHex)
+    await reopened.ready()
+    pfpDrive = reopened
+    await announceDriveOnSwarm(pfpDrive, getPfpTopicCache())
+    console.warn('[Hyperdrive] restartPfpHyperdrive: store/drive recreated')
+    return true
+  } catch (e) {
+    console.error('[Hyperdrive] restartPfpHyperdrive failed:', e)
+    return false
+  }
+}
+
 async function reopenLocalDriveIfClosing () {
   if (!store || !localDriveKeyHex) return false
   try {
@@ -230,6 +327,23 @@ async function reopenLocalDriveIfClosing () {
       return await restartLocalHyperdrive()
     } else {
       console.error('[Hyperdrive] reopenLocalDrive failed:', e)
+      return false
+    }
+  }
+}
+
+async function reopenPfpDriveIfClosing () {
+  if (!store || !pfpDriveKeyHex) return false
+  try {
+    const reopened = new Hyperdrive(store, pfpDriveKeyHex)
+    await reopened.ready()
+    pfpDrive = reopened
+    return true
+  } catch (e) {
+    if (isStoreClosedError(e)) {
+      return await restartPfpHyperdrive()
+    } else {
+      console.error('[Hyperdrive] reopenPfpDrive failed:', e)
       return false
     }
   }
@@ -283,6 +397,116 @@ export async function storeFile(identifier, fileHash, data, metadata) {
     }
   }
   console.log(`[Hyperdrive] storeFile wrote path=${path} bytes=${data?.length || 0} ms=${Date.now() - t0}`)
+}
+
+async function ensurePfpDriveReady () {
+  if (!pfpDrive) throw new Error('Pfp Hyperdrive not initialized')
+  await pfpDrive.ready()
+}
+
+export function getPfpDriveKey () {
+  return pfpDriveKeyHex
+}
+
+export async function storePfpFile(owner, fileHash, data, metadata) {
+  await ensurePfpDriveReady()
+  const hash = crypto.createHash('sha256').update(data).digest('hex')
+  if (hash !== fileHash) {
+    throw new Error('Hash mismatch')
+  }
+
+  const path = buildPfpFilePath(owner, fileHash)
+  let exists = false
+  try {
+    exists = await pfpDrive.exists(path)
+  } catch (err) {
+    const isClosing = isClosingCoreError(err) || isStoreClosedError(err)
+    if (isClosing) {
+      console.warn('[Hyperdrive] storePfpFile detected closing core; reopening...')
+      const ok = await reopenPfpDriveIfClosing()
+      if (ok) exists = await pfpDrive.exists(path)
+      else throw err
+    } else {
+      throw err
+    }
+  }
+
+  if (exists) {
+    console.log(`[Hyperdrive] storePfpFile skip exists path=${path}`)
+    return
+  }
+
+  const t0 = Date.now()
+  try {
+    await pfpDrive.put(path, data, { metadata })
+  } catch (err) {
+    const isClosing = isClosingCoreError(err) || isStoreClosedError(err)
+    if (isClosing) {
+      console.warn('[Hyperdrive] storePfpFile.put detected closing core; reopening...')
+      const ok = await reopenPfpDriveIfClosing()
+      if (ok) {
+        await pfpDrive.put(path, data, { metadata })
+      } else {
+        throw err
+      }
+    } else {
+      throw err
+    }
+  }
+
+  console.log(`[Hyperdrive] storePfpFile wrote path=${path} bytes=${data?.length || 0} ms=${Date.now() - t0}`)
+}
+
+export async function getPfpFile(owner, fileHash) {
+  await ensurePfpDriveReady()
+  const path = buildPfpFilePath(owner, fileHash)
+  try {
+    const buf = await pfpDrive.get(path)
+    console.log(`[Hyperdrive] getPfpFile path=${path} found=${!!buf} bytes=${buf?.length || 0}`)
+    return buf || null
+  } catch (err) {
+    const isClosing = isClosingCoreError(err) || isStoreClosedError(err)
+    if (isClosing) {
+      console.warn('[Hyperdrive] getPfpFile detected closing core; reopening...')
+      const ok = await reopenPfpDriveIfClosing()
+      if (ok) {
+        try {
+          const buf2 = await pfpDrive.get(path)
+          console.log(`[Hyperdrive] getPfpFile(after reopen) path=${path} found=${!!buf2} bytes=${buf2?.length || 0}`)
+          return buf2 || null
+        } catch (err2) {
+          console.error('[Hyperdrive] getPfpFile reopen failed:', err2)
+          return null
+        }
+      }
+    }
+    console.error('[Hyperdrive] getPfpFile error:', err)
+    return null
+  }
+}
+
+export async function pfpFileExists(owner, fileHash) {
+  await ensurePfpDriveReady()
+  const path = buildPfpFilePath(owner, fileHash)
+  try {
+    return await pfpDrive.exists(path)
+  } catch (err) {
+    const isClosing = isClosingCoreError(err) || isStoreClosedError(err)
+    if (isClosing) {
+      console.warn('[Hyperdrive] pfpFileExists detected closing core; reopening...')
+      const ok = await reopenPfpDriveIfClosing()
+      if (ok) {
+        try {
+          return await pfpDrive.exists(path)
+        } catch (err2) {
+          console.error('[Hyperdrive] pfpFileExists reopen failed:', err2)
+          return false
+        }
+      }
+    }
+    console.error('[Hyperdrive] pfpFileExists error:', err)
+    return false
+  }
 }
 
 /**
@@ -378,6 +602,64 @@ export async function fetchFileFromDrive(driveKey, identifier, fileHash) {
       console.log(`[Fetch] remote drive closed key=${driveKey}`)
     } catch (_) {}
     try { release?.() } catch (_) {}
+  }
+}
+
+export async function fetchPfpFileFromDrive(driveKey, owner, fileHash) {
+  if (!driveKey) return null
+  const core = pfpStore || store
+  const remote = new Hyperdrive(core, driveKey)
+  await remote.ready()
+  let release = null
+  try {
+    const done = remote.findingPeers()
+    release = await acquireRemoteTopic(remote)
+    done()
+    const path = buildPfpFilePath(owner, fileHash)
+    const t0 = Date.now()
+    const buf = await remote.get(path)
+    console.log(`[FetchPfp] remote.get path=${path} found=${!!buf} bytes=${buf?.length || 0} ms=${Date.now() - t0}`)
+    return buf || null
+  } catch (err) {
+    console.error('[FetchPfp] error fetching from remote drive:', err?.message || err)
+    return null
+  } finally {
+    try { await remote.close() } catch (_) {}
+    try { release?.() } catch (_) {}
+  }
+}
+
+export async function mirrorPfpDrive(remoteKeyHex) {
+  if (!remoteKeyHex) return
+  if (!pfpDrive) throw new Error('Pfp Hyperdrive not initialized')
+
+  const core = pfpStore || store
+  const remote = new Hyperdrive(core, remoteKeyHex)
+  await remote.ready()
+  let release = null
+  try {
+    if (typeof remote.mirror !== 'function') {
+      console.warn('[PfpMirror] remote.mirror not available for key', remoteKeyHex)
+      return
+    }
+    const done = remote.findingPeers()
+    release = await acquireRemoteTopic(remote)
+    done()
+    const mirror = remote.mirror(pfpDrive, {
+      prune: false,
+      includeEquals: false,
+      filter: () => true
+    })
+    console.log(`[PfpMirror] start remote=${remoteKeyHex.slice(0, 12)}`)
+    for await (const _diff of mirror) {
+      // No per-file logging to keep noise low
+    }
+    console.log(`[PfpMirror] complete remote=${remoteKeyHex.slice(0, 12)} files=${mirror.count?.files ?? 'n/a'}`)
+  } catch (err) {
+    console.error('[PfpMirror] mirror error for', remoteKeyHex, err)
+  } finally {
+    try { release?.() } catch (_) {}
+    try { await remote.close() } catch (_) {}
   }
 }
 

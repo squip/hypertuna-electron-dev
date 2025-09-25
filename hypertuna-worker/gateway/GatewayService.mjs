@@ -13,7 +13,8 @@ import {
   getEventsFromPeerHyperswarm,
   forwardJoinRequestToPeer,
   forwardCallbackToPeer,
-  requestFileFromPeer
+  requestFileFromPeer,
+  requestPfpFromPeer
 } from './HyperswarmClient.mjs';
 
 const MAX_LOG_ENTRIES = 500;
@@ -198,7 +199,113 @@ export class GatewayService extends EventEmitter {
     };
     this.healthInterval = null;
     this.eventCheckTimers = new Map();
+    this.pfpOwnerIndex = new Map(); // owner -> Set<peerPublicKey>
+    this.pfpDriveKeys = new Map(); // peerPublicKey -> driveKey
     this.peerHandshakes = new Map();
+  }
+
+  _normalizeOwnerKey(owner) {
+    if (!owner) return null;
+    try {
+      return owner.trim().toLowerCase();
+    } catch (_) {
+      return null;
+    }
+  }
+
+  _addOwnerMapping(owner, peerKey) {
+    const normalized = this._normalizeOwnerKey(owner);
+    if (!normalized) return;
+    let peers = this.pfpOwnerIndex.get(normalized);
+    if (!peers) {
+      peers = new Set();
+      this.pfpOwnerIndex.set(normalized, peers);
+    }
+    peers.add(peerKey);
+  }
+
+  _removeOwnerMapping(owner, peerKey) {
+    const normalized = this._normalizeOwnerKey(owner);
+    if (!normalized) return;
+    const peers = this.pfpOwnerIndex.get(normalized);
+    if (!peers) return;
+    peers.delete(peerKey);
+    if (peers.size === 0) {
+      this.pfpOwnerIndex.delete(normalized);
+    }
+  }
+
+  _getPeersForOwner(owner) {
+    const normalized = this._normalizeOwnerKey(owner);
+    if (!normalized) return [];
+    const peers = this.pfpOwnerIndex.get(normalized);
+    return peers ? Array.from(peers) : [];
+  }
+
+  _getPeersWithPfpDrives() {
+    return Array.from(this.pfpDriveKeys.keys());
+  }
+
+  _drainStream(stream) {
+    if (!stream) return Promise.resolve();
+    return new Promise((resolve) => {
+      let resolved = false;
+      const done = () => {
+        if (resolved) return;
+        resolved = true;
+        resolve();
+      };
+      stream.on('end', done);
+      stream.on('close', done);
+      stream.on('error', done);
+      try {
+        stream.resume?.();
+      } catch (_) {
+        done();
+      }
+    });
+  }
+
+  async _fetchPfpFromPeers(owner, file) {
+    const ownerPeers = owner ? this._getPeersForOwner(owner) : [];
+    const generalPeers = this._getPeersWithPfpDrives().filter((peerKey) => !ownerPeers.includes(peerKey));
+    const candidates = [...ownerPeers, ...generalPeers];
+
+    if (!candidates.length) return null;
+
+    for (const peerKey of candidates) {
+      const peer = this.activePeers.find(p => p.publicKey === peerKey);
+      if (!peer) continue;
+      let healthy = this.peerHealthManager.isPeerHealthy(peerKey);
+      if (!healthy) {
+        try {
+          healthy = await this.peerHealthManager.checkPeerHealth(peer, this.connectionPool);
+        } catch (err) {
+          this.log('warn', `PFP health check failed for peer ${peerKey.slice(0, 8)}: ${err.message}`);
+          healthy = false;
+        }
+      }
+      if (!healthy) continue;
+
+      try {
+        const stream = await requestPfpFromPeer(peer, owner || null, file, this.connectionPool);
+        peer.lastSeen = Date.now();
+        if ((stream.statusCode || 200) === 200) {
+          return stream;
+        }
+
+        if ((stream.statusCode || 500) === 404) {
+          await this._drainStream(stream);
+          continue;
+        }
+
+        return stream;
+      } catch (error) {
+        this.log('warn', `Failed to proxy pfp from peer ${peerKey.slice(0, 8)}: ${error.message}`);
+      }
+    }
+
+    return null;
   }
 
   _onProtocolCreated({ publicKey, protocol, context = {} }) {
@@ -474,6 +581,37 @@ export class GatewayService extends EventEmitter {
       }
     });
 
+    const servePfp = async (req, res) => {
+      const owner = req.params.owner;
+      const file = req.params.file;
+      if (!file) {
+        res.status(400).json({ error: 'Missing file parameter' });
+        return;
+      }
+
+      try {
+        const stream = await this._fetchPfpFromPeers(owner || null, file);
+        if (!stream) {
+          res.status(404).json({ error: 'Avatar not found' });
+          return;
+        }
+
+        Object.entries(stream.headers || {}).forEach(([key, value]) => {
+          if (value !== undefined) {
+            res.setHeader(key, value);
+          }
+        });
+        res.status(stream.statusCode || 200);
+        stream.pipe(res);
+      } catch (error) {
+        this.log('error', `PFP proxy error: ${error.message}`);
+        res.status(500).json({ error: 'Internal Server Error', message: error.message });
+      }
+    };
+
+    this.app.get('/pfp/:file', servePfp);
+    this.app.get('/pfp/:owner/:file', servePfp);
+
     this.app.use(async (req, res, next) => {
       if (req.path === '/health' || req.path === '/register' || req.path.startsWith('/callback')) {
         return next();
@@ -538,6 +676,29 @@ export class GatewayService extends EventEmitter {
       peer.lastSeen = Date.now();
       peer.status = 'registered';
       peer.mode = mode;
+    }
+
+    const previousOwner = peer.nostrPubkeyHex || null;
+    const previousDriveKey = peer.pfpDriveKey || null;
+
+    const nostrPubkeyHex = data.nostrPubkeyHex || data.nostr_pubkey_hex || null;
+    const pfpDriveKey = data.pfpDriveKey || data.pfp_drive_key || null;
+
+    if (previousOwner && previousOwner !== nostrPubkeyHex) {
+      this._removeOwnerMapping(previousOwner, publicKey);
+    }
+
+    peer.nostrPubkeyHex = nostrPubkeyHex || previousOwner || null;
+    peer.pfpDriveKey = pfpDriveKey || previousDriveKey || null;
+
+    if (peer.nostrPubkeyHex) {
+      this._addOwnerMapping(peer.nostrPubkeyHex, publicKey);
+    }
+
+    if (peer.pfpDriveKey) {
+      this.pfpDriveKeys.set(publicKey, peer.pfpDriveKey);
+    } else {
+      this.pfpDriveKeys.delete(publicKey);
     }
 
     if (Array.isArray(relays)) {
@@ -804,6 +965,16 @@ export class GatewayService extends EventEmitter {
     }
 
     return null;
+  }
+
+  getPeersWithPfpDrive() {
+    return this.activePeers
+      .filter(peer => !!peer.pfpDriveKey)
+      .map(peer => ({
+        publicKey: peer.publicKey,
+        pfpDriveKey: peer.pfpDriveKey,
+        nostrPubkeyHex: peer.nostrPubkeyHex || null
+      }));
   }
 }
 

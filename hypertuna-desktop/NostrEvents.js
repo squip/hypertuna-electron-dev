@@ -124,17 +124,17 @@ class NostrEvents {
      * @param {string} privateKey - Private key for signing
      * @returns {Promise<Object>} - Signed event
      */
-    static async createProfileEvent(profile, privateKey) {
+    static async createProfileEvent(profile, privateKey, options = {}) {
         console.log('Creating profile event with data:', {
             name: profile.name,
             about: profile.about ? profile.about.substring(0, 30) + '...' : undefined,
             picture: profile.picture ? 'present' : undefined
         });
-        
+        const tags = Array.isArray(options.tags) ? [...options.tags] : [];
         return this.createEvent(
             this.KIND_METADATA,
             JSON.stringify(profile),
-            [],
+            tags,
             privateKey
         );
     }
@@ -242,7 +242,7 @@ class NostrEvents {
      * @param {string} privateKey - Private key for signing
      * @returns {Promise<Object>} - Collection of events for group creation
      */
-    static async createGroupCreationEvent(name, about, isPublic, isOpen, fileSharing, privateKey, relayKey = null, proxyServer = '', npub, proxyProtocol = 'wss') {
+    static async createGroupCreationEvent(name, about, isPublic, isOpen, fileSharing, privateKey, relayKey = null, proxyServer = '', npub, proxyProtocol = 'wss', options = {}) {
         // Import the utility
         const { PublicIdentifierUtils } = await import('./PublicIdentifierUtils.js');
         
@@ -264,6 +264,8 @@ class NostrEvents {
             ['hypertuna', publicIdentifier], // Use public identifier
             ['i', 'hypertuna:relay']
         ];
+
+        const avatar = options?.avatar;
         
         if (isPublic) {
             groupTags.push(['public']);
@@ -282,7 +284,11 @@ class NostrEvents {
         } else {
             groupTags.push(['file-sharing-off']);
         }
-        
+
+        if (avatar?.tagUrl) {
+            groupTags.push(['picture', avatar.tagUrl, 'hypertuna:drive:pfp']);
+        }
+
         // Create the kind 9007 group creation event
         const groupCreateEvent = await this.createEvent(
             this.KIND_GROUP_CREATE,
@@ -316,6 +322,10 @@ class NostrEvents {
             metadataTags.push(['file-sharing-on']);
         } else {
             metadataTags.push(['file-sharing-off']);
+        }
+
+        if (avatar?.tagUrl) {
+            metadataTags.push(['picture', avatar.tagUrl, 'hypertuna:drive:pfp']);
         }
         
         const metadataEvent = await this.createEvent(
@@ -358,7 +368,7 @@ class NostrEvents {
      * @param {string} privateKey - Private key for signing
      * @returns {Promise<Object>} - Metadata edit event and updated metadata event
      */
-    static async createGroupMetadataEditEvents(publicIdentifier, metadata, privateKey) {
+    static async createGroupMetadataEditEvents(publicIdentifier, metadata, privateKey, options = {}) {
         console.log(`Creating group metadata edit events for: ${publicIdentifier}`);
         
         // Create the kind 9002 edit metadata event
@@ -366,6 +376,8 @@ class NostrEvents {
             ['h', publicIdentifier], // Use public identifier
             ['i', 'hypertuna:relay']
         ];
+
+        const avatar = options?.avatar;
         
         if (metadata.name) {
             editTags.push(['name', metadata.name]);
@@ -381,6 +393,10 @@ class NostrEvents {
         
         if (metadata.isOpen !== undefined) {
             editTags.push([metadata.isOpen ? 'open' : 'closed']);
+        }
+
+        if (avatar?.tagUrl) {
+            editTags.push(['picture', avatar.tagUrl, 'hypertuna:drive:pfp']);
         }
         
         const editEvent = await this.createEvent(
@@ -411,14 +427,18 @@ class NostrEvents {
             // Preserve existing public/private status
             metadataTags.push(['public']);  // Default to public if not specified
         }
-        
+
         if (metadata.isOpen !== undefined) {
             metadataTags.push([metadata.isOpen ? 'open' : 'closed']);
         } else {
             // Preserve existing open/closed status
             metadataTags.push(['open']);  // Default to open if not specified
         }
-        
+
+        if (avatar?.tagUrl) {
+            metadataTags.push(['picture', avatar.tagUrl, 'hypertuna:drive:pfp']);
+        }
+
         const updatedMetadataEvent = await this.createEvent(
             this.KIND_GROUP_METADATA,
             `Updated metadata for group: ${metadata.name || 'Unnamed Group'}`,
@@ -671,6 +691,14 @@ class NostrEvents {
         const hypertunaId = this._getTagValue(event, 'hypertuna');
         const hasIdentifierTag = event.tags.some(tag => tag[0] === 'i' && tag[1] === 'hypertuna:relay');
 
+        let pictureUrl = null;
+        let pictureIsHypertunaPfp = false;
+        const pictureTag = event.tags.find(tag => tag[0] === 'picture');
+        if (pictureTag) {
+            pictureUrl = pictureTag[1] || null;
+            pictureIsHypertunaPfp = pictureTag.includes('hypertuna:drive:pfp');
+        }
+
         // Determine file sharing status from tags
         let fileSharing = false;
         if (this._hasTag(event, 'file-sharing-on')) {
@@ -692,7 +720,9 @@ class NostrEvents {
             event: event,
             hypertunaId: hypertunaId,
             isHypertunaRelay: hasIdentifierTag,
-            fileSharing
+            fileSharing,
+            picture: pictureUrl,
+            pictureIsHypertunaPfp
         };
     }
     

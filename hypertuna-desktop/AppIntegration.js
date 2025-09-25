@@ -10,6 +10,7 @@ import { HypertunaUtils } from './HypertunaUtils.js';
 import { ConfigLogger } from './ConfigLogger.js';
 import NostrEvents from './NostrEvents.js';  // Add this import
 import MembersList from './MembersList.js';
+import { AvatarModal } from './AvatarModal.js';
 
 const relayReadinessTracker = new Map(); // Track relay readiness state
 const electronAPI = window.electronAPI || null;
@@ -51,6 +52,28 @@ function integrateNostrRelays(App) {
     App.discoveryRelays = new Map();
     App.discoveryRelayStorageKey = 'discovery_relay_whitelist';
     App.persistedDiscoveryRelays = [];
+
+    App.pendingProfileAvatar = null;
+    App.pendingCreateRelayAvatar = null;
+    App.pendingEditRelayAvatar = null;
+
+    App.resolveGroupAvatar = function(group) {
+        if (!group) return null;
+        const raw = group.picture || null;
+        const isHypertuna = !!group.pictureIsHypertunaPfp;
+        if (!raw) return null;
+        return HypertunaUtils.resolvePfpUrl(raw, isHypertuna);
+    };
+
+    const uint8ArrayToBase64 = (bytes) => {
+        let binary = '';
+        const chunk = 0x8000;
+        for (let i = 0; i < bytes.length; i += chunk) {
+            const segment = bytes.subarray(i, i + chunk);
+            binary += String.fromCharCode(...segment);
+        }
+        return btoa(binary);
+    };
     
 
     
@@ -250,7 +273,10 @@ function integrateNostrRelays(App) {
                 privateKey: this.currentUser.privateKey,
                 pubkey: this.currentUser.pubkey,
                 name: this.currentUser.name,
-                about: this.currentUser.about
+                about: this.currentUser.about,
+                picture: this.currentUser.picture || null,
+                pictureTagUrl: this.currentUser.pictureTagUrl || null,
+                pictureIsHypertunaPfp: !!this.currentUser.pictureIsHypertunaPfp
             };
             
             // If there's Hypertuna configuration, add it to the saved user
@@ -342,6 +368,10 @@ function integrateNostrRelays(App) {
             });
             
             this.currentUser = JSON.parse(savedUser);
+            if (!this.currentUser.picture) this.currentUser.picture = null;
+            if (!this.currentUser.pictureTagUrl) this.currentUser.pictureTagUrl = null;
+            this.currentUser.pictureIsHypertunaPfp = !!this.currentUser.pictureIsHypertunaPfp;
+            this.currentUser.tempAvatarPreview = null;
             
             // Check for Hypertuna configuration
             ConfigLogger.log('LOAD', {
@@ -474,11 +504,27 @@ function integrateNostrRelays(App) {
             profile = {
                 name: this.currentUser.name || 'User_' + NostrUtils.truncatePubkey(this.currentUser.pubkey),
                 about: this.currentUser.about || '',
-                picture: null
+                picture: this.currentUser.picture || null,
+                pictureTagUrl: this.currentUser.pictureTagUrl || null,
+                pictureIsHypertunaPfp: !!this.currentUser.pictureIsHypertunaPfp
             };
         }
+
+        if (!profile.pictureTagUrl && profile.picture) {
+            profile.pictureTagUrl = profile.picture;
+        }
+        profile.pictureIsHypertunaPfp = !!profile.pictureIsHypertunaPfp;
         
         const name = profile.name || 'User_' + NostrUtils.truncatePubkey(this.currentUser.pubkey);
+        let resolvedPicture = null;
+        if (this.currentUser?.tempAvatarPreview) {
+            resolvedPicture = this.currentUser.tempAvatarPreview;
+        } else if (profile) {
+            const tagUrl = profile.pictureTagUrl || profile.picture || null;
+            if (tagUrl) {
+                resolvedPicture = HypertunaUtils.resolvePfpUrl(tagUrl, profile.pictureIsHypertunaPfp);
+            }
+        }
         
         console.log('Updating profile display with:', {
             name: profile.name,
@@ -554,10 +600,9 @@ function integrateNostrRelays(App) {
         const updateProfilePicture = (selector) => {
             const avatar = document.querySelector(selector);
             if (avatar) {
-                if (profile.picture) {
-                    console.log(`Setting profile picture from URL: ${profile.picture}`);
-                    // Replace the text content with an image
-                    avatar.innerHTML = `<img src="${profile.picture}" alt="${name}" style="width: 100%; height: 100%; border-radius: 50%; object-fit: cover;">`;
+                if (resolvedPicture) {
+                    console.log(`Setting profile picture from URL: ${resolvedPicture}`);
+                    avatar.innerHTML = `<img src="${resolvedPicture}" alt="${name}" style="width: 100%; height: 100%; border-radius: 50%; object-fit: cover;">`;
                 } else {
                     console.log(`Using initials for profile avatar: ${name.charAt(0).toUpperCase()}`);
                     // Use first character of name as avatar
@@ -580,7 +625,175 @@ function integrateNostrRelays(App) {
             this.updateHypertunaDisplay();
         }
         
+        if (profile.pictureTagUrl) {
+            this.currentUser.pictureTagUrl = profile.pictureTagUrl;
+        }
+        this.currentUser.pictureIsHypertunaPfp = profile.pictureIsHypertunaPfp;
+        if (resolvedPicture) {
+            this.currentUser.picture = resolvedPicture;
+        }
+
         console.log('Profile display updated successfully');
+    };
+
+    App.handleProfileAvatarChange = async function() {
+        if (!this.currentUser) return;
+        try {
+            const result = await AvatarModal.open({ title: 'Update Profile Avatar' });
+            if (!result) return;
+
+            const buffer = result.buffer;
+            const fileHash = await NostrUtils.computeSha256(buffer);
+            const base64 = result.base64 || uint8ArrayToBase64(buffer);
+            const gatewaySettings = await HypertunaUtils.getGatewaySettings();
+            const cachedSettings = HypertunaUtils.getCachedGatewaySettings() || {};
+            const baseUrl = (gatewaySettings.gatewayUrl || cachedSettings.gatewayUrl || '').replace(/\/$/, '');
+            const owner = this.currentUser.pubkey;
+            const fileName = `${fileHash}${result.extension}`;
+            const pictureUrl = `${baseUrl}/pfp/${owner}/${fileName}`;
+            const tagUrl = `${baseUrl}/pfp/${fileName}`;
+
+            if (isElectron && electronAPI?.sendToWorker) {
+                await electronAPI.sendToWorker({
+                    type: 'upload-pfp',
+                    data: {
+                        owner,
+                        fileHash,
+                        metadata: {
+                            mimeType: result.mimeType,
+                            filename: fileName
+                        },
+                        buffer: base64
+                    }
+                }).catch((err) => {
+                    console.error('Failed to send avatar to worker:', err);
+                });
+            }
+
+            this.pendingProfileAvatar = {
+                fileHash,
+                extension: result.extension,
+                mimeType: result.mimeType,
+                owner,
+                pictureUrl,
+                tagUrl,
+                preview: result.preview
+            };
+
+            this.currentUser.picture = pictureUrl;
+            this.currentUser.pictureTagUrl = tagUrl;
+            this.currentUser.pictureIsHypertunaPfp = true;
+            this.currentUser.tempAvatarPreview = result.preview;
+            this.saveUserToLocalStorage();
+            this.updateProfileDisplay();
+
+            await this.updateProfile({ silent: true });
+        } catch (error) {
+            console.error('Error updating profile avatar:', error);
+            alert('Failed to update avatar: ' + error.message);
+        }
+    };
+
+    App.handleCreateRelayAvatar = async function() {
+        if (!this.currentUser) return;
+        try {
+            const result = await AvatarModal.open({ title: 'Relay Avatar' });
+            if (!result) return;
+
+            const buffer = result.buffer;
+            const fileHash = await NostrUtils.computeSha256(buffer);
+            const base64 = result.base64 || uint8ArrayToBase64(buffer);
+            const gatewaySettings = await HypertunaUtils.getGatewaySettings();
+            const cachedSettings = HypertunaUtils.getCachedGatewaySettings() || {};
+            const baseUrl = (gatewaySettings.gatewayUrl || cachedSettings.gatewayUrl || '').replace(/\/$/, '');
+            const fileName = `${fileHash}${result.extension}`;
+            const pictureUrl = `${baseUrl}/pfp/${fileName}`;
+
+            if (isElectron && electronAPI?.sendToWorker) {
+                await electronAPI.sendToWorker({
+                    type: 'upload-pfp',
+                    data: {
+                        owner: '',
+                        fileHash,
+                        metadata: {
+                            mimeType: result.mimeType,
+                            filename: fileName
+                        },
+                        buffer: base64
+                    }
+                }).catch((err) => {
+                    console.error('Failed to send relay avatar to worker:', err);
+                });
+            }
+
+            this.pendingCreateRelayAvatar = {
+                fileHash,
+                extension: result.extension,
+                mimeType: result.mimeType,
+                pictureUrl,
+                tagUrl: pictureUrl,
+                preview: result.preview
+            };
+
+            const previewEl = document.getElementById('create-relay-avatar-preview');
+            if (previewEl) {
+                previewEl.innerHTML = `<img src="${result.preview}" alt="Relay avatar preview">`;
+            }
+        } catch (error) {
+            console.error('Error selecting relay avatar:', error);
+            alert('Failed to update relay avatar: ' + error.message);
+        }
+    };
+
+    App.handleEditRelayAvatar = async function() {
+        if (!this.currentGroupId) return;
+        try {
+            const result = await AvatarModal.open({ title: 'Relay Avatar' });
+            if (!result) return;
+
+            const buffer = result.buffer;
+            const fileHash = await NostrUtils.computeSha256(buffer);
+            const base64 = result.base64 || uint8ArrayToBase64(buffer);
+            const gatewaySettings = await HypertunaUtils.getGatewaySettings();
+            const cachedSettings = HypertunaUtils.getCachedGatewaySettings() || {};
+            const baseUrl = (gatewaySettings.gatewayUrl || cachedSettings.gatewayUrl || '').replace(/\/$/, '');
+            const fileName = `${fileHash}${result.extension}`;
+            const pictureUrl = `${baseUrl}/pfp/${fileName}`;
+
+            if (isElectron && electronAPI?.sendToWorker) {
+                await electronAPI.sendToWorker({
+                    type: 'upload-pfp',
+                    data: {
+                        owner: '',
+                        fileHash,
+                        metadata: {
+                            mimeType: result.mimeType,
+                            filename: fileName
+                        },
+                        buffer: base64
+                    }
+                }).catch((err) => {
+                    console.error('Failed to send relay avatar to worker:', err);
+                });
+            }
+
+            this.pendingEditRelayAvatar = {
+                fileHash,
+                extension: result.extension,
+                mimeType: result.mimeType,
+                pictureUrl,
+                tagUrl: pictureUrl,
+                preview: result.preview
+            };
+
+            const previewEl = document.getElementById('edit-relay-avatar-preview');
+            if (previewEl) {
+                previewEl.innerHTML = `<img src="${result.preview}" alt="Relay avatar preview">`;
+            }
+        } catch (error) {
+            console.error('Error selecting relay avatar:', error);
+            alert('Failed to update relay avatar: ' + error.message);
+        }
     };
     
     /**
@@ -959,8 +1172,12 @@ App.syncHypertunaConfigToFile = async function() {
                 groupElement.href = '#';
                 groupElement.className = 'group-item';
                 
-                // Create avatar with first letter of group name
+                // Create avatar with first letter of group name or image
                 const firstLetter = group.name ? group.name.charAt(0).toUpperCase() : 'G';
+                const avatarUrl = this.resolveGroupAvatar(group);
+                const avatarMarkup = avatarUrl
+                    ? `<img src="${avatarUrl}" alt="${group.name || 'Relay'}">`
+                    : firstLetter;
                 
                 // Use hypertunaId as an additional identifier
                 const hypertunaId = group.hypertunaId || '';
@@ -973,7 +1190,7 @@ App.syncHypertunaConfigToFile = async function() {
                 }
                 
                 groupElement.innerHTML = `
-                    <div class="group-avatar">${firstLetter}</div>
+                    <div class="group-avatar">${avatarMarkup}</div>
                     <div class="group-info">
                         <div class="group-name">${group.name || 'Unnamed Relay'}</div>
                         <div class="group-description">${group.about || 'No description available'}</div>
@@ -1165,6 +1382,17 @@ App.syncHypertunaConfigToFile = async function() {
                 
                 const editOpenCheckbox = document.getElementById('edit-group-open');
                 if (editOpenCheckbox) editOpenCheckbox.checked = group.isOpen;
+
+                const editAvatarPreview = document.getElementById('edit-relay-avatar-preview');
+                if (editAvatarPreview) {
+                    const avatarUrl = this.resolveGroupAvatar(group);
+                    if (avatarUrl) {
+                        editAvatarPreview.innerHTML = `<img src="${avatarUrl}" alt="${group.name || 'Relay'}">`;
+                    } else {
+                        editAvatarPreview.innerHTML = '<span>🛰️</span>';
+                    }
+                }
+                this.pendingEditRelayAvatar = null;
             } else if (settingsForm && noPermissionMsg) {
                 settingsForm.classList.add('hidden');
                 noPermissionMsg.classList.remove('hidden');
@@ -1595,7 +1823,8 @@ App.syncHypertunaConfigToFile = async function() {
                 proxyProtocol,
                 npub,
                 relayKey?.relayUrl || null,
-                fileSharing
+                fileSharing,
+                { avatar: this.pendingCreateRelayAvatar }
             );
 
             console.log(`Group created successfully with public ID: ${eventsCollection.groupId}`);
@@ -1619,6 +1848,11 @@ App.syncHypertunaConfigToFile = async function() {
             this.loadGroups();
             
             alert('Group created successfully!');
+            this.pendingCreateRelayAvatar = null;
+            const previewEl = document.getElementById('create-relay-avatar-preview');
+            if (previewEl) {
+                previewEl.innerHTML = '<span>🛰️</span>';
+            }
             // this.navigateTo('groups'); // Don't navigate away immediately, let user see modal
         } catch (e) {
             console.error('Error creating group:', e);
@@ -2115,13 +2349,19 @@ App.syncHypertunaConfigToFile = async function() {
         }
         
         try {
+            const currentGroup = this.nostr.getGroupById(this.currentGroupId) || {};
+            let avatarOption = this.pendingEditRelayAvatar;
+            if (!avatarOption && currentGroup.pictureIsHypertunaPfp && currentGroup.picture) {
+                avatarOption = { tagUrl: currentGroup.picture };
+            }
+
             // Update group metadata with both kind 9002 and 39000 events
             const events = await this.nostr.updateGroupMetadata(this.currentGroupId, {
                 name,
                 about,
                 isPublic,
                 isOpen
-            });
+            }, { avatar: avatarOption });
             
             // Reload group details to reflect changes
             setTimeout(() => {
@@ -2129,6 +2369,7 @@ App.syncHypertunaConfigToFile = async function() {
             }, 1000);
             
             alert('Group settings updated successfully!');
+            this.pendingEditRelayAvatar = null;
             
         } catch (e) {
             console.error('Error updating group settings:', e);
@@ -2350,6 +2591,10 @@ App.displayDiscoverRelays = function(discoveredRelays) {
         groupElement.className = 'group-item group-item-with-followers';
         
         const firstLetter = group.name ? group.name.charAt(0).toUpperCase() : 'R';
+        const avatarUrl = this.resolveGroupAvatar(group);
+        const avatarMarkup = avatarUrl
+            ? `<img src="${avatarUrl}" alt="${group.name || 'Relay'}">`
+            : firstLetter;
         
         // Create followers avatars HTML
         const maxAvatars = 3;
@@ -2358,27 +2603,29 @@ App.displayDiscoverRelays = function(discoveredRelays) {
         
         const avatarsHtml = displayedFollowers.map(follower => {
             const initial = follower.profile.name ? follower.profile.name.charAt(0).toUpperCase() : '?';
-            
-            if (follower.profile.picture) {
+            const followerAvatar = follower.profile.picture
+                ? HypertunaUtils.resolvePfpUrl(follower.profile.pictureTagUrl || follower.profile.picture, follower.profile.pictureIsHypertunaPfp)
+                : null;
+
+            if (followerAvatar) {
                 return `
                     <div class="follower-avatar">
-                        <img src="${follower.profile.picture}" alt="${follower.profile.name}" 
-                             onerror="this.parentElement.innerHTML='<span>${initial}</span>'">
-                        <div class="follower-tooltip">${follower.profile.name}</div>
-                    </div>
-                `;
-            } else {
-                return `
-                    <div class="follower-avatar">
-                        <span>${initial}</span>
+                        <img src="${followerAvatar}" alt="${follower.profile.name || initial}">
                         <div class="follower-tooltip">${follower.profile.name}</div>
                     </div>
                 `;
             }
+
+            return `
+                <div class="follower-avatar">
+                    <span>${initial}</span>
+                    <div class="follower-tooltip">${follower.profile.name}</div>
+                </div>
+            `;
         }).join('');
         
         groupElement.innerHTML = `
-            <div class="group-avatar">${firstLetter}</div>
+            <div class="group-avatar">${avatarMarkup}</div>
             <div class="group-info">
                 <div class="group-name">${group.name || 'Unnamed Relay'}</div>
                 <div class="group-description">${group.about || 'No description available'}</div>
@@ -2509,12 +2756,12 @@ App.loadFollowingList = async function() {
             const name = profile.name || `User_${NostrUtils.truncatePubkey(pubkey)}`;
             const firstLetter = name.charAt(0).toUpperCase();
             
-            let avatarHtml;
-            if (profile.picture) {
-                avatarHtml = `<img src="${profile.picture}" alt="${name}" onerror="this.parentElement.innerHTML='<span>${firstLetter}</span>'">`;
-            } else {
-                avatarHtml = `<span>${firstLetter}</span>`;
-            }
+            const resolvedPicture = profile.picture
+                ? HypertunaUtils.resolvePfpUrl(profile.pictureTagUrl || profile.picture, profile.pictureIsHypertunaPfp)
+                : null;
+            const avatarHtml = resolvedPicture
+                ? `<img src="${resolvedPicture}" alt="${name}">`
+                : `<span>${firstLetter}</span>`;
             
             const npub = NostrUtils.hexToNpub(pubkey);
             const displayPub = NostrUtils.truncateNpub(npub);
@@ -2604,12 +2851,12 @@ App.addFollow = async function() {
         followItem.className = 'following-item pending-addition';
         followItem.dataset.pubkey = pubkey;
         
-        let avatarHtml;
-        if (profile.picture) {
-            avatarHtml = `<img src="${profile.picture}" alt="${name}" onerror="this.parentElement.innerHTML='<span>${firstLetter}</span>'">`;
-        } else {
-            avatarHtml = `<span>${firstLetter}</span>`;
-        }
+        const resolvedPicture = profile.picture
+            ? HypertunaUtils.resolvePfpUrl(profile.pictureTagUrl || profile.picture, profile.pictureIsHypertunaPfp)
+            : null;
+        const avatarHtml = resolvedPicture
+            ? `<img src="${resolvedPicture}" alt="${name}">`
+            : `<span>${firstLetter}</span>`;
         
         const npubAdded = NostrUtils.hexToNpub(pubkey);
         const displayPubAdded = NostrUtils.truncateNpub(npubAdded);
@@ -2995,21 +3242,37 @@ App.setupFollowingModalListeners = function() {
      * Replace update profile method
      * Updates user profile via the nostr client
      */
-    App.updateProfile = async function() {
+    App.updateProfile = async function(options = {}) {
         if (!this.currentUser) return;
         
         const name = document.getElementById('profile-name-input').value.trim();
         const about = document.getElementById('profile-about-input').value.trim();
+        const profileTags = [];
+        const profileUpdate = { name, about };
+
+        if (this.pendingProfileAvatar) {
+            profileUpdate.picture = this.pendingProfileAvatar.pictureUrl;
+            profileTags.push(['picture', this.pendingProfileAvatar.tagUrl, 'hypertuna:drive:pfp']);
+        } else if (this.currentUser?.picture) {
+            profileUpdate.picture = this.currentUser.picture;
+            if (this.currentUser.pictureIsHypertunaPfp && this.currentUser.pictureTagUrl) {
+                profileTags.push(['picture', this.currentUser.pictureTagUrl, 'hypertuna:drive:pfp']);
+            }
+        }
         
         try {
-            await this.nostr.updateProfile({
-                name,
-                about
-            });
+            await this.nostr.updateProfile(profileUpdate, { tags: profileTags });
             
             // Update user profile metadata
             this.currentUser.name = name;
             this.currentUser.about = about;
+            if (profileUpdate.picture) {
+                this.currentUser.picture = profileUpdate.picture;
+            }
+            if (this.pendingProfileAvatar) {
+                this.pendingProfileAvatar = null;
+                delete this.currentUser.tempAvatarPreview;
+            }
             
             // Save to localStorage
             this.saveUserToLocalStorage();
@@ -3017,7 +3280,9 @@ App.setupFollowingModalListeners = function() {
             // Update profile display
             this.updateProfileDisplay();
             
-            alert('Profile updated successfully');
+            if (!options.silent) {
+                alert('Profile updated successfully');
+            }
         } catch (e) {
             console.error('Error updating profile:', e);
             alert('Error updating profile: ' + e.message);

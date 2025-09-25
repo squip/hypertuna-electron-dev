@@ -232,6 +232,11 @@
                                         <label for="edit-group-description">Description</label>
                                         <textarea id="edit-group-description" class="form-textarea" rows="3"></textarea>
                                     </div>
+                                    <div class="form-group relay-avatar-picker">
+                                        <label>Relay Avatar</label>
+                                        <div class="relay-avatar-preview" id="edit-relay-avatar-preview"><span>🛰️</span></div>
+                                        <button type="button" id="btn-edit-relay-avatar" class="btn btn-secondary btn-small">Change Relay Avatar</button>
+                                    </div>
                                     <div class="settings-toggles">
                                         <div class="toggle-item">
                                             <label class="toggle-label">
@@ -298,6 +303,11 @@
                             <label for="new-group-description">Description</label>
                             <textarea id="new-group-description" class="form-textarea" rows="4" placeholder="What's this relay about?"></textarea>
                         </div>
+                        <div class="form-group relay-avatar-picker">
+                            <label>Relay Avatar</label>
+                            <div class="relay-avatar-preview" id="create-relay-avatar-preview"><span>🛰️</span></div>
+                            <button type="button" id="btn-create-relay-avatar" class="btn btn-secondary btn-small">Change Relay Avatar</button>
+                        </div>
                             <div class="settings-toggles">
                                 <div class="toggle-item">
                                     <label class="toggle-label">
@@ -355,7 +365,7 @@
                                     <div class="profile-avatar-large">
                                         <span>👤</span>
                                     </div>
-                                    <button class="btn btn-secondary btn-small">Change Avatar</button>
+                                    <button id="btn-profile-avatar" class="btn btn-secondary btn-small">Change Avatar</button>
                                 </div>
 
                                 <div class="profile-form">
@@ -982,11 +992,29 @@
               document.getElementById('btn-create-group').addEventListener('click', () => {
                   this.createGroup();
               });
+
+              const createRelayAvatarBtn = document.getElementById('btn-create-relay-avatar');
+              if (createRelayAvatarBtn) {
+                  createRelayAvatarBtn.addEventListener('click', () => {
+                      if (this.handleCreateRelayAvatar) {
+                          this.handleCreateRelayAvatar();
+                      }
+                  });
+              }
               
               // Profile page
               document.getElementById('btn-update-profile').addEventListener('click', () => {
                   this.updateProfile();
               });
+
+              const changeAvatarBtn = document.getElementById('btn-profile-avatar');
+              if (changeAvatarBtn) {
+                  changeAvatarBtn.addEventListener('click', () => {
+                      if (this.handleProfileAvatarChange) {
+                          this.handleProfileAvatarChange();
+                      }
+                  });
+              }
               
               document.getElementById('btn-toggle-privkey').addEventListener('click', () => {
                   const input = document.getElementById('profile-privkey-display');
@@ -997,6 +1025,15 @@
               if (addRelayBtn) {
                   addRelayBtn.addEventListener('click', () => {
                       this.handleAddDiscoveryRelay();
+                  });
+              }
+
+              const editRelayAvatarBtn = document.getElementById('btn-edit-relay-avatar');
+              if (editRelayAvatarBtn) {
+                  editRelayAvatarBtn.addEventListener('click', () => {
+                      if (this.handleEditRelayAvatar) {
+                          this.handleEditRelayAvatar();
+                      }
                   });
               }
 

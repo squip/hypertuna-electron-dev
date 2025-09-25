@@ -392,6 +392,20 @@ async function requestFileFromPeer(peer, identifier, file, connectionPool) {
   return stream;
 }
 
+async function requestPfpFromPeer(peer, owner, file, connectionPool) {
+  const connection = await connectionPool.getConnection(peer.publicKey);
+  const ownerSegment = owner ? `/${encodeURIComponent(owner)}` : '';
+  const response = await connection.sendRequest({
+    method: 'GET',
+    path: `/pfp${ownerSegment}/${encodeURIComponent(file)}`
+  });
+
+  const stream = Readable.from(response.body);
+  stream.headers = response.headers;
+  stream.statusCode = response.statusCode;
+  return stream;
+}
+
 async function getEventsFromPeerHyperswarm(peerPublicKey, relayKey, connectionKey, connectionPool, authToken = null) {
   const connection = await connectionPool.getConnection(peerPublicKey);
 
@@ -421,5 +435,6 @@ export {
   getEventsFromPeerHyperswarm,
   forwardJoinRequestToPeer,
   forwardCallbackToPeer,
-  requestFileFromPeer
+  requestFileFromPeer,
+  requestPfpFromPeer
 };

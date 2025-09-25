@@ -477,7 +477,7 @@ class NostrIntegration {
      * @param {string} [authenticatedRelayUrl] - Tokenized relay URL from the worker
      * @returns {Promise<Object>} - Create group events collection
      */
-    async createGroup(name, about, isPublic, isOpen, relayKey, proxyServer, proxyProtocol, npub, authenticatedRelayUrl = null, fileSharing = false) {
+    async createGroup(name, about, isPublic, isOpen, relayKey, proxyServer, proxyProtocol, npub, authenticatedRelayUrl = null, fileSharing = false, options = {}) {
         try {
             // Validate inputs
             if (typeof name !== 'string') {
@@ -505,7 +505,8 @@ class NostrIntegration {
                 proxyProtocol,
                 npub,
                 authenticatedRelayUrl,
-                fileSharing
+                fileSharing,
+                avatar: options.avatar || null
             });
             
             console.log('Group created successfully with the following events:');
@@ -599,9 +600,9 @@ class NostrIntegration {
      * @param {Object} metadata - Updated metadata
      * @returns {Promise<Object>} - Collection of metadata update events
      */
-    async updateGroupMetadata(groupId, metadata) {
+    async updateGroupMetadata(groupId, metadata, options = {}) {
         try {
-            const events = await this.client.updateGroupMetadata(groupId, metadata);
+            const events = await this.client.updateGroupMetadata(groupId, metadata, options);
             
             if (events.updatedMetadataEvent) {
                 console.log('Group metadata updated successfully:');
@@ -631,14 +632,14 @@ class NostrIntegration {
      * Update the updateProfile method in NostrIntegration.js
      * Replace the existing updateProfile method with this one
      */
-    async updateProfile(profile) {
+    async updateProfile(profile, options = {}) {
         const maxAttempts = 3;
         let attempt = 0;
         let lastError = null;
 
         while (attempt < maxAttempts) {
             try {
-                const event = await this.client.updateProfile(profile);
+                const event = await this.client.updateProfile(profile, options);
                 console.log("Profile update published:", {
                     id: event.id,
                     kind: event.kind,

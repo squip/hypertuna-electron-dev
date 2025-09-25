@@ -956,10 +956,19 @@ async fetchMultipleProfiles(pubkeys) {
         ], (event) => {
             try {
                 const profile = JSON.parse(event.content);
+                if (Array.isArray(event.tags)) {
+                    const pictureTag = event.tags.find(tag => tag[0] === 'picture');
+                    if (pictureTag) {
+                        profile.pictureTagUrl = pictureTag[1] || null;
+                        profile.pictureIsHypertunaPfp = pictureTag.includes('hypertuna:drive:pfp');
+                    }
+                }
                 const fullProfile = {
                     ...profile,
                     pubkey: event.pubkey,
-                    updated_at: event.created_at
+                    updated_at: event.created_at,
+                    pictureTagUrl: profile.pictureTagUrl || null,
+                    pictureIsHypertunaPfp: profile.pictureIsHypertunaPfp || false
                 };
                 
                 this.cachedProfiles.set(event.pubkey, fullProfile);
@@ -1504,6 +1513,13 @@ async fetchMultipleProfiles(pubkeys) {
             });
             
             const profile = JSON.parse(event.content);
+            if (Array.isArray(event.tags)) {
+                const pictureTag = event.tags.find(tag => tag[0] === 'picture');
+                if (pictureTag) {
+                    profile.pictureTagUrl = pictureTag[1] || null;
+                    profile.pictureIsHypertunaPfp = pictureTag.includes('hypertuna:drive:pfp');
+                }
+            }
             console.log(`Parsed profile data:`, {
                 name: profile.name,
                 about: profile.about ? profile.about.substring(0, 30) + '...' : undefined,
@@ -1513,7 +1529,9 @@ async fetchMultipleProfiles(pubkeys) {
             this.cachedProfiles.set(event.pubkey, {
                 ...profile,
                 pubkey: event.pubkey,
-                updated_at: event.created_at
+                updated_at: event.created_at,
+                pictureTagUrl: profile.pictureTagUrl || null,
+                pictureIsHypertunaPfp: profile.pictureIsHypertunaPfp || false
             });
             
             // Update current user if it's our profile
@@ -1979,12 +1997,21 @@ async fetchMultipleProfiles(pubkeys) {
                     
                     try {
                         const profile = JSON.parse(event.content);
+                        if (Array.isArray(event.tags)) {
+                            const pictureTag = event.tags.find(tag => tag[0] === 'picture');
+                            if (pictureTag) {
+                                profile.pictureTagUrl = pictureTag[1] || null;
+                                profile.pictureIsHypertunaPfp = pictureTag.includes('hypertuna:drive:pfp');
+                            }
+                        }
                         console.log(`Parsed profile data for ${pubkey.substring(0, 8)}:`, profile);
                         
                         this.cachedProfiles.set(pubkey, {
                             ...profile,
                             pubkey,
-                            updated_at: event.created_at
+                            updated_at: event.created_at,
+                            pictureTagUrl: profile.pictureTagUrl || null,
+                            pictureIsHypertunaPfp: profile.pictureIsHypertunaPfp || false
                         });
                         
                         // Clean up
@@ -2351,7 +2378,8 @@ async fetchMultipleProfiles(pubkeys) {
             proxyServer: groupData.proxyServer || '',
             proxyProtocol: groupData.proxyProtocol || 'wss',
             authenticatedRelayUrl: groupData.authenticatedRelayUrl || null,
-            fileSharing: Boolean(groupData.fileSharing)
+            fileSharing: Boolean(groupData.fileSharing),
+            avatar: groupData.avatar || null
         };
         
         console.log('Creating group with normalized data:', normalizedData);
@@ -2367,7 +2395,8 @@ async fetchMultipleProfiles(pubkeys) {
             normalizedData.identifier,
             normalizedData.proxyServer,
             npub,
-            normalizedData.proxyProtocol
+            normalizedData.proxyProtocol,
+            { avatar: normalizedData.avatar }
         );
         
         const {
@@ -2822,7 +2851,7 @@ async fetchMultipleProfiles(pubkeys) {
      * @param {Object} metadata - Updated metadata
      * @returns {Promise<Object>} - Collection of edit metadata events
      */
-    async updateGroupMetadata(publicIdentifier, metadata) {
+    async updateGroupMetadata(publicIdentifier, metadata, options = {}) {
         if (!this.user || !this.user.privateKey) {
             throw new Error('User not logged in');
         }
@@ -2835,7 +2864,8 @@ async fetchMultipleProfiles(pubkeys) {
         const events = await NostrEvents.createGroupMetadataEditEvents(
             publicIdentifier,
             metadata,
-            this.user.privateKey
+            this.user.privateKey,
+            options
         );
         
         // Publish both events
@@ -2892,14 +2922,15 @@ async fetchMultipleProfiles(pubkeys) {
      * @param {Object} profile - Profile data
      * @returns {Promise<Object>} - Profile event
      */
-    async updateProfile(profile) {
+    async updateProfile(profile, options = {}) {
         if (!this.user || !this.user.privateKey) {
             throw new Error('User not logged in');
         }
-        
+
         const event = await NostrEvents.createProfileEvent(
             profile,
-            this.user.privateKey
+            this.user.privateKey,
+            options
         );
         
         // Publish the event once across all relays

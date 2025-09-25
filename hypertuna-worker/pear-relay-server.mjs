@@ -45,7 +45,7 @@ import {
   calculateAuthorizedUsers
 } from './hypertuna-relay-profile-manager-bare.mjs';
 
-import { getFile } from './hyperdrive-manager.mjs';
+import { getFile, getPfpFile } from './hyperdrive-manager.mjs';
 import { loadGatewaySettings, getCachedGatewaySettings } from '../shared/config/GatewaySettings.mjs';
 
 
@@ -133,6 +133,7 @@ export async function initializeRelayServer(customConfig = {}) {
     storage: customConfig.storage || global.userConfig?.storage || process.env.STORAGE_DIR || join(process.cwd(), 'data'),
     // Add gateway public key if known (optional)
     gatewayPublicKey: customConfig.gatewayPublicKey || null,
+    pfpDriveKey: customConfig.pfpDriveKey || null,
     ...customConfig
   };
   
@@ -1541,6 +1542,66 @@ function setupProtocolHandlers(protocol) {
       };
     }
   });
+
+  async function handlePfpRequest(request, ownerParam = null) {
+    const rawOwner = ownerParam || request.params.owner || null;
+    const fileId = request.params.file;
+
+    if (!fileId) {
+      updateMetrics(false);
+      return {
+        statusCode: 400,
+        headers: { 'content-type': 'application/json' },
+        body: b4a.from(JSON.stringify({ error: 'Missing file identifier' }))
+      };
+    }
+
+    try {
+      const hash = fileId.split('.')[0];
+      const ownerKey = rawOwner ? rawOwner.trim() : '';
+      const fileBuffer = await getPfpFile(ownerKey, hash);
+
+      if (!fileBuffer) {
+        updateMetrics(false);
+        return {
+          statusCode: 404,
+          headers: { 'content-type': 'application/json' },
+          body: b4a.from(JSON.stringify({ error: 'Avatar not found' }))
+        };
+      }
+
+      const ext = fileId.includes('.') ? fileId.split('.').pop().toLowerCase() : '';
+      const mimeTypes = {
+        jpg: 'image/jpeg',
+        jpeg: 'image/jpeg',
+        png: 'image/png',
+        gif: 'image/gif',
+        webp: 'image/webp'
+      };
+      const contentType = mimeTypes[ext] || 'application/octet-stream';
+
+      updateMetrics(true);
+      return {
+        statusCode: 200,
+        headers: {
+          'content-type': contentType,
+          'cache-control': 'public, max-age=60'
+        },
+        body: b4a.from(fileBuffer)
+      };
+    } catch (error) {
+      console.error('[RelayServer] PFP handler error:', error);
+      updateMetrics(false);
+      return {
+        statusCode: 500,
+        headers: { 'content-type': 'application/json' },
+        body: b4a.from(JSON.stringify({ error: 'Internal Server Error', message: error.message }))
+      };
+    }
+  }
+
+  protocol.handle('/pfp/:file', (request) => handlePfpRequest(request, null));
+  protocol.handle('/pfp/:owner/:file', (request) => handlePfpRequest(request));
   
   console.log('[RelayServer] Protocol handlers setup complete');
 }
@@ -1769,7 +1830,9 @@ async function registerWithGateway(relayProfileInfo = null, options = {}) {
       relays: relayList,
       address: advertisedAddress,
       mode: 'hyperswarm',
-      timestamp: new Date().toISOString()
+      timestamp: new Date().toISOString(),
+      nostrPubkeyHex: config.nostr_pubkey_hex || null,
+      pfpDriveKey: config.pfpDriveKey || null
     };
 
     if (relayProfileInfo) {

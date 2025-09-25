@@ -1,5 +1,6 @@
 // MembersList.js - Enhanced with deduplication
 import { NostrUtils } from "./NostrUtils.js";
+import { HypertunaUtils } from "./HypertunaUtils.js";
 
 export default class MembersList {
   constructor(container, client, currentUserPubkey) {
@@ -97,13 +98,16 @@ export default class MembersList {
         const first = name.charAt(0).toUpperCase();
         const roleText = roles.includes('admin') ? 'Admin' : 'Member';
         const roleClass = roles.includes('admin') ? 'admin' : '';
+        const resolvedPicture = profile.picture
+            ? HypertunaUtils.resolvePfpUrl(profile.pictureTagUrl || profile.picture, profile.pictureIsHypertunaPfp)
+            : null;
 
         const item = document.createElement('div');
         item.className = 'member-item';
         item.dataset.pubkey = pk; // Add data attribute for easy identification
         
         item.innerHTML = `
-            <div class="member-avatar">${profile.picture ? `<img src="${profile.picture}" alt="${name}">` : `<span>${first}</span>`}</div>
+            <div class="member-avatar">${resolvedPicture ? `<img src="${resolvedPicture}" alt="${name}">` : `<span>${first}</span>`}</div>
             <div class="member-info">
                 <div class="member-name">${name}</div>
                 <div class="member-pubkey">${displayPub}</div>

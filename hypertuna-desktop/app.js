@@ -685,6 +685,29 @@ async function handleWorkerMessage(message) {
       }
       break
 
+    case 'pfp-drive-key':
+      try {
+        const cfg = (await HypertunaUtils.loadConfig()) || {}
+        cfg.pfpDriveKey = message.driveKey
+        await HypertunaUtils.saveConfig(cfg)
+        if (window.App && window.App.currentUser && window.App.currentUser.hypertunaConfig) {
+          window.App.currentUser.hypertunaConfig.pfpDriveKey = message.driveKey
+          if (typeof window.App.saveUserToLocalStorage === 'function') {
+            window.App.saveUserToLocalStorage()
+          }
+          if (typeof window.App.updateHypertunaDisplay === 'function') {
+            window.App.updateHypertunaDisplay()
+          }
+        }
+      } catch (e) {
+        console.error('[App] Failed to persist pfp drive key', e)
+      }
+      break
+
+    case 'upload-pfp-complete':
+      console.log(`[App] Worker stored avatar owner=${message.owner || 'root'} fileHash=${message.fileHash}`)
+      break
+
     case 'heartbeat':
       // Update last heartbeat time
       updateWorkerStatus('running', `Running (${new Date(message.timestamp).toLocaleTimeString()})`)
