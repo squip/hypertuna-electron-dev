@@ -651,7 +651,7 @@ function integrateNostrRelays(App) {
             const owner = this.currentUser.pubkey;
             const fileName = `${fileHash}${result.extension}`;
             const pictureUrl = `${baseUrl}/pfp/${owner}/${fileName}`;
-            const tagUrl = `${baseUrl}/pfp/${fileName}`;
+            const tagUrl = `${baseUrl}/pfp/${owner}/${fileName}`;
 
             if (isElectron && electronAPI?.sendToWorker) {
                 await electronAPI.sendToWorker({
