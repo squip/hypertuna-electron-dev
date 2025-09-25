@@ -180,8 +180,14 @@
                                 
                                 <div class="message-input-container">
                                     <div class="message-input-wrapper">
+                                        <button id="btn-attach-file" class="icon-btn message-attach-btn" type="button" aria-label="Attach file" aria-pressed="false">
+                                            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+                                                <line x1="12" y1="5" x2="12" y2="19"></line>
+                                                <line x1="5" y1="12" x2="19" y2="12"></line>
+                                            </svg>
+                                        </button>
+                                        <input type="file" id="message-file" class="visually-hidden" accept="*/*">
                                         <textarea id="message-input" class="message-input" placeholder="Type a message..." rows="1"></textarea>
-                                        <input type="file" id="message-file" accept="*/*">
                                         <button id="btn-send-message" class="send-btn" aria-label="Send message">
                                             <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                                                 <line x1="22" y1="2" x2="11" y2="13"></line>
@@ -203,7 +209,7 @@
                                 <div id="admin-panel" class="admin-panel hidden">
                                     <h3>Admin Actions</h3>
                                     <div class="admin-actions">
-                                        <button id="btn-invite-members" class="btn btn-secondary btn-small">Invite Members</button>
+                                        <button id="btn-invite-members" class="btn btn-primary">Invite Members</button>
                                     </div>
                                     <div id="join-requests-section" class="join-requests hidden">
                                         <h4>Pending Join Requests (<span id="join-request-count">0</span>)</h4>
@@ -213,7 +219,7 @@
                                 <div id="member-actions" class="member-panel hidden">
                                     <h3>Member Actions</h3>
                                     <div class="member-actions">
-                                        <button id="btn-member-invite" class="btn btn-secondary btn-small">Invite Members</button>
+                                        <button id="btn-member-invite" class="btn btn-primary">Invite Members</button>
                                     </div>
                                 </div>
                             </div>
@@ -931,6 +937,23 @@
               document.getElementById('btn-send-message').addEventListener('click', () => {
                   this.sendMessage();
               });
+
+              const attachFileButton = document.getElementById('btn-attach-file');
+              const messageFileInput = document.getElementById('message-file');
+              if (attachFileButton && messageFileInput) {
+                  attachFileButton.addEventListener('click', () => {
+                      messageFileInput.click();
+                  });
+
+                  const syncAttachmentState = () => {
+                      const hasFile = messageFileInput.files && messageFileInput.files.length > 0;
+                      attachFileButton.classList.toggle('message-attach-btn--active', hasFile);
+                      attachFileButton.setAttribute('aria-pressed', hasFile ? 'true' : 'false');
+                  };
+
+                  messageFileInput.addEventListener('change', syncAttachmentState);
+                  syncAttachmentState();
+              }
               
               // Enter key to send message
               document.getElementById('message-input').addEventListener('keypress', (e) => {

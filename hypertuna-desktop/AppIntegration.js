@@ -2164,6 +2164,7 @@ App.syncHypertunaConfigToFile = async function() {
         const messageInput = document.getElementById('message-input');
         const fileInput = document.getElementById('message-file');
         const sendButton = document.getElementById('btn-send-message');
+        const attachButton = document.getElementById('btn-attach-file');
         const messageText = messageInput.value.trim();
 
         const file = fileInput.files[0];
@@ -2183,6 +2184,9 @@ App.syncHypertunaConfigToFile = async function() {
             messageInput.disabled = true;
             fileInput.disabled = true;
             sendButton.disabled = true;
+            if (attachButton) {
+                attachButton.disabled = true;
+            }
             
             await this.nostr.sendGroupMessage(
                 this.currentGroupId,
@@ -2194,6 +2198,10 @@ App.syncHypertunaConfigToFile = async function() {
             messageInput.value = '';
             messageInput.style.height = 'auto';
             fileInput.value = '';
+            if (attachButton) {
+                attachButton.classList.remove('message-attach-btn--active');
+                attachButton.setAttribute('aria-pressed', 'false');
+            }
             
             // Reload messages
             this.loadGroupMessages();
@@ -2206,6 +2214,9 @@ App.syncHypertunaConfigToFile = async function() {
             messageInput.disabled = false;
             fileInput.disabled = false;
             sendButton.disabled = false;
+            if (attachButton) {
+                attachButton.disabled = false;
+            }
             messageInput.focus();
         }
     };
