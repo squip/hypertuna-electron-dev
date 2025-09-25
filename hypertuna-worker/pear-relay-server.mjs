@@ -1839,7 +1839,6 @@ async function registerWithGateway(relayProfileInfo = null, options = {}) {
       return value || null;
     };
 
-    const gatewayBase = buildGatewayWebsocketBase(config);
     const metadataCache = new Map();
     const relayList = [];
 
@@ -1897,7 +1896,7 @@ async function registerWithGateway(relayProfileInfo = null, options = {}) {
         isPublic: resolvedIsPublic,
         metadataUpdatedAt: resolvedMetadata?.updatedAt || toTimestamp(profile?.updated_at),
         metadataEventId: resolvedMetadata?.eventId || null,
-        connectionUrl: `${gatewayBase}/${identifierPath}`
+        gatewayPath: identifierPath
       });
     }
 
@@ -1955,7 +1954,7 @@ async function registerWithGateway(relayProfileInfo = null, options = {}) {
         isPublic: newRelayIsPublic,
         metadataUpdatedAt: resolvedNewMetadata?.updatedAt || toTimestamp(relayProfileInfo.updated_at),
         metadataEventId: resolvedNewMetadata?.eventId || null,
-        connectionUrl: `${gatewayBase}/${identifierPath}`
+        gatewayPath: identifierPath
       };
     }
 

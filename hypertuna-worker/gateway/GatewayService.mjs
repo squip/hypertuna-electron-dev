@@ -763,14 +763,16 @@ export class GatewayService extends EventEmitter {
         if (relayObj.avatarUrl !== undefined) {
           nextMetadata.avatarUrl = relayObj.avatarUrl || null;
         }
-        if (relayObj.connectionUrl) {
-          nextMetadata.connectionUrl = relayObj.connectionUrl;
-        }
         if (relayObj.metadataEventId) {
           nextMetadata.metadataEventId = relayObj.metadataEventId;
         }
         if (!nextMetadata.identifier) {
           nextMetadata.identifier = identifier;
+        }
+
+        const gatewayPath = this._normalizeGatewayPath(identifier, relayObj.gatewayPath, relayObj.connectionUrl);
+        if (gatewayPath) {
+          nextMetadata.gatewayPath = gatewayPath;
         }
 
         if (typeof relayObj.isPublic === 'boolean') {
@@ -822,15 +824,6 @@ export class GatewayService extends EventEmitter {
     };
   }
 
-  _coerceTimestamp(value) {
-    if (value === null || value === undefined) return null;
-    if (typeof value === 'number') {
-      return Number.isFinite(value) ? value : null;
-    }
-    const parsed = Date.parse(value);
-    return Number.isFinite(parsed) ? parsed : null;
-  }
-
   async _handleGatewayRegisterRequest(publicKey, request) {
     try {
       let payload = {};
@@ -871,6 +864,37 @@ export class GatewayService extends EventEmitter {
         body: Buffer.from(JSON.stringify({ error: error.message }))
       };
     }
+  }
+
+  _coerceTimestamp(value) {
+    if (value === null || value === undefined) return null;
+    if (typeof value === 'number') {
+      return Number.isFinite(value) ? value : null;
+    }
+    const parsed = Date.parse(value);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+
+  _normalizeGatewayPath(identifier, gatewayPath = null, legacyUrl = null) {
+    if (typeof gatewayPath === 'string' && gatewayPath.trim()) {
+      return gatewayPath.replace(/^\//, '');
+    }
+
+    if (typeof legacyUrl === 'string' && legacyUrl.trim()) {
+      try {
+        const parsed = new URL(legacyUrl);
+        const path = parsed.pathname.replace(/^\//, '');
+        if (path) return path;
+      } catch (_) {
+        // ignore malformed URL
+      }
+    }
+
+    if (typeof identifier === 'string' && identifier.includes(':')) {
+      return identifier.replace(':', '/');
+    }
+
+    return typeof identifier === 'string' ? identifier : null;
   }
 
   handleGatewayWebSocketConnection(ws, req) {

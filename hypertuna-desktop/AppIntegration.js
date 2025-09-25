@@ -68,6 +68,64 @@ function integrateNostrRelays(App) {
         return HypertunaUtils.resolvePfpUrl(raw, isHypertuna);
     };
 
+    App.normalizeGatewayPath = function(identifier, metadata = null) {
+        if (metadata && typeof metadata.gatewayPath === 'string' && metadata.gatewayPath.trim()) {
+            return metadata.gatewayPath.replace(/^\//, '');
+        }
+
+        const legacyUrl = metadata?.connectionUrl;
+        if (typeof legacyUrl === 'string' && legacyUrl.trim()) {
+            try {
+                const parsed = new URL(legacyUrl);
+                const path = parsed.pathname.replace(/^\//, '');
+                if (path) return path;
+            } catch (_) {
+                // ignore malformed legacy URL
+            }
+        }
+
+        if (typeof identifier === 'string' && identifier.includes(':')) {
+            return identifier.replace(':', '/');
+        }
+
+        return typeof identifier === 'string' ? identifier : null;
+    };
+
+    App.resolveLocalGatewayBase = async function() {
+        let settings = null;
+        try {
+            settings = await HypertunaUtils.getGatewaySettings();
+        } catch (_) {
+            settings = null;
+        }
+        if (!settings || typeof settings !== 'object') {
+            settings = HypertunaUtils.getCachedGatewaySettings() || {};
+        }
+
+        const protocol = settings.proxyWebsocketProtocol || settings.proxy_websocket_protocol || (() => {
+            if (typeof settings.gatewayUrl === 'string') {
+                try {
+                    const parsed = new URL(settings.gatewayUrl);
+                    return parsed.protocol === 'http:' ? 'ws' : 'wss';
+                } catch (_) {}
+            }
+            return 'ws';
+        })();
+
+        let host = settings.proxyHost || settings.proxy_host;
+        if (!host && typeof settings.gatewayUrl === 'string') {
+            try {
+                const parsed = new URL(settings.gatewayUrl);
+                host = parsed.host;
+            } catch (_) {}
+        }
+        if (!host) {
+            host = '127.0.0.1:8443';
+        }
+
+        return `${protocol}://${host}`.replace(/\/$/, '');
+    };
+
     App.updateGatewayPeers = function({ relayMap, peerDetails } = {}) {
         const nextRelayMap = new Map();
 
@@ -2746,6 +2804,7 @@ App.loadDiscoverRelays = async function(force = false) {
         const followRelayMap = await this.nostr.client.discoverRelaysFromFollows();
         const userRelayIds = this.nostr.client.userRelayIds || new Set();
         const entries = [];
+        const gatewayBaseUrl = await this.resolveLocalGatewayBase();
 
         for (const [identifier, relayInfo] of this.gatewayPeerRelayMap.entries()) {
             if (!identifier || !relayInfo) continue;
@@ -2788,6 +2847,8 @@ App.loadDiscoverRelays = async function(force = false) {
             const groupData = followerInfo?.group || null;
             const hypertunaId = groupData?.hypertunaId || identifier;
             const avatarUrl = metadata.avatarUrl || (groupData ? this.resolveGroupAvatar(groupData) : null);
+            const gatewayPath = this.normalizeGatewayPath(identifier, metadata);
+            const connectionUrl = gatewayPath ? `${gatewayBaseUrl}/${gatewayPath}` : null;
 
             entries.push({
                 identifier,
@@ -2800,10 +2861,18 @@ App.loadDiscoverRelays = async function(force = false) {
                 followerCount,
                 followers: followerInfo?.followers || [],
                 group: groupData,
-                connectionUrl: metadata.connectionUrl || null,
+                connectionUrl,
                 metadataUpdatedAt: metadata.metadataUpdatedAt || metadata.updatedAt || null,
                 metadataEventId: metadata.metadataEventId || null
             });
+
+            if (connectionUrl && this.nostr?.client) {
+                try {
+                    this.nostr.client.queueRelayConnection(identifier, connectionUrl);
+                } catch (err) {
+                    console.warn('Failed to queue relay connection', identifier, err);
+                }
+            }
         }
 
         entries.sort((a, b) => {
@@ -2846,7 +2915,8 @@ App.displayDiscoverRelays = function(relays) {
             followerCount: relayData.followerCount || 0,
             peerCount: this.getRelayPeerCount(relayData.group?.hypertunaId || identifier),
             isPublic: typeof relayData.group?.isPublic === 'boolean' ? relayData.group.isPublic : true,
-            group: relayData.group || null
+            group: relayData.group || null,
+            connectionUrl: relayData.connectionUrl || null
         }));
     }
 
@@ -2878,7 +2948,8 @@ App.displayDiscoverRelays = function(relays) {
             followerCount = 0,
             peerCount = 0,
             isPublic = true,
-            group = null
+            group = null,
+            connectionUrl = null
         } = entry;
 
         if (this.nostr && typeof this.nostr.isGroupMember === 'function' && this.currentUser) {
@@ -2892,11 +2963,17 @@ App.displayDiscoverRelays = function(relays) {
         groupElement.className = 'group-item group-item-with-followers';
 
         const displayName = name || 'Unnamed Relay';
-        const fallbackLetter = displayName.charAt(0).toUpperCase();
+        const descriptionText = description || 'No description available';
+        const displayNameEsc = this.escapeHtml(displayName);
+        const descriptionEsc = this.escapeHtml(descriptionText);
+        const visibilityLabel = isPublic ? 'Public Relay' : 'Private Relay';
+        const visibilityEsc = this.escapeHtml(visibilityLabel);
+
+        const fallbackLetter = displayName.trim() ? displayName.trim().charAt(0).toUpperCase() : 'R';
         const resolvedAvatar = avatarUrl || (group ? this.resolveGroupAvatar(group) : null);
         const avatarMarkup = resolvedAvatar
-            ? `<img src="${resolvedAvatar}" alt="${displayName}">`
-            : fallbackLetter;
+            ? `<img src="${this.escapeHtml(resolvedAvatar)}" alt="${displayNameEsc}">`
+            : this.escapeHtml(fallbackLetter);
 
         const maxAvatars = 3;
         const displayedFollowers = followers.slice(0, maxAvatars);
@@ -2904,6 +2981,7 @@ App.displayDiscoverRelays = function(relays) {
 
         const avatarsHtml = displayedFollowers.map((follower) => {
             const followerName = follower.profile?.name || '';
+            const followerNameEsc = this.escapeHtml(followerName || 'Unknown user');
             const initial = followerName ? followerName.charAt(0).toUpperCase() : '?';
             const followerAvatar = follower.profile?.picture
                 ? HypertunaUtils.resolvePfpUrl(
@@ -2915,16 +2993,16 @@ App.displayDiscoverRelays = function(relays) {
             if (followerAvatar) {
                 return `
                     <div class="follower-avatar">
-                        <img src="${followerAvatar}" alt="${followerName || initial}">
-                        <div class="follower-tooltip">${followerName || 'Unknown user'}</div>
+                        <img src="${this.escapeHtml(followerAvatar)}" alt="${followerNameEsc}">
+                        <div class="follower-tooltip">${followerNameEsc}</div>
                     </div>
                 `;
             }
 
             return `
                 <div class="follower-avatar">
-                    <span>${initial}</span>
-                    <div class="follower-tooltip">${followerName || 'Unknown user'}</div>
+                    <span>${this.escapeHtml(initial)}</span>
+                    <div class="follower-tooltip">${followerNameEsc}</div>
                 </div>
             `;
         }).join('');
@@ -2932,23 +3010,21 @@ App.displayDiscoverRelays = function(relays) {
         const latestPeerCount = this.getRelayPeerCount(hypertunaId) || peerCount || 0;
         const peerLabel = latestPeerCount === 1 ? '1 peer online' : `${latestPeerCount} peers online`;
 
-        const visibilityLabel = isPublic ? 'Public Relay' : 'Private Relay';
-
         groupElement.innerHTML = `
             <div class="group-avatar">${avatarMarkup}</div>
             <div class="group-info">
-                <div class="group-name">${displayName}</div>
-                <div class="group-description">${description || 'No description available'}</div>
-                <div class="group-visibility muted">${visibilityLabel}</div>
+                <div class="group-name">${displayNameEsc}</div>
+                <div class="group-description">${descriptionEsc}</div>
+                <div class="group-visibility muted">${visibilityEsc}</div>
             </div>
-            <div class="group-peer-summary" data-role="peer-count">${peerLabel}</div>
+            <div class="group-peer-summary" data-role="peer-count">${this.escapeHtml(peerLabel)}</div>
             <div class="followers-info">
                 <div class="followers-avatars">
                     ${avatarsHtml}
                 </div>
                 <div class="followers-count">
-                    ${followerCount} ${followerCount === 1 ? 'follow' : 'follows'}
-                    ${additionalCount > 0 ? `+${additionalCount}` : ''}
+                    ${this.escapeHtml(String(followerCount))} ${followerCount === 1 ? 'follow' : 'follows'}
+                    ${additionalCount > 0 ? `+${this.escapeHtml(String(additionalCount))}` : ''}
                 </div>
             </div>
         `;
@@ -2957,8 +3033,19 @@ App.displayDiscoverRelays = function(relays) {
             groupElement.dataset.hypertunaId = hypertunaId;
         }
 
+        if (connectionUrl) {
+            groupElement.dataset.connectionUrl = connectionUrl;
+        }
+
         groupElement.addEventListener('click', (e) => {
             e.preventDefault();
+            if (connectionUrl && this.nostr?.client) {
+                try {
+                    this.nostr.client.queueRelayConnection(identifier, connectionUrl);
+                } catch (err) {
+                    console.warn('Failed to queue relay connection on click', identifier, err);
+                }
+            }
             this.currentGroupId = identifier;
             this.currentHypertunaId = hypertunaId;
             this.navigateTo('group-detail');

@@ -233,13 +233,23 @@ function updateGatewayPeerState(status = {}) {
   const nextRelayMap = new Map();
   for (const [identifier, info] of relayEntries) {
     const peersArray = Array.isArray(info?.peers) ? info.peers : [];
+    const metadata = info?.metadata && typeof info.metadata === 'object'
+      ? { ...info.metadata }
+      : null;
+
+    if (metadata && metadata.metadataUpdatedAt != null) {
+      const ts = Number(metadata.metadataUpdatedAt);
+      if (Number.isFinite(ts)) metadata.metadataUpdatedAt = ts;
+    }
+
     nextRelayMap.set(identifier, {
       peers: new Set(peersArray),
       peerCount:
         typeof info?.peerCount === 'number' ? info.peerCount : peersArray.length,
       status: info?.status || 'unknown',
       lastActive: info?.lastActive || null,
-      createdAt: info?.createdAt || null
+      createdAt: info?.createdAt || null,
+      metadata
     });
   }
 
