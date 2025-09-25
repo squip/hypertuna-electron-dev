@@ -3,20 +3,25 @@ import { NostrUtils } from "./NostrUtils.js";
 import { HypertunaUtils } from "./HypertunaUtils.js";
 
 export default class MembersList {
-  constructor(container, client, currentUserPubkey) {
+  constructor(container, client, currentUserPubkey, options = {}) {
     this.container = container;
     this.client = client;
     this.currentUserPubkey = currentUserPubkey;
     this.renderedMembers = new Set(); // Track rendered members to prevent duplicates
+    this.onlineStatusResolver = options.onlineStatusResolver || null;
   }
 
   setUserPubkey(pubkey) {
     this.currentUserPubkey = pubkey;
   }
 
+  setOnlineStatusResolver(resolver) {
+    this.onlineStatusResolver = resolver;
+  }
+
   async render(members = [], admins = []) {
     if (!this.container) return;
-    
+
     // Clear container and reset tracked members
     this.container.innerHTML = '';
     this.renderedMembers.clear();
@@ -89,7 +94,7 @@ export default class MembersList {
         }
         
         this.renderedMembers.add(pk);
-        
+
         const profile = profiles[pk];
         const roles = member.roles || ['member'];
         const npub = NostrUtils.hexToNpub(pk);
@@ -101,15 +106,21 @@ export default class MembersList {
         const resolvedPicture = profile.picture
             ? HypertunaUtils.resolvePfpUrl(profile.pictureTagUrl || profile.picture, profile.pictureIsHypertunaPfp)
             : null;
+        const isOnline = this.onlineStatusResolver ? !!this.onlineStatusResolver(pk) : false;
 
         const item = document.createElement('div');
         item.className = 'member-item';
         item.dataset.pubkey = pk; // Add data attribute for easy identification
-        
+        if (isOnline) {
+            item.dataset.online = 'true';
+        } else {
+            delete item.dataset.online;
+        }
+
         item.innerHTML = `
             <div class="member-avatar">${resolvedPicture ? `<img src="${resolvedPicture}" alt="${name}">` : `<span>${first}</span>`}</div>
             <div class="member-info">
-                <div class="member-name">${name}</div>
+                <div class="member-name">${name}${isOnline ? '<span class="member-status-dot" title="Online"></span>' : ''}</div>
                 <div class="member-pubkey">${displayPub}</div>
             </div>
             <span class="member-role ${roleClass}">${roleText}</span>`;
@@ -153,6 +164,38 @@ export default class MembersList {
 
         this.container.appendChild(item);
     }
+  }
+
+  updateOnlineStatuses(resolver = null) {
+    if (resolver) {
+      this.onlineStatusResolver = resolver;
+    }
+    if (!this.container || !this.onlineStatusResolver) return;
+
+    const items = this.container.querySelectorAll('.member-item');
+    items.forEach((item) => {
+      const pk = item.dataset.pubkey;
+      if (!pk) return;
+      const isOnline = !!this.onlineStatusResolver(pk);
+      const nameEl = item.querySelector('.member-name');
+      if (!nameEl) return;
+      let indicator = nameEl.querySelector('.member-status-dot');
+
+      if (isOnline) {
+        item.dataset.online = 'true';
+        if (!indicator) {
+          indicator = document.createElement('span');
+          indicator.className = 'member-status-dot';
+          indicator.title = 'Online';
+          nameEl.appendChild(indicator);
+        }
+      } else {
+        delete item.dataset.online;
+        if (indicator) {
+          indicator.remove();
+        }
+      }
+    });
   }
   
   // New method to check if a member is already rendered

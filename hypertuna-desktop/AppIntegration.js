@@ -48,6 +48,9 @@ function integrateNostrRelays(App) {
     // Create nostr integration
     App.nostr = new NostrIntegration(App);
 
+    App.gatewayPeerRelayMap = new Map();
+    App.gatewayPeerDetails = new Map();
+
     // Track discovery relay connections displayed in profile UI
     App.discoveryRelays = new Map();
     App.discoveryRelayStorageKey = 'discovery_relay_whitelist';
@@ -63,6 +66,151 @@ function integrateNostrRelays(App) {
         const isHypertuna = !!group.pictureIsHypertunaPfp;
         if (!raw) return null;
         return HypertunaUtils.resolvePfpUrl(raw, isHypertuna);
+    };
+
+    App.updateGatewayPeers = function({ relayMap, peerDetails } = {}) {
+        const nextRelayMap = new Map();
+
+        if (relayMap instanceof Map) {
+            for (const [identifier, info] of relayMap.entries()) {
+                if (!identifier) continue;
+                const peers = info?.peers instanceof Set
+                    ? new Set(info.peers)
+                    : new Set(Array.isArray(info?.peers) ? info.peers : []);
+                nextRelayMap.set(identifier, {
+                    peers,
+                    peerCount: typeof info?.peerCount === 'number' ? info.peerCount : peers.size,
+                    status: info?.status || 'unknown',
+                    lastActive: info?.lastActive || null,
+                    createdAt: info?.createdAt || null
+                });
+            }
+        } else if (relayMap && typeof relayMap === 'object') {
+            for (const [identifier, info] of Object.entries(relayMap)) {
+                if (!identifier) continue;
+                const peers = Array.isArray(info?.peers) ? new Set(info.peers) : new Set();
+                nextRelayMap.set(identifier, {
+                    peers,
+                    peerCount: typeof info?.peerCount === 'number' ? info.peerCount : peers.size,
+                    status: info?.status || 'unknown',
+                    lastActive: info?.lastActive || null,
+                    createdAt: info?.createdAt || null
+                });
+            }
+        }
+
+        const nextPeerDetails = new Map();
+        if (peerDetails instanceof Map) {
+            for (const [peerKey, info] of peerDetails.entries()) {
+                nextPeerDetails.set(peerKey, {
+                    nostrPubkeyHex: info?.nostrPubkeyHex || null,
+                    relays: Array.isArray(info?.relays) ? [...info.relays] : [],
+                    relayCount: typeof info?.relayCount === 'number'
+                        ? info.relayCount
+                        : Array.isArray(info?.relays) ? info.relays.length : 0,
+                    lastSeen: info?.lastSeen || null,
+                    status: info?.status || 'unknown',
+                    mode: info?.mode || null,
+                    address: info?.address || null
+                });
+            }
+        } else if (peerDetails && typeof peerDetails === 'object') {
+            for (const [peerKey, info] of Object.entries(peerDetails)) {
+                nextPeerDetails.set(peerKey, {
+                    nostrPubkeyHex: info?.nostrPubkeyHex || null,
+                    relays: Array.isArray(info?.relays) ? [...info.relays] : [],
+                    relayCount: typeof info?.relayCount === 'number'
+                        ? info.relayCount
+                        : Array.isArray(info?.relays) ? info.relays.length : 0,
+                    lastSeen: info?.lastSeen || null,
+                    status: info?.status || 'unknown',
+                    mode: info?.mode || null,
+                    address: info?.address || null
+                });
+            }
+        }
+
+        this.gatewayPeerRelayMap = nextRelayMap;
+        this.gatewayPeerDetails = nextPeerDetails;
+
+        if (this.currentPage === 'group-detail') {
+            this.updateGroupPeerSummary();
+            if (this.membersList && typeof this.membersList.updateOnlineStatuses === 'function') {
+                this.membersList.setOnlineStatusResolver((pubkey) => this.isMemberOnline(pubkey));
+                this.membersList.updateOnlineStatuses();
+            }
+        }
+
+        this.updateVisibleGroupPeerSummaries();
+    };
+
+    App.getRelayPeerEntry = function(identifier = null) {
+        const id = identifier || this.currentHypertunaId;
+        if (!id) return null;
+        return this.gatewayPeerRelayMap.get(id) || null;
+    };
+
+    App.getRelayPeerCount = function(identifier = null) {
+        const entry = this.getRelayPeerEntry(identifier);
+        if (!entry) return 0;
+        if (typeof entry.peerCount === 'number') return entry.peerCount;
+        if (entry.peers instanceof Set) return entry.peers.size;
+        if (Array.isArray(entry.peers)) return entry.peers.length;
+        return 0;
+    };
+
+    App.getRelayPeerSet = function(identifier = null) {
+        const entry = this.getRelayPeerEntry(identifier);
+        if (!entry) return new Set();
+        if (entry.peers instanceof Set) return entry.peers;
+        if (Array.isArray(entry.peers)) return new Set(entry.peers);
+        return new Set();
+    };
+
+    App.isMemberOnline = function(pubkey, relayIdentifier = null) {
+        if (!pubkey) return false;
+        const normalized = pubkey.toLowerCase();
+        const peers = this.getRelayPeerSet(relayIdentifier);
+        for (const peerKey of peers) {
+            const detail = this.gatewayPeerDetails.get(peerKey);
+            if (!detail?.nostrPubkeyHex) continue;
+            if (detail.nostrPubkeyHex.toLowerCase() === normalized) {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    App.updateGroupPeerSummary = function(identifier = null) {
+        const peerCountEl = document.getElementById('group-header-peer-count');
+        if (!peerCountEl) return;
+        const targetId = identifier || this.currentHypertunaId;
+        if (!targetId) {
+            peerCountEl.textContent = 'Peers unavailable';
+            return;
+        }
+        const count = this.getRelayPeerCount(targetId);
+        peerCountEl.textContent = count === 1 ? '1 peer online' : `${count} peers online`;
+    };
+
+    App.updateVisibleGroupPeerSummaries = function() {
+        const updateContainer = (container) => {
+            if (!container) return;
+            const items = container.querySelectorAll('[data-role="peer-count"]');
+            items.forEach((element) => {
+                const host = element.closest('[data-hypertuna-id]');
+                const identifier = host?.dataset.hypertunaId || null;
+                if (!identifier) {
+                    element.textContent = 'Peers unavailable';
+                    return;
+                }
+                const count = this.getRelayPeerCount(identifier);
+                element.textContent = count === 1 ? '1 peer online' : `${count} peers online`;
+            });
+        };
+
+        updateContainer(document.getElementById('groups-list'));
+        updateContainer(document.getElementById('discover-list'));
     };
 
     const uint8ArrayToBase64 = (bytes) => {
@@ -1182,24 +1330,23 @@ App.syncHypertunaConfigToFile = async function() {
                 // Use hypertunaId as an additional identifier
                 const hypertunaId = group.hypertunaId || '';
                 
-                // Get the actual connection URL from the relay manager
-                let connectionUrl = 'Not connected';
-                const relayUrl = this.nostr.client.groupRelayUrls.get(group.id);
-                if (relayUrl) {
-                    connectionUrl = relayUrl;
-                }
-                
+                const peerCount = hypertunaId ? this.getRelayPeerCount(hypertunaId) : 0;
+                const peerLabel = hypertunaId
+                    ? (peerCount === 1 ? '1 peer online' : `${peerCount} peers online`)
+                    : 'Peers unavailable';
+
                 groupElement.innerHTML = `
                     <div class="group-avatar">${avatarMarkup}</div>
                     <div class="group-info">
                         <div class="group-name">${group.name || 'Unnamed Relay'}</div>
                         <div class="group-description">${group.about || 'No description available'}</div>
                     </div>
-                    <div class="group-meta-badges">
-                        <span class="meta-badge">${group.isPublic ? 'Public' : 'Private'}</span>
-                        <span class="meta-badge">${group.isOpen ? 'Open' : 'Closed'}</span>
-                    </div>
+                    <div class="group-peer-summary" data-role="peer-count">${peerLabel}</div>
                 `;
+
+                if (hypertunaId) {
+                    groupElement.dataset.hypertunaId = hypertunaId;
+                }
                 
                 groupElement.addEventListener('click', (e) => {
                     e.preventDefault();
@@ -1248,24 +1395,26 @@ App.syncHypertunaConfigToFile = async function() {
             
             this.currentGroup = group;
             this.currentHypertunaId = group.hypertunaId;
-            
+
             // Rest of the method remains the same...
             // Update group header with null checks
             const groupNameElement = document.getElementById('group-detail-name');
             if (groupNameElement) {
                 groupNameElement.textContent = group.name || 'Unnamed Relay';
             }
-            
+
             const groupVisibilityElement = document.getElementById('group-detail-visibility');
             if (groupVisibilityElement) {
                 groupVisibilityElement.textContent = group.isPublic ? 'Public' : 'Private';
             }
-            
+
             const groupJoinTypeElement = document.getElementById('group-detail-join-type');
             if (groupJoinTypeElement) {
                 groupJoinTypeElement.textContent = group.isOpen ? 'Open' : 'Closed';
             }
-            
+
+            this.updateGroupPeerSummary(group.hypertunaId);
+
             const groupDescriptionElement = document.getElementById('group-detail-description');
             if (groupDescriptionElement) {
                 groupDescriptionElement.textContent = group.about || 'No description available.';
@@ -1569,16 +1718,21 @@ App.syncHypertunaConfigToFile = async function() {
         }
         
         // Create or update the MembersList instance
+        const onlineResolver = (pubkey) => this.isMemberOnline(pubkey, this.currentHypertunaId);
+
         if (!this.membersList) {
-            this.membersList = new MembersList(container, this.nostr.client, this.currentUser.pubkey);
+            this.membersList = new MembersList(container, this.nostr.client, this.currentUser.pubkey, {
+                onlineStatusResolver: onlineResolver
+            });
         } else {
             // Clear rendered members tracking when updating
             this.membersList.clearRenderedMembers();
             this.membersList.container = container;
             this.membersList.client = this.nostr.client;
             this.membersList.setUserPubkey(this.currentUser.pubkey);
+            this.membersList.setOnlineStatusResolver(onlineResolver);
         }
-        
+
         try {
             // Get members and admins
             const members = this.nostr.getGroupMembers(this.currentGroupId);
@@ -1594,6 +1748,7 @@ App.syncHypertunaConfigToFile = async function() {
             
             // Render the members list
             await this.membersList.render(members, admins);
+            this.membersList.updateOnlineStatuses();
             
             // Create new event handlers with proper cleanup
             const promoteHandler = (e) => {
@@ -1637,14 +1792,20 @@ App.syncHypertunaConfigToFile = async function() {
         if (!this.currentUser || !this.currentGroupId) return;
         const admins = this.nostr.getGroupAdmins(this.currentGroupId);
         const container = document.getElementById("member-list");
+        const onlineResolver = (pubkey) => this.isMemberOnline(pubkey, this.currentHypertunaId);
+
         if (!this.membersList) {
-            this.membersList = new MembersList(container, this.nostr.client, this.currentUser.pubkey);
+            this.membersList = new MembersList(container, this.nostr.client, this.currentUser.pubkey, {
+                onlineStatusResolver: onlineResolver
+            });
         } else {
             this.membersList.container = container;
             this.membersList.client = this.nostr.client;
             this.membersList.setUserPubkey(this.currentUser.pubkey);
+            this.membersList.setOnlineStatusResolver(onlineResolver);
         }
         await this.membersList.render(members, admins);
+        this.membersList.updateOnlineStatuses();
         container.addEventListener('promote', (e) => {
             this.updateMemberRole(e.detail.pubkey, ['admin']);
         });
@@ -2635,16 +2796,19 @@ App.displayDiscoverRelays = function(discoveredRelays) {
             `;
         }).join('');
         
+        const hypertunaId = group.hypertunaId || null;
+        const peerCount = hypertunaId ? this.getRelayPeerCount(hypertunaId) : 0;
+        const peerLabel = hypertunaId
+            ? (peerCount === 1 ? '1 peer online' : `${peerCount} peers online`)
+            : 'Peers unavailable';
+
         groupElement.innerHTML = `
             <div class="group-avatar">${avatarMarkup}</div>
             <div class="group-info">
                 <div class="group-name">${group.name || 'Unnamed Relay'}</div>
                 <div class="group-description">${group.about || 'No description available'}</div>
             </div>
-            <div class="group-meta-badges">
-                <span class="meta-badge">${group.isPublic ? 'Public' : 'Private'}</span>
-                <span class="meta-badge">${group.isOpen ? 'Open' : 'Closed'}</span>
-            </div>
+            <div class="group-peer-summary" data-role="peer-count">${peerLabel}</div>
             <div class="followers-info">
                 <div class="followers-avatars">
                     ${avatarsHtml}
@@ -2655,6 +2819,10 @@ App.displayDiscoverRelays = function(discoveredRelays) {
                 </div>
             </div>
         `;
+
+        if (hypertunaId) {
+            groupElement.dataset.hypertunaId = hypertunaId;
+        }
         
         groupElement.addEventListener('click', (e) => {
             e.preventDefault();

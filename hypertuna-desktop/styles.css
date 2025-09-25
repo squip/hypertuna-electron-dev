@@ -536,19 +536,13 @@ body {
     white-space: nowrap;
 }
 
-.group-meta-badges {
-    display: flex;
-    gap: var(--space-xs);
+.group-peer-summary {
     margin-left: auto;
-    flex-shrink: 0;
-}
-
-.meta-badge {
-    font-size: 0.75rem;
-    padding: 0.125rem var(--space-sm);
-    background-color: var(--surface-hover);
+    padding-left: var(--space-md);
+    font-size: 0.875rem;
     color: var(--text-secondary);
-    border-radius: var(--radius-full);
+    white-space: nowrap;
+    flex-shrink: 0;
 }
 
 /* Group Detail Page */
@@ -572,6 +566,19 @@ body {
     min-width: 0;
 }
 
+.group-header-actions {
+    display: flex;
+    align-items: center;
+    gap: var(--space-sm);
+    margin-left: auto;
+}
+
+.group-peer-count {
+    font-size: 0.875rem;
+    color: var(--text-secondary);
+    white-space: nowrap;
+}
+
 .group-header-info h2 {
     font-size: 1.25rem;
     font-weight: 600;
@@ -584,6 +591,15 @@ body {
     display: flex;
     gap: var(--space-xs);
     margin-top: var(--space-xs);
+}
+
+.meta-badge {
+    font-size: 0.75rem;
+    padding: 0.125rem var(--space-sm);
+    background-color: var(--surface-hover);
+    color: var(--text-secondary);
+    border-radius: var(--radius-full);
+    white-space: nowrap;
 }
 
 /* Tab Navigation */
@@ -876,11 +892,22 @@ members-list,.member-list {
 }
 
 .member-name {
+    display: flex;
+    align-items: center;
+    gap: var(--space-xs);
     font-weight: 500;
     margin-bottom: 0.125rem;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+}
+
+.member-status-dot {
+    width: 0.5rem;
+    height: 0.5rem;
+    border-radius: 50%;
+    background: var(--success-color);
+    flex-shrink: 0;
 }
 
 .member-pubkey {
@@ -1801,7 +1828,7 @@ members-list,.member-list {
     display: flex;
     align-items: center;
     gap: var(--space-sm);
-    margin-left: auto;
+    margin-left: var(--space-md);
     flex-shrink: 0;
 }
 

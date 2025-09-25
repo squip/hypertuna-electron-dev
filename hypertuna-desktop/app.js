@@ -29,6 +29,8 @@ let gatewayLogs = [];
 let gatewayLogVisible = false;
 let gatewayOptionsState = { detectLanAddresses: false, detectPublicIp: false };
 let gatewayUptimeTimer = null;
+let gatewayPeerRelayMap = new Map();
+let gatewayPeerDetails = new Map();
 const DEFAULT_API_URL = 'http://localhost:1945';
 
 // Store worker messages that may arrive before AppIntegration sets up handlers
@@ -218,6 +220,59 @@ function updateGatewayUI(status) {
   }
 }
 
+function updateGatewayPeerState(status = {}) {
+  const relayEntries =
+    status && typeof status.peerRelayMap === 'object'
+      ? Object.entries(status.peerRelayMap)
+      : [];
+  const detailEntries =
+    status && typeof status.peerDetails === 'object'
+      ? Object.entries(status.peerDetails)
+      : [];
+
+  const nextRelayMap = new Map();
+  for (const [identifier, info] of relayEntries) {
+    const peersArray = Array.isArray(info?.peers) ? info.peers : [];
+    nextRelayMap.set(identifier, {
+      peers: new Set(peersArray),
+      peerCount:
+        typeof info?.peerCount === 'number' ? info.peerCount : peersArray.length,
+      status: info?.status || 'unknown',
+      lastActive: info?.lastActive || null,
+      createdAt: info?.createdAt || null
+    });
+  }
+
+  const nextDetailMap = new Map();
+  for (const [peerKey, info] of detailEntries) {
+    const relays = Array.isArray(info?.relays) ? info.relays : [];
+    nextDetailMap.set(peerKey, {
+      nostrPubkeyHex: info?.nostrPubkeyHex || null,
+      relays,
+      relayCount:
+        typeof info?.relayCount === 'number' ? info.relayCount : relays.length,
+      lastSeen: info?.lastSeen || null,
+      status: info?.status || 'unknown',
+      mode: info?.mode || null,
+      address: info?.address || null
+    });
+  }
+
+  gatewayPeerRelayMap = nextRelayMap;
+  gatewayPeerDetails = nextDetailMap;
+
+  window.gatewayPeerRelayMap = gatewayPeerRelayMap;
+  window.gatewayPeerDetails = gatewayPeerDetails;
+
+  if (window.App && typeof window.App.updateGatewayPeers === 'function') {
+    window.App.updateGatewayPeers({
+      relayMap: gatewayPeerRelayMap,
+      peerDetails: gatewayPeerDetails,
+      status
+    });
+  }
+}
+
 function renderGatewayLogs() {
   if (!gatewayLogsContainer) return
   gatewayLogsContainer.innerHTML = ''
@@ -245,7 +300,9 @@ async function refreshGatewayStatus({ fetchOptions = true } = {}) {
     const optionsResult = results[2]
 
     if (statusResult && 'status' in statusResult) {
-      updateGatewayUI(statusResult.status || { running: false })
+      const statusPayload = statusResult.status || { running: false }
+      updateGatewayUI(statusPayload)
+      updateGatewayPeerState(statusPayload)
     }
 
     if (Array.isArray(logsResult?.logs)) {
@@ -858,6 +915,7 @@ async function handleWorkerMessage(message) {
     case 'gateway-status':
       if (message.status) {
         updateGatewayUI(message.status)
+        updateGatewayPeerState(message.status)
       }
       break
 
@@ -874,12 +932,20 @@ async function handleWorkerMessage(message) {
 
     case 'gateway-started':
       addLog('Local gateway started', 'status')
-      if (message.status) updateGatewayUI(message.status)
+      if (message.status) {
+        updateGatewayUI(message.status)
+        updateGatewayPeerState(message.status)
+      }
       break
 
     case 'gateway-stopped':
       addLog('Local gateway stopped', 'status')
-      if (message.status) updateGatewayUI(message.status)
+      if (message.status) {
+        updateGatewayUI(message.status)
+        updateGatewayPeerState(message.status)
+      } else {
+        updateGatewayPeerState({})
+      }
       break
 
     case 'gateway-error':

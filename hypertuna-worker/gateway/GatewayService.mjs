@@ -447,6 +447,31 @@ export class GatewayService extends EventEmitter {
   }
 
   getStatus() {
+    const peerRelayMap = {};
+    for (const [identifier, relay] of this.activeRelays.entries()) {
+      peerRelayMap[identifier] = {
+        peers: Array.from(relay.peers || []),
+        peerCount: relay.peers ? relay.peers.size : 0,
+        status: relay.status || 'unknown',
+        lastActive: relay.lastActive || null,
+        createdAt: relay.createdAt || null
+      };
+    }
+
+    const peerDetails = {};
+    for (const peer of this.activePeers) {
+      const relays = peer.relays ? Array.from(peer.relays) : [];
+      peerDetails[peer.publicKey] = {
+        nostrPubkeyHex: peer.nostrPubkeyHex || null,
+        relays,
+        relayCount: relays.length,
+        lastSeen: peer.lastSeen || null,
+        status: peer.status || 'unknown',
+        mode: peer.mode || null,
+        address: peer.address || null
+      };
+    }
+
     return {
       running: this.isRunning,
       port: this.config?.port || DEFAULT_PORT,
@@ -455,7 +480,9 @@ export class GatewayService extends EventEmitter {
       urls: this.config?.urls || this.gatewayServer?.getServerUrls() || null,
       health: this.healthState,
       peers: this.activePeers.length,
-      relays: this.activeRelays.size
+      relays: this.activeRelays.size,
+      peerRelayMap,
+      peerDetails
     };
   }
 
