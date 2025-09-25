@@ -454,7 +454,8 @@ export class GatewayService extends EventEmitter {
         peerCount: relay.peers ? relay.peers.size : 0,
         status: relay.status || 'unknown',
         lastActive: relay.lastActive || null,
-        createdAt: relay.createdAt || null
+        createdAt: relay.createdAt || null,
+        metadata: relay.metadata || null
       };
     }
 
@@ -733,18 +734,60 @@ export class GatewayService extends EventEmitter {
         const identifier = typeof entry === 'string' ? entry : entry?.identifier;
         if (!identifier) return;
 
+        const relayObj = (entry && typeof entry === 'object') ? entry : { identifier };
+
         peer.relays.add(identifier);
         if (!this.activeRelays.has(identifier)) {
           this.activeRelays.set(identifier, {
             peers: new Set(),
             status: 'active',
             createdAt: Date.now(),
-            lastActive: Date.now()
+            lastActive: Date.now(),
+            metadata: null
           });
         }
+
         const relayData = this.activeRelays.get(identifier);
         relayData.peers.add(publicKey);
         relayData.lastActive = Date.now();
+
+        const prevMetadata = relayData.metadata || {};
+        const nextMetadata = { ...prevMetadata };
+
+        if (relayObj.name && relayObj.name !== prevMetadata.name) {
+          nextMetadata.name = relayObj.name;
+        }
+        if (relayObj.description !== undefined && relayObj.description !== prevMetadata.description) {
+          nextMetadata.description = relayObj.description;
+        }
+        if (relayObj.avatarUrl !== undefined) {
+          nextMetadata.avatarUrl = relayObj.avatarUrl || null;
+        }
+        if (relayObj.connectionUrl) {
+          nextMetadata.connectionUrl = relayObj.connectionUrl;
+        }
+        if (relayObj.metadataEventId) {
+          nextMetadata.metadataEventId = relayObj.metadataEventId;
+        }
+        if (!nextMetadata.identifier) {
+          nextMetadata.identifier = identifier;
+        }
+
+        if (typeof relayObj.isPublic === 'boolean') {
+          nextMetadata.isPublic = relayObj.isPublic;
+        } else if (nextMetadata.isPublic === undefined) {
+          nextMetadata.isPublic = true;
+        }
+
+        const incomingTimestamp = this._coerceTimestamp(relayObj.metadataUpdatedAt);
+        const existingTimestamp = this._coerceTimestamp(prevMetadata.metadataUpdatedAt);
+        if (incomingTimestamp !== null) {
+          if (existingTimestamp === null || incomingTimestamp >= existingTimestamp) {
+            nextMetadata.metadataUpdatedAt = incomingTimestamp;
+          }
+        }
+
+        relayData.metadata = nextMetadata;
       });
     }
 
@@ -777,6 +820,15 @@ export class GatewayService extends EventEmitter {
       relayCount: peer.relays.size,
       relays: Array.from(peer.relays)
     };
+  }
+
+  _coerceTimestamp(value) {
+    if (value === null || value === undefined) return null;
+    if (typeof value === 'number') {
+      return Number.isFinite(value) ? value : null;
+    }
+    const parsed = Date.parse(value);
+    return Number.isFinite(parsed) ? parsed : null;
   }
 
   async _handleGatewayRegisterRequest(publicKey, request) {

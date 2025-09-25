@@ -35,6 +35,68 @@ const relayMemberRemoves = new Map();
 const publicToKey = new Map();
 const keyToPublic = new Map();
 
+function parseRelayMetadataEvent(event) {
+    if (!event) return null;
+
+    const tags = Array.isArray(event.tags) ? event.tags : [];
+    const findTagValue = (key) => {
+        const tag = tags.find((t) => t[0] === key && t.length > 1);
+        return tag ? tag[1] : null;
+    };
+
+    const metadata = {
+        name: findTagValue('name'),
+        description: findTagValue('about'),
+        avatarUrl: null,
+        isPublic: null,
+        createdAt: event.created_at || null,
+        updatedAt: event.created_at ? event.created_at * 1000 : null,
+        identifier: findTagValue('d') || null,
+        eventId: event.id || null
+    };
+
+    const pictureTag = tags.find((t) => t[0] === 'picture' && t.length > 1 && typeof t[1] === 'string');
+    if (pictureTag) {
+        metadata.avatarUrl = pictureTag[1];
+    }
+
+    if (tags.some((t) => t[0] === 'public')) {
+        metadata.isPublic = true;
+    } else if (tags.some((t) => t[0] === 'private')) {
+        metadata.isPublic = false;
+    }
+
+    return metadata;
+}
+
+export async function getRelayMetadata(relayKey, publicIdentifier = null) {
+    const manager = activeRelays.get(relayKey);
+    if (!manager) return null;
+
+    try {
+        const filter = { kinds: [39000], limit: 50 };
+        if (publicIdentifier) {
+            filter['#d'] = [publicIdentifier];
+        }
+
+        const events = await manager.queryEvents(filter);
+        if (!Array.isArray(events) || events.length === 0) {
+            return null;
+        }
+
+        events.sort((a, b) => (b?.created_at || 0) - (a?.created_at || 0));
+        const latest = events[0];
+        const parsed = parseRelayMetadataEvent(latest);
+        if (parsed && !parsed.identifier && publicIdentifier) {
+            parsed.identifier = publicIdentifier;
+        }
+        return parsed;
+    } catch (error) {
+        console.error(`[RelayAdapter] Failed to load metadata for relay ${relayKey}:`, error);
+        return null;
+    }
+}
+
 function getGatewayWebsocketProtocol(config) {
     return config?.proxy_websocket_protocol === 'ws' ? 'ws' : 'wss';
 }

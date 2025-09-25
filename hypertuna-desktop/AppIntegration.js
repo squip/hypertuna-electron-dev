@@ -77,24 +77,42 @@ function integrateNostrRelays(App) {
                 const peers = info?.peers instanceof Set
                     ? new Set(info.peers)
                     : new Set(Array.isArray(info?.peers) ? info.peers : []);
+                const metadata = info?.metadata && typeof info.metadata === 'object'
+                    ? { ...info.metadata }
+                    : null;
+                if (metadata && metadata.metadataUpdatedAt != null) {
+                    const ts = Number(metadata.metadataUpdatedAt);
+                    if (Number.isFinite(ts)) metadata.metadataUpdatedAt = ts;
+                }
+
                 nextRelayMap.set(identifier, {
                     peers,
                     peerCount: typeof info?.peerCount === 'number' ? info.peerCount : peers.size,
                     status: info?.status || 'unknown',
                     lastActive: info?.lastActive || null,
-                    createdAt: info?.createdAt || null
+                    createdAt: info?.createdAt || null,
+                    metadata
                 });
             }
         } else if (relayMap && typeof relayMap === 'object') {
             for (const [identifier, info] of Object.entries(relayMap)) {
                 if (!identifier) continue;
                 const peers = Array.isArray(info?.peers) ? new Set(info.peers) : new Set();
+                const metadata = info?.metadata && typeof info.metadata === 'object'
+                    ? { ...info.metadata }
+                    : null;
+                if (metadata && metadata.metadataUpdatedAt != null) {
+                    const ts = Number(metadata.metadataUpdatedAt);
+                    if (Number.isFinite(ts)) metadata.metadataUpdatedAt = ts;
+                }
+
                 nextRelayMap.set(identifier, {
                     peers,
                     peerCount: typeof info?.peerCount === 'number' ? info.peerCount : peers.size,
                     status: info?.status || 'unknown',
                     lastActive: info?.lastActive || null,
-                    createdAt: info?.createdAt || null
+                    createdAt: info?.createdAt || null,
+                    metadata
                 });
             }
         }
@@ -133,6 +151,9 @@ function integrateNostrRelays(App) {
         this.gatewayPeerRelayMap = nextRelayMap;
         this.gatewayPeerDetails = nextPeerDetails;
 
+        this.discoverRelaysCache = null;
+        this.discoverRelaysCacheTime = 0;
+
         if (this.currentPage === 'group-detail') {
             this.updateGroupPeerSummary();
             if (this.membersList && typeof this.membersList.updateOnlineStatuses === 'function') {
@@ -142,6 +163,10 @@ function integrateNostrRelays(App) {
         }
 
         this.updateVisibleGroupPeerSummaries();
+
+        if (this.currentListView === 'discover' && typeof this.loadDiscoverRelays === 'function') {
+            this.loadDiscoverRelays(true).catch((err) => console.error('Failed to refresh discover relays:', err));
+        }
     };
 
     App.getRelayPeerEntry = function(identifier = null) {
@@ -2681,39 +2706,118 @@ App.setupKeyFormatToggles = function() {
 /**
  * Load discover relays
  */
-App.loadDiscoverRelays = async function() {
-    if (!this.currentUser || !this.nostr) return;
-    
+App.loadDiscoverRelays = async function(force = false) {
     const discoverList = document.getElementById('discover-list');
-    
-    // Check cache
+    if (!discoverList) return;
+
+    if (!this.currentUser || !this.nostr?.client) {
+        discoverList.innerHTML = `
+            <div class="empty-state">
+                <p>Sign in to browse relays from your network.</p>
+            </div>
+        `;
+        return;
+    }
+
+    if (!(this.gatewayPeerRelayMap instanceof Map) || this.gatewayPeerRelayMap.size === 0) {
+        discoverList.innerHTML = `
+            <div class="empty-state">
+                <p>No active relays available from the gateway.</p>
+                <p>Ensure your gateway is online and peers are registered.</p>
+            </div>
+        `;
+        return;
+    }
+
     const now = Date.now();
-    if (this.discoverRelaysCache && (now - this.discoverRelaysCacheTime) < this.DISCOVER_CACHE_DURATION) {
+    if (!force && this.discoverRelaysCache && (now - this.discoverRelaysCacheTime) < this.DISCOVER_CACHE_DURATION) {
         this.displayDiscoverRelays(this.discoverRelaysCache);
         return;
     }
-    
-    // Show loading state
+
     discoverList.innerHTML = `
         <div class="discover-loading">
             <div class="loading"></div>
-            <div class="discover-loading-text">Discovering relays from your network...</div>
+            <div class="discover-loading-text">Loading recommended relays…</div>
         </div>
     `;
-    
+
     try {
-        // Discover relays from follows
-        const discoveredRelays = await this.nostr.client.discoverRelaysFromFollows();
-        
-        // Cache the results
-        this.discoverRelaysCache = discoveredRelays;
+        const followRelayMap = await this.nostr.client.discoverRelaysFromFollows();
+        const userRelayIds = this.nostr.client.userRelayIds || new Set();
+        const entries = [];
+
+        for (const [identifier, relayInfo] of this.gatewayPeerRelayMap.entries()) {
+            if (!identifier || !relayInfo) continue;
+
+            const metadata = relayInfo.metadata && typeof relayInfo.metadata === 'object'
+                ? relayInfo.metadata
+                : {};
+            const followerInfo = followRelayMap.get(identifier);
+            const followerCount = followerInfo?.followerCount || 0;
+
+            const isPublic = typeof metadata.isPublic === 'boolean'
+                ? metadata.isPublic
+                : (typeof followerInfo?.group?.isPublic === 'boolean'
+                    ? followerInfo.group.isPublic
+                    : true);
+
+            if (!isPublic && followerCount === 0) {
+                continue;
+            }
+
+            if (userRelayIds instanceof Set && userRelayIds.has(identifier)) {
+                continue;
+            }
+
+            if (typeof this.nostr.isGroupMember === 'function' && this.nostr.isGroupMember(identifier, this.currentUser.pubkey)) {
+                continue;
+            }
+
+            const name = metadata.name || followerInfo?.group?.name || 'Unnamed Relay';
+            const description = metadata.description || followerInfo?.group?.about || 'No description available';
+
+            const peerCount = typeof relayInfo.peerCount === 'number'
+                ? relayInfo.peerCount
+                : relayInfo.peers instanceof Set
+                    ? relayInfo.peers.size
+                    : Array.isArray(relayInfo.peers)
+                        ? relayInfo.peers.length
+                        : 0;
+
+            const groupData = followerInfo?.group || null;
+            const hypertunaId = groupData?.hypertunaId || identifier;
+            const avatarUrl = metadata.avatarUrl || (groupData ? this.resolveGroupAvatar(groupData) : null);
+
+            entries.push({
+                identifier,
+                hypertunaId,
+                name,
+                description,
+                avatarUrl,
+                isPublic,
+                peerCount,
+                followerCount,
+                followers: followerInfo?.followers || [],
+                group: groupData,
+                connectionUrl: metadata.connectionUrl || null,
+                metadataUpdatedAt: metadata.metadataUpdatedAt || metadata.updatedAt || null,
+                metadataEventId: metadata.metadataEventId || null
+            });
+        }
+
+        entries.sort((a, b) => {
+            if (b.followerCount !== a.followerCount) return b.followerCount - a.followerCount;
+            if (b.peerCount !== a.peerCount) return b.peerCount - a.peerCount;
+            return a.name.localeCompare(b.name);
+        });
+
+        this.discoverRelaysCache = entries;
         this.discoverRelaysCacheTime = now;
-        
-        // Display the results
-        this.displayDiscoverRelays(discoveredRelays);
-        
-    } catch (e) {
-        console.error('Error discovering relays:', e);
+
+        this.displayDiscoverRelays(entries);
+    } catch (error) {
+        console.error('Error discovering relays:', error);
         discoverList.innerHTML = `
             <div class="empty-state">
                 <p>Error discovering relays</p>
@@ -2726,10 +2830,27 @@ App.loadDiscoverRelays = async function() {
 /**
  * Display discovered relays
  */
-App.displayDiscoverRelays = function(discoveredRelays) {
+App.displayDiscoverRelays = function(relays) {
     const discoverList = document.getElementById('discover-list');
-    
-    if (discoveredRelays.size === 0) {
+    if (!discoverList) return;
+
+    let entries = relays;
+    if (entries instanceof Map) {
+        entries = Array.from(entries.entries()).map(([identifier, relayData]) => ({
+            identifier,
+            hypertunaId: relayData.group?.hypertunaId || identifier,
+            name: relayData.group?.name || 'Unnamed Relay',
+            description: relayData.group?.about || 'No description available',
+            avatarUrl: this.resolveGroupAvatar(relayData.group),
+            followers: relayData.followers || [],
+            followerCount: relayData.followerCount || 0,
+            peerCount: this.getRelayPeerCount(relayData.group?.hypertunaId || identifier),
+            isPublic: typeof relayData.group?.isPublic === 'boolean' ? relayData.group.isPublic : true,
+            group: relayData.group || null
+        }));
+    }
+
+    if (!Array.isArray(entries) || entries.length === 0) {
         discoverList.innerHTML = `
             <div class="empty-state">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -2737,53 +2858,65 @@ App.displayDiscoverRelays = function(discoveredRelays) {
                     <polyline points="3.27 6.96 12 12.01 20.73 6.96"></polyline>
                     <line x1="12" y1="22.08" x2="12" y2="12"></line>
                 </svg>
-                <p>No relays found in your network</p>
-                <p>Follow more people to discover relays!</p>
+                <p>No relays match the current criteria.</p>
+                <p>Follow more people or wait for peers to come online.</p>
             </div>
         `;
         return;
     }
-    
-    // Sort by follower count
-    const sortedRelays = Array.from(discoveredRelays.entries())
-        .sort((a, b) => b[1].followerCount - a[1].followerCount);
-    
+
     discoverList.innerHTML = '';
-    
-    sortedRelays.forEach(([groupId, relayData]) => {
-        const { group, followers } = relayData;
-        
-        // Skip if user is already a member
-        if (this.nostr.isGroupMember(groupId, this.currentUser.pubkey)) {
-            return;
+
+    entries.forEach((entry) => {
+        const {
+            identifier,
+            hypertunaId,
+            name,
+            description,
+            avatarUrl,
+            followers = [],
+            followerCount = 0,
+            peerCount = 0,
+            isPublic = true,
+            group = null
+        } = entry;
+
+        if (this.nostr && typeof this.nostr.isGroupMember === 'function' && this.currentUser) {
+            if (this.nostr.isGroupMember(identifier, this.currentUser.pubkey)) {
+                return;
+            }
         }
-        
+
         const groupElement = document.createElement('a');
         groupElement.href = '#';
         groupElement.className = 'group-item group-item-with-followers';
-        
-        const firstLetter = group.name ? group.name.charAt(0).toUpperCase() : 'R';
-        const avatarUrl = this.resolveGroupAvatar(group);
-        const avatarMarkup = avatarUrl
-            ? `<img src="${avatarUrl}" alt="${group.name || 'Relay'}">`
-            : firstLetter;
-        
-        // Create followers avatars HTML
+
+        const displayName = name || 'Unnamed Relay';
+        const fallbackLetter = displayName.charAt(0).toUpperCase();
+        const resolvedAvatar = avatarUrl || (group ? this.resolveGroupAvatar(group) : null);
+        const avatarMarkup = resolvedAvatar
+            ? `<img src="${resolvedAvatar}" alt="${displayName}">`
+            : fallbackLetter;
+
         const maxAvatars = 3;
         const displayedFollowers = followers.slice(0, maxAvatars);
-        const additionalCount = followers.length - maxAvatars;
-        
-        const avatarsHtml = displayedFollowers.map(follower => {
-            const initial = follower.profile.name ? follower.profile.name.charAt(0).toUpperCase() : '?';
-            const followerAvatar = follower.profile.picture
-                ? HypertunaUtils.resolvePfpUrl(follower.profile.pictureTagUrl || follower.profile.picture, follower.profile.pictureIsHypertunaPfp)
+        const additionalCount = Math.max(0, followers.length - displayedFollowers.length);
+
+        const avatarsHtml = displayedFollowers.map((follower) => {
+            const followerName = follower.profile?.name || '';
+            const initial = followerName ? followerName.charAt(0).toUpperCase() : '?';
+            const followerAvatar = follower.profile?.picture
+                ? HypertunaUtils.resolvePfpUrl(
+                    follower.profile.pictureTagUrl || follower.profile.picture,
+                    follower.profile.pictureIsHypertunaPfp
+                )
                 : null;
 
             if (followerAvatar) {
                 return `
                     <div class="follower-avatar">
-                        <img src="${followerAvatar}" alt="${follower.profile.name || initial}">
-                        <div class="follower-tooltip">${follower.profile.name}</div>
+                        <img src="${followerAvatar}" alt="${followerName || initial}">
+                        <div class="follower-tooltip">${followerName || 'Unknown user'}</div>
                     </div>
                 `;
             }
@@ -2791,22 +2924,22 @@ App.displayDiscoverRelays = function(discoveredRelays) {
             return `
                 <div class="follower-avatar">
                     <span>${initial}</span>
-                    <div class="follower-tooltip">${follower.profile.name}</div>
+                    <div class="follower-tooltip">${followerName || 'Unknown user'}</div>
                 </div>
             `;
         }).join('');
-        
-        const hypertunaId = group.hypertunaId || null;
-        const peerCount = hypertunaId ? this.getRelayPeerCount(hypertunaId) : 0;
-        const peerLabel = hypertunaId
-            ? (peerCount === 1 ? '1 peer online' : `${peerCount} peers online`)
-            : 'Peers unavailable';
+
+        const latestPeerCount = this.getRelayPeerCount(hypertunaId) || peerCount || 0;
+        const peerLabel = latestPeerCount === 1 ? '1 peer online' : `${latestPeerCount} peers online`;
+
+        const visibilityLabel = isPublic ? 'Public Relay' : 'Private Relay';
 
         groupElement.innerHTML = `
             <div class="group-avatar">${avatarMarkup}</div>
             <div class="group-info">
-                <div class="group-name">${group.name || 'Unnamed Relay'}</div>
-                <div class="group-description">${group.about || 'No description available'}</div>
+                <div class="group-name">${displayName}</div>
+                <div class="group-description">${description || 'No description available'}</div>
+                <div class="group-visibility muted">${visibilityLabel}</div>
             </div>
             <div class="group-peer-summary" data-role="peer-count">${peerLabel}</div>
             <div class="followers-info">
@@ -2814,7 +2947,7 @@ App.displayDiscoverRelays = function(discoveredRelays) {
                     ${avatarsHtml}
                 </div>
                 <div class="followers-count">
-                    ${followers.length} ${followers.length === 1 ? 'follow' : 'follows'}
+                    ${followerCount} ${followerCount === 1 ? 'follow' : 'follows'}
                     ${additionalCount > 0 ? `+${additionalCount}` : ''}
                 </div>
             </div>
@@ -2823,25 +2956,19 @@ App.displayDiscoverRelays = function(discoveredRelays) {
         if (hypertunaId) {
             groupElement.dataset.hypertunaId = hypertunaId;
         }
-        
+
         groupElement.addEventListener('click', (e) => {
             e.preventDefault();
-            this.currentGroupId = groupId;
-            this.currentHypertunaId = group.hypertunaId;
+            this.currentGroupId = identifier;
+            this.currentHypertunaId = hypertunaId;
             this.navigateTo('group-detail');
         });
-        
+
         discoverList.appendChild(groupElement);
     });
-    
-    // Add info message if all discovered relays are already joined
-    if (discoverList.children.length === 0) {
-        discoverList.innerHTML = `
-            <div class="empty-state">
-                <p>You've already joined all relays in your network!</p>
-                <p>Follow more people to discover new relays.</p>
-            </div>
-        `;
+
+    if (typeof this.updateVisibleGroupPeerSummaries === 'function') {
+        this.updateVisibleGroupPeerSummaries();
     }
 };
 

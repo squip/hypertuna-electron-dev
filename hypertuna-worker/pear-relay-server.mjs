@@ -27,7 +27,8 @@ import {
   getActiveRelays,
   cleanupRelays,
   updateRelaySubscriptions,
-  getRelayMembers
+  getRelayMembers,
+  getRelayMetadata
 } from './hypertuna-relay-manager-adapter.mjs';
 
 import {
@@ -1806,18 +1807,97 @@ async function registerWithGateway(relayProfileInfo = null, options = {}) {
     const activeRelays = await getActiveRelays();
     const profiles = await getRelayProfiles();
 
-    const relayList = [];
+    const profilesByRelayKey = new Map();
+    const profilesByIdentifier = new Map();
+    for (const profile of profiles) {
+      profilesByRelayKey.set(profile.relay_key, profile);
+      if (profile.public_identifier) {
+        profilesByIdentifier.set(profile.public_identifier, profile);
+      }
+    }
+
+    const toTimestamp = (value) => {
+      if (!value) return null;
+      if (typeof value === 'number' && Number.isFinite(value)) return value;
+      const parsed = Date.parse(value);
+      return Number.isFinite(parsed) ? parsed : null;
+    };
+
+    const resolveProfileAvatar = (profile) => {
+      if (!profile) return null;
+      const candidates = [
+        profile.avatarUrl,
+        profile.avatar_url,
+        profile.avatar,
+        profile.pictureTagUrl,
+        profile.picture_tag_url,
+        profile.pictureUrl,
+        profile.picture_url,
+        profile.picture
+      ];
+      const value = candidates.find((entry) => typeof entry === 'string' && entry.trim().length > 0);
+      return value || null;
+    };
+
     const gatewayBase = buildGatewayWebsocketBase(config);
+    const metadataCache = new Map();
+    const relayList = [];
+
     for (const relay of activeRelays) {
-      const profile = profiles.find(p => p.relay_key === relay.relayKey);
-      if (!profile) continue;
+      const profile =
+        profilesByRelayKey.get(relay.relayKey) ||
+        (relay.publicIdentifier ? profilesByIdentifier.get(relay.publicIdentifier) : null) ||
+        null;
+
+      const publicIdentifier = String(
+        profile?.public_identifier || relay.publicIdentifier || relay.relayKey
+      );
+
+      let metadata = metadataCache.get(relay.relayKey);
+      if (metadata === undefined) {
+        metadata = await getRelayMetadata(relay.relayKey, publicIdentifier);
+        metadataCache.set(relay.relayKey, metadata || null);
+      }
+      const resolvedMetadata = metadata || null;
+
+      const resolvedName =
+        resolvedMetadata?.name ||
+        profile?.name ||
+        relay.name ||
+        `Relay ${relay.relayKey.substring(0, 8)}`;
+
+      const resolvedDescription =
+        resolvedMetadata?.description ||
+        profile?.description ||
+        relay.description ||
+        '';
+
+      const resolvedAvatar = resolvedMetadata?.avatarUrl || resolveProfileAvatar(profile);
+
+      let resolvedIsPublic;
+      if (typeof resolvedMetadata?.isPublic === 'boolean') {
+        resolvedIsPublic = resolvedMetadata.isPublic;
+      } else if (typeof profile?.isPublic === 'boolean') {
+        resolvedIsPublic = profile.isPublic;
+      } else if (typeof profile?.is_public === 'boolean') {
+        resolvedIsPublic = profile.is_public;
+      } else {
+        resolvedIsPublic = true;
+      }
+
+      const identifierPath = publicIdentifier.includes(':')
+        ? publicIdentifier.replace(':', '/')
+        : publicIdentifier;
 
       relayList.push({
-        identifier: profile.public_identifier || relay.relayKey,
-        name: profile.name || 'Unnamed Relay',
-        connectionUrl: profile.public_identifier ?
-          `${gatewayBase}/${profile.public_identifier.replace(':', '/')}` :
-          `${gatewayBase}/${relay.relayKey}`
+        identifier: publicIdentifier,
+        name: resolvedName,
+        description: resolvedDescription,
+        avatarUrl: resolvedAvatar || null,
+        isPublic: resolvedIsPublic,
+        metadataUpdatedAt: resolvedMetadata?.updatedAt || toTimestamp(profile?.updated_at),
+        metadataEventId: resolvedMetadata?.eventId || null,
+        connectionUrl: `${gatewayBase}/${identifierPath}`
       });
     }
 
@@ -1836,10 +1916,46 @@ async function registerWithGateway(relayProfileInfo = null, options = {}) {
     };
 
     if (relayProfileInfo) {
+      const newRelayIdentifier = String(
+        relayProfileInfo.public_identifier || relayProfileInfo.relay_key
+      );
+
+      let newRelayMetadata = metadataCache.get(relayProfileInfo.relay_key);
+      if (newRelayMetadata === undefined) {
+        newRelayMetadata = await getRelayMetadata(
+          relayProfileInfo.relay_key,
+          newRelayIdentifier
+        );
+        metadataCache.set(relayProfileInfo.relay_key, newRelayMetadata || null);
+      }
+      const resolvedNewMetadata = newRelayMetadata || null;
+
+      const profileAvatar = resolveProfileAvatar(relayProfileInfo);
+
+      let newRelayIsPublic;
+      if (typeof resolvedNewMetadata?.isPublic === 'boolean') {
+        newRelayIsPublic = resolvedNewMetadata.isPublic;
+      } else if (typeof relayProfileInfo.isPublic === 'boolean') {
+        newRelayIsPublic = relayProfileInfo.isPublic;
+      } else if (typeof relayProfileInfo.is_public === 'boolean') {
+        newRelayIsPublic = relayProfileInfo.is_public;
+      } else {
+        newRelayIsPublic = true;
+      }
+
+      const identifierPath = newRelayIdentifier.includes(':')
+        ? newRelayIdentifier.replace(':', '/')
+        : newRelayIdentifier;
+
       registrationData.newRelay = {
-        identifier: relayProfileInfo.public_identifier || relayProfileInfo.relay_key,
-        name: relayProfileInfo.name,
-        description: relayProfileInfo.description
+        identifier: newRelayIdentifier,
+        name: resolvedNewMetadata?.name || relayProfileInfo.name,
+        description: resolvedNewMetadata?.description || relayProfileInfo.description || '',
+        avatarUrl: resolvedNewMetadata?.avatarUrl || profileAvatar || null,
+        isPublic: newRelayIsPublic,
+        metadataUpdatedAt: resolvedNewMetadata?.updatedAt || toTimestamp(relayProfileInfo.updated_at),
+        metadataEventId: resolvedNewMetadata?.eventId || null,
+        connectionUrl: `${gatewayBase}/${identifierPath}`
       };
     }
 
