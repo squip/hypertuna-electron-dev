@@ -308,6 +308,63 @@ export class GatewayService extends EventEmitter {
     return null;
   }
 
+  async _fetchPfpFromRelay(identifier, owner, file) {
+    const normalized = this._normalizeRelayIdentifier(identifier);
+    if (!normalized) return null;
+
+    const relayEntry = this.activeRelays.get(normalized);
+    if (!relayEntry || !relayEntry.peers?.size) {
+      return null;
+    }
+
+    const peerKeys = Array.from(relayEntry.peers);
+    let encounteredNotFound = false;
+    let attempted = false;
+
+    for (const peerKey of peerKeys) {
+      const peer = this.activePeers.find(p => p.publicKey === peerKey);
+      if (!peer) continue;
+
+      let healthy = this.peerHealthManager.isPeerHealthy(peerKey);
+      if (!healthy) {
+        try {
+          healthy = await this.peerHealthManager.checkPeerHealth(peer, this.connectionPool);
+        } catch (error) {
+          this.log('warn', `PFP health probe failed for relay host ${peerKey.slice(0, 8)}: ${error.message}`);
+          healthy = false;
+        }
+      }
+
+      if (!healthy) {
+        continue;
+      }
+
+      try {
+        attempted = true;
+        const stream = await requestPfpFromPeer(peer, owner || null, file, this.connectionPool);
+        peer.lastSeen = Date.now();
+
+        if ((stream.statusCode || 200) === 200) {
+          return stream;
+        }
+
+        if ((stream.statusCode || 500) === 404) {
+          encounteredNotFound = true;
+        }
+
+        await this._drainStream(stream);
+      } catch (error) {
+        this.log('warn', `Failed to proxy relay PFP ${file} for ${normalized} via ${peerKey.slice(0, 8)}: ${error.message}`);
+      }
+    }
+
+    if (encounteredNotFound) {
+      return false;
+    }
+
+    return null;
+  }
+
   _onProtocolCreated({ publicKey, protocol, context = {} }) {
     if (!protocol) return;
     const isServer = !!context.isServer;
@@ -609,12 +666,95 @@ export class GatewayService extends EventEmitter {
       }
     });
 
+    this.app.post('/post/join/:identifier', async (req, res) => {
+      const identifier = req.params.identifier;
+
+      try {
+        const relayEntry = this.activeRelays.get(identifier);
+        if (!relayEntry || !relayEntry.peers?.size) {
+          return res.status(404).json({ error: 'Relay not registered with gateway' });
+        }
+
+        const peer = await this.findHealthyPeerForRelay(identifier, true);
+        if (!peer) {
+          return res.status(503).json({ error: 'No healthy peers available for this relay' });
+        }
+
+        const payloadBody = req.body ? Buffer.from(JSON.stringify(req.body)) : undefined;
+        const headers = { ...req.headers };
+        delete headers['content-length'];
+        delete headers['transfer-encoding'];
+        delete headers['content-encoding'];
+        headers['content-type'] = 'application/json';
+
+        const forwardResponse = await forwardRequestToPeer(peer, {
+          method: req.method,
+          path: req.originalUrl || req.url,
+          headers,
+          body: payloadBody
+        }, this.connectionPool);
+
+        Object.entries(forwardResponse.headers || {}).forEach(([key, value]) => {
+          if (value !== undefined) {
+            res.setHeader(key, value);
+          }
+        });
+
+        const statusCode = forwardResponse.statusCode || 200;
+        const responseBody = forwardResponse.body || Buffer.alloc(0);
+        res.status(statusCode);
+        res.send(responseBody);
+      } catch (error) {
+        this.log('error', `Join request forwarding failed for ${identifier}: ${error.message}`);
+
+        const match = /status\s(\d{3})/i.exec(error.message || '');
+        const status = match ? Number(match[1]) : 502;
+        res.status(status).json({ error: error.message });
+      }
+    });
+
     const servePfp = async (req, res) => {
       const owner = req.params.owner;
       const file = req.params.file;
       if (!file) {
         res.status(400).json({ error: 'Missing file parameter' });
         return;
+      }
+
+      const relayHintRaw = req.query?.relay || req.query?.identifier || req.query?.relayId;
+      const relayIdentifier = this._normalizeRelayIdentifier(relayHintRaw);
+
+      if (relayIdentifier) {
+        try {
+          const targetedStream = await this._fetchPfpFromRelay(relayIdentifier, owner || null, file);
+          if (targetedStream === false) {
+            res.status(404).json({ error: 'Avatar not found' });
+            return;
+          }
+
+          if (!targetedStream) {
+            const relayEntry = this.activeRelays.get(relayIdentifier);
+            if (!relayEntry || !relayEntry.peers?.size) {
+              res.status(404).json({ error: 'Relay not registered with gateway' });
+            } else {
+              res.status(503).json({ error: 'No healthy peers available for this relay' });
+            }
+            return;
+          }
+
+          Object.entries(targetedStream.headers || {}).forEach(([key, value]) => {
+            if (value !== undefined) {
+              res.setHeader(key, value);
+            }
+          });
+          res.status(targetedStream.statusCode || 200);
+          targetedStream.pipe(res);
+          return;
+        } catch (error) {
+          this.log('warn', `Relay-specific PFP fetch failed for ${relayIdentifier}: ${error.message}`);
+          res.status(502).json({ error: 'Failed to proxy avatar from relay host', message: error.message });
+          return;
+        }
       }
 
       try {
@@ -761,7 +901,11 @@ export class GatewayService extends EventEmitter {
           nextMetadata.description = relayObj.description;
         }
         if (relayObj.avatarUrl !== undefined) {
-          nextMetadata.avatarUrl = relayObj.avatarUrl || null;
+          if (relayObj.avatarUrl) {
+            nextMetadata.avatarUrl = this._ensureRelayAvatarUrl(relayObj.avatarUrl, identifier);
+          } else {
+            nextMetadata.avatarUrl = null;
+          }
         }
         if (relayObj.metadataEventId) {
           nextMetadata.metadataEventId = relayObj.metadataEventId;
@@ -895,6 +1039,58 @@ export class GatewayService extends EventEmitter {
     }
 
     return typeof identifier === 'string' ? identifier : null;
+  }
+
+  _normalizeRelayIdentifier(value) {
+    if (!value || typeof value !== 'string') return null;
+    let normalized = value.trim();
+    if (!normalized) return null;
+
+    try {
+      normalized = decodeURIComponent(normalized);
+    } catch (_) {
+      // ignore URI decoding errors
+    }
+
+    if (normalized.includes('/')) {
+      const parts = normalized.split('/').filter(Boolean);
+      if (parts.length >= 2) {
+        normalized = `${parts[0]}:${parts[1]}`;
+      }
+    }
+
+    return normalized;
+  }
+
+  _ensureRelayAvatarUrl(url, identifier) {
+    if (!url || typeof url !== 'string' || !identifier) {
+      return url;
+    }
+
+    const trimmed = url.trim();
+    if (!trimmed) return url;
+
+    const isRelative = trimmed.startsWith('/');
+    let parsed;
+
+    try {
+      parsed = new URL(trimmed, 'http://placeholder.local');
+    } catch (_) {
+      return url;
+    }
+
+    if (!parsed.pathname.startsWith('/pfp/')) {
+      return url;
+    }
+
+    parsed.searchParams.set('relay', identifier);
+
+    if (isRelative) {
+      const search = parsed.search ? parsed.search : '';
+      return `${parsed.pathname}${search}`;
+    }
+
+    return parsed.toString();
   }
 
   handleGatewayWebSocketConnection(ws, req) {
