@@ -6,8 +6,6 @@ import { join } from 'node:path';
 import process from 'node:process';
 import crypto from 'hypercore-crypto';
 import { setTimeout, setInterval, clearInterval } from 'node:timers';
-import http from 'node:http';
-import https from 'node:https';
 import b4a from 'b4a';
 import { URL } from 'node:url';
 import { initializeChallengeManager, getChallengeManager } from './challenge-manager.mjs';
@@ -57,6 +55,8 @@ let gatewayRegistrationInterval = null;
 let gatewayConnection = null;
 let pendingRegistrations = []; // Queue registrations until gateway connects
 let connectedPeers = new Map(); // Track all connected peers
+let pendingPeerProtocols = new Map(); // Awaiters for outbound connections
+const peerJoinHandles = new Map(); // Persistent joinPeer handles
 
 // Enhanced health state tracking
 let healthState = {
@@ -86,16 +86,6 @@ function buildGatewayWebsocketBase(cfg = config) {
   const protocol = getGatewayWebsocketProtocol(cfg);
   const host = cfg?.proxy_server_address || 'localhost';
   return `${protocol}://${host}`;
-}
-
-function resolveHttpClient(url) {
-  const protocol = url.protocol || new URL(url).protocol;
-  const isHttps = protocol === 'https:';
-  return {
-    client: isHttps ? https : http,
-    defaultPort: isHttps ? 443 : 80,
-    isHttps
-  };
 }
 
 // Initialize with enhanced config
@@ -351,19 +341,98 @@ async function startHyperswarmServer() {
   }
 }
 
+function ensurePeerJoinHandle(publicKey) {
+  if (!swarm) {
+    throw new Error('Hyperswarm swarm not initialized');
+  }
+
+  const normalized = publicKey.toLowerCase();
+  if (peerJoinHandles.has(normalized)) {
+    return peerJoinHandles.get(normalized);
+  }
+
+  let keyBuffer;
+  try {
+    keyBuffer = Buffer.from(normalized, 'hex');
+  } catch (error) {
+    throw new Error(`Invalid peer public key: ${publicKey}`);
+  }
+  const handle = swarm.joinPeer(keyBuffer);
+  peerJoinHandles.set(normalized, handle);
+  return handle;
+}
+
+function toBuffer(body) {
+  if (!body) return Buffer.alloc(0);
+  if (Buffer.isBuffer(body)) return body;
+  if (Array.isArray(body)) return Buffer.from(body);
+  if (typeof body === 'string') return Buffer.from(body);
+  return Buffer.alloc(0);
+}
+
+function parseJsonBody(body) {
+  const buffer = toBuffer(body);
+  if (!buffer.length) return null;
+  try {
+    return JSON.parse(buffer.toString('utf8'));
+  } catch (error) {
+    throw new Error(`Failed to parse JSON response: ${error.message}`);
+  }
+}
+
+async function waitForPeerProtocol(publicKey, timeoutMs = 20000) {
+  const normalized = publicKey.toLowerCase();
+  const existing = connectedPeers.get(normalized);
+  if (existing?.protocol && existing.protocol.channel && !existing.protocol.channel.closed) {
+    return existing.protocol;
+  }
+
+  ensurePeerJoinHandle(normalized);
+
+  return new Promise((resolve, reject) => {
+    const pending = pendingPeerProtocols.get(normalized) || [];
+    const timeout = setTimeout(() => {
+      const list = pendingPeerProtocols.get(normalized) || [];
+      const filtered = list.filter(entry => entry !== pendingEntry);
+      if (filtered.length) {
+        pendingPeerProtocols.set(normalized, filtered);
+      } else {
+        pendingPeerProtocols.delete(normalized);
+      }
+      reject(new Error('Timed out waiting for peer connection'));
+    }, timeoutMs);
+
+    const pendingEntry = {
+      resolve(protocol) {
+        clearTimeout(timeout);
+        resolve(protocol);
+      },
+      reject(err) {
+        clearTimeout(timeout);
+        reject(err);
+      }
+    };
+
+    pending.push(pendingEntry);
+    pendingPeerProtocols.set(normalized, pending);
+  });
+}
+
 // Handle incoming peer connections
 function handlePeerConnection(stream, peerInfo) {
   const publicKey = peerInfo.publicKey.toString('hex');
+  const normalizedKey = publicKey.toLowerCase();
   console.log('[RelayServer] Setting up protocol for peer:', publicKey);
   
   // Track the peer
-  connectedPeers.set(publicKey, {
+  connectedPeers.set(normalizedKey, {
     connectedAt: Date.now(),
     peerInfo,
     protocol: null,
     identified: false,
     stream: stream, // Keep reference to stream
-    keepAliveInterval: null // Add keepalive tracking
+    keepAliveInterval: null, // Add keepalive tracking
+    publicKey
   });
   
   const handshakeInfo = {
@@ -377,7 +446,7 @@ function handlePeerConnection(stream, peerInfo) {
   const protocol = new RelayProtocol(stream, true, handshakeInfo);
   
   // Store protocol reference
-  const peerData = connectedPeers.get(publicKey);
+  const peerData = connectedPeers.get(normalizedKey);
   peerData.protocol = protocol;
   
   // Set up keepalive for gateway connections
@@ -402,7 +471,7 @@ function handlePeerConnection(stream, peerInfo) {
       // Start keepalive for gateway connection
       startKeepAlive(publicKey);
     }
-    else if (config.gatewayPublicKey && publicKey === config.gatewayPublicKey) {
+    else if (config.gatewayPublicKey && publicKey.toLowerCase() === config.gatewayPublicKey.toLowerCase()) {
       console.log('[RelayServer] >>> GATEWAY IDENTIFIED BY PUBLIC KEY <<<');
       setGatewayConnection(protocol, publicKey);
       
@@ -412,6 +481,18 @@ function handlePeerConnection(stream, peerInfo) {
       console.log('[RelayServer] Regular peer connection (not gateway)');
     }
     console.log('[RelayServer] ----------------------------------------');
+
+    const pending = pendingPeerProtocols.get(normalizedKey);
+    if (pending && pending.length) {
+      pendingPeerProtocols.delete(normalizedKey);
+      for (const entry of pending) {
+        try {
+          entry.resolve(protocol);
+        } catch (err) {
+          console.warn('[RelayServer] Failed to resolve pending peer protocol:', err.message);
+        }
+      }
+    }
   });
   
   protocol.on('close', () => {
@@ -420,14 +501,24 @@ function handlePeerConnection(stream, peerInfo) {
     console.log('[RelayServer] Peer:', publicKey.substring(0, 8) + '...');
     
     // Clean up keepalive
-    const peer = connectedPeers.get(publicKey);
+    const peer = connectedPeers.get(normalizedKey);
     if (peer && peer.keepAliveInterval) {
       clearInterval(peer.keepAliveInterval);
     }
     
     // Remove from connected peers
-    connectedPeers.delete(publicKey);
-    
+    connectedPeers.delete(normalizedKey);
+
+    const pending = pendingPeerProtocols.get(normalizedKey);
+    if (pending && pending.length) {
+      pendingPeerProtocols.delete(normalizedKey);
+      for (const entry of pending) {
+        try {
+          entry.reject(new Error('Peer connection closed'));
+        } catch (_) {}
+      }
+    }
+
     if (gatewayConnection === protocol) {
       console.log('[RelayServer] >>> GATEWAY CONNECTION LOST <<<');
       gatewayConnection = null;
@@ -466,7 +557,8 @@ function handlePeerConnection(stream, peerInfo) {
 
 // Add keepalive function
 function startKeepAlive(publicKey) {
-  const peer = connectedPeers.get(publicKey);
+  const normalizedKey = publicKey.toLowerCase();
+  const peer = connectedPeers.get(normalizedKey);
   if (!peer || !peer.protocol) return;
   
   console.log(`[RelayServer] Starting keepalive for ${publicKey.substring(0, 8)}...`);
@@ -480,6 +572,7 @@ function startKeepAlive(publicKey) {
       } else {
         console.log(`[RelayServer] Connection lost for ${publicKey.substring(0, 8)}, stopping keepalive`);
         clearInterval(peer.keepAliveInterval);
+        connectedPeers.delete(normalizedKey);
       }
     } catch (error) {
       console.error(`[RelayServer] Keepalive error for ${publicKey.substring(0, 8)}:`, error.message);
@@ -493,7 +586,8 @@ function setGatewayConnection(protocol, publicKey) {
   healthState.services.gatewayStatus = 'connected';
   
   // Mark peer as identified
-  const peer = connectedPeers.get(publicKey);
+  const normalizedKey = publicKey.toLowerCase();
+  const peer = connectedPeers.get(normalizedKey);
   if (peer) {
     peer.identified = true;
     peer.isGateway = true;
@@ -2152,7 +2246,7 @@ async function createGroupJoinRequest(publicIdentifier, privateKey) {
 }
 
 export async function startJoinAuthentication(options) {
-  const { publicIdentifier, fileSharing = false } = options;
+  const { publicIdentifier, fileSharing = false, hostPeers: hostPeerList = [] } = options;
   const userNsec = config.nostr_nsec_hex;
   const userPubkey = NostrUtils.getPublicKey(userNsec);
   if (config.nostr_pubkey_hex && userPubkey !== config.nostr_pubkey_hex) {
@@ -2195,62 +2289,64 @@ export async function startJoinAuthentication(options) {
     const joinEvent = await createGroupJoinRequest(publicIdentifier, userNsec);
     console.log(`[RelayServer] Created join event ID: ${joinEvent.id.substring(0, 8)}...`);
     
-    // 2. Make an HTTP(S) request to the gateway's /post/join/:identifier endpoint
-    const gatewayUrl = new URL(config.gatewayUrl);
-    const { client: joinClient, defaultPort: joinDefaultPort, isHttps: joinIsHttps } = resolveHttpClient(gatewayUrl);
-    const postData = JSON.stringify({ event: joinEvent });
-    
-    const requestOptions = {
-      hostname: gatewayUrl.hostname,
-      port: gatewayUrl.port || joinDefaultPort,
-      path: `/post/join/${publicIdentifier}`,
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Content-Length': b4a.byteLength(postData)
-      }
-    };
-    if (joinIsHttps) {
-      requestOptions.rejectUnauthorized = false; // For self-signed certs in dev
+    const hostPeers = Array.isArray(hostPeerList)
+      ? hostPeerList.map((key) => String(key || '').trim().toLowerCase()).filter(Boolean)
+      : [];
+
+    if (!hostPeers.length) {
+      throw new Error('No hosting peers discovered for this relay');
     }
-    
-    console.log(`[RelayServer] Sending join request to gateway: ${requestOptions.hostname}${requestOptions.path}`);
-    
-    const joinResponse = await new Promise((resolve, reject) => {
-      const req = joinClient.request(requestOptions, (res) => {
-        let data = '';
-        res.on('data', (chunk) => data += chunk);
-        res.on('end', () => {
-          if (res.statusCode >= 200 && res.statusCode < 300) {
-            try {
-              resolve(JSON.parse(data));
-            } catch (e) {
-              reject(new Error(`Failed to parse JSON response: ${data}`));
-            }
-          } else {
-            reject(new Error(`Gateway returned status ${res.statusCode}: ${data}`));
-          }
+
+    let challengePayload = null;
+    let relayPubkey = null;
+    let selectedPeerKey = null;
+    let joinProtocol = null;
+    let lastJoinError = null;
+
+    for (const hostPeerKey of hostPeers) {
+      try {
+        console.log(`[RelayServer] Attempting direct join via peer ${hostPeerKey.substring(0, 8)}...`);
+        const protocol = await waitForPeerProtocol(hostPeerKey, 20000);
+        const joinResponse = await protocol.sendRequest({
+          method: 'POST',
+          path: `/post/join/${publicIdentifier}`,
+          headers: { 'content-type': 'application/json' },
+          body: Buffer.from(JSON.stringify({ event: joinEvent }))
         });
-      });
-      
-      req.on('error', (e) => {
-        console.error(`[RelayServer] Join request error:`, e);
-        reject(e);
-      });
-      
-      req.write(postData);
-      req.end();
-    });
 
-    console.log('[RelayServer] Received response from gateway:', joinResponse);
+        if ((joinResponse.statusCode || 200) >= 400) {
+          const responseBody = toBuffer(joinResponse.body).toString('utf8');
+          throw new Error(`Peer returned status ${joinResponse.statusCode}: ${responseBody}`);
+        }
 
-    // Step 2.3: Handle challenge and verification callback
-    const { challenge, relayPubkey } = joinResponse;
+        const parsed = parseJsonBody(joinResponse.body) || {};
+        if (!parsed.challenge || !parsed.relayPubkey) {
+          throw new Error('Invalid join response from peer');
+        }
+
+        challengePayload = parsed;
+        relayPubkey = parsed.relayPubkey;
+        selectedPeerKey = hostPeerKey;
+        joinProtocol = protocol;
+        break;
+      } catch (error) {
+        console.error(`[RelayServer] Direct join attempt failed for ${hostPeerKey.substring(0, 8)}:`, error.message);
+        lastJoinError = error;
+      }
+    }
+
+    if (!challengePayload || !relayPubkey || !joinProtocol) {
+      throw lastJoinError || new Error('Failed to contact relay host');
+    }
+
+    console.log('[RelayServer] Received challenge from peer:', challengePayload);
+
+    const { challenge } = challengePayload;
 
     console.log(`[RelayServer] Challenge: ${challenge.substring(0, 16)}...`);
 
     if (!challenge || !relayPubkey) {
-      throw new Error('Invalid challenge response from gateway. Missing required fields.');
+      throw new Error('Invalid challenge response from relay host. Missing required fields.');
     }
 
     // Send 'verify' progress update to the desktop UI
@@ -2283,58 +2379,27 @@ export async function startJoinAuthentication(options) {
     console.log(`[RelayServer] Ciphertext length: ${ciphertext.length}`);
     console.log(`[RelayServer] IV base64: ${ivBase64}`);
 
-    // Send the encrypted challenge to the verification URL
-    const verifyGatewayUrl = new URL(`/callback/verify-ownership/${publicIdentifier}`, config.gatewayUrl);
-    const verifyPostData = JSON.stringify({
-      pubkey: userPubkey,
-      ciphertext: ciphertext,
-      iv: ivBase64
+    console.log(`[RelayServer] Sending verification request directly to peer ${selectedPeerKey.substring(0, 8)}...`);
+
+    const verifyResponseRaw = await joinProtocol.sendRequest({
+      method: 'POST',
+      path: `/verify-ownership`,
+      headers: { 'content-type': 'application/json' },
+      body: Buffer.from(JSON.stringify({
+        pubkey: userPubkey,
+        ciphertext,
+        iv: ivBase64
+      }))
     });
 
-    const { client: verifyClient, defaultPort: verifyDefaultPort, isHttps: verifyIsHttps } = resolveHttpClient(verifyGatewayUrl);
-    const verifyOptions = {
-      hostname: verifyGatewayUrl.hostname,
-      port: verifyGatewayUrl.port || verifyDefaultPort,
-      path: verifyGatewayUrl.pathname,
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Content-Length': b4a.byteLength(verifyPostData)
-      }
-    };
-    if (verifyIsHttps) {
-      verifyOptions.rejectUnauthorized = false; // For self-signed certs in dev
+    if ((verifyResponseRaw.statusCode || 200) >= 400) {
+      const responseBody = toBuffer(verifyResponseRaw.body).toString('utf8');
+      throw new Error(`Peer verification failed with status ${verifyResponseRaw.statusCode}: ${responseBody}`);
     }
 
-    console.log(`[RelayServer] Sending verification request to gateway: ${verifyOptions.hostname}${verifyOptions.path}`);
+    const verifyResponse = parseJsonBody(verifyResponseRaw.body) || {};
 
-    const verifyResponse = await new Promise((resolve, reject) => {
-      const req = verifyClient.request(verifyOptions, (res) => {
-        let data = '';
-        res.on('data', (chunk) => data += chunk);
-        res.on('end', () => {
-          if (res.statusCode >= 200 && res.statusCode < 300) {
-            try {
-              resolve(JSON.parse(data));
-            } catch (e) {
-              reject(new Error(`Failed to parse JSON response from verifyUrl: ${data}`));
-            }
-          } else {
-            reject(new Error(`Gateway verification failed with status ${res.statusCode}: ${data}`));
-          }
-        });
-      });
-
-      req.on('error', (e) => {
-        console.error(`[RelayServer] Verification request error:`, e);
-        reject(e);
-      });
-
-      req.write(verifyPostData);
-      req.end();
-    });
-
-    console.log('[RelayServer] Received verification response from gateway:', verifyResponse);
+    console.log('[RelayServer] Received verification response from peer:', verifyResponse);
     if (verifyResponse && verifyResponse.success === false) {
       console.log(`[RelayServer] Verification failed: ${verifyResponse.error}`);
     }
@@ -2350,7 +2415,7 @@ export async function startJoinAuthentication(options) {
     const { authToken, relayUrl, relayKey, publicIdentifier: returnedIdentifier } = verifyResponse;
     const finalIdentifier = returnedIdentifier || publicIdentifier;
     if (!authToken || !relayUrl || !relayKey) {
-      throw new Error('Final response from gateway missing authToken, relayKey, or relayUrl');
+      throw new Error('Final response from relay host missing authToken, relayKey, or relayUrl');
     }
 
     // Join the relay locally so we have a profile and key mapping
@@ -2379,7 +2444,7 @@ export async function startJoinAuthentication(options) {
     if (global.sendMessage) {
       global.sendMessage({
         type: 'join-auth-success',
-        data: { publicIdentifier: finalIdentifier, relayKey, authToken, relayUrl }
+        data: { publicIdentifier: finalIdentifier, relayKey, authToken, relayUrl, hostPeer: selectedPeerKey }
       });
     }
 

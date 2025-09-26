@@ -1285,11 +1285,20 @@ async function joinRelayInstance(publicIdentifier, fileSharing = false) {
     addLog(`Starting join flow for relay: ${publicIdentifier}`, 'status');
     
     // Send message to worker to start the process
-    electronAPI
-      .sendToWorker({
-        type: 'start-join-flow',
-        data: { publicIdentifier, fileSharing }
-      })
+  let hostPeers = []
+  try {
+    if (window.App?.getRelayPeerSet) {
+      hostPeers = Array.from(window.App.getRelayPeerSet(publicIdentifier) || [])
+    }
+  } catch (err) {
+    addLog(`Failed to resolve relay host peers: ${err.message}`, 'warn')
+  }
+
+  electronAPI
+    .sendToWorker({
+      type: 'start-join-flow',
+      data: { publicIdentifier, fileSharing, hostPeers }
+    })
       .catch((error) => {
         addLog(`Failed to start join flow: ${error.message}`, 'error');
         relayJoinResolvers.delete(publicIdentifier);
