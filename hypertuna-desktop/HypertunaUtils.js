@@ -30,11 +30,35 @@ export class HypertunaUtils {
     static DEFAULT_CONTEXT = 'hypertuna-relay-peer';
 
     static async getGatewaySettings() {
-        return loadGatewaySettings();
+        const settings = await loadGatewaySettings();
+        if (!settings) return settings;
+
+        const next = { ...settings };
+        if (this.isLoopbackHost(next.proxyHost)) {
+            next.proxyHost = next.proxyHost ? next.proxyHost.replace(/:(\d+)$/, '') : null;
+        }
+        if (typeof next.gatewayUrl === 'string') {
+            next.gatewayUrl = this.sanitizeLoopbackGatewayUrl(next.gatewayUrl);
+        }
+        return next;
     }
 
     static getCachedGatewaySettings() {
-        return getCachedGatewaySettings();
+        const settings = getCachedGatewaySettings();
+        if (!settings) return settings;
+
+        const next = { ...settings };
+        if (this.isLoopbackHost(next.proxyHost)) {
+            next.proxyHost = next.proxyHost ? next.proxyHost.replace(/:(\d+)$/, '') : null;
+        }
+        if (typeof next.gatewayUrl === 'string') {
+            next.gatewayUrl = this.sanitizeLoopbackGatewayUrl(next.gatewayUrl);
+        }
+        return next;
+    }
+
+    static isLoopbackHost(host) {
+        return typeof host === 'string' && LOOPBACK_HOST_REGEX.test(host.trim());
     }
 
     static async getDefaultGatewayUrl() {
@@ -53,6 +77,23 @@ export class HypertunaUtils {
 
     static getGatewayWebsocketProtocol(value) {
         return deriveGatewayWebsocketProtocol(value);
+    }
+
+    static sanitizeLoopbackGatewayUrl(url) {
+        if (typeof url !== 'string') return null;
+        try {
+            const parsed = new URL(url);
+            if (this.isLoopbackHost(parsed.host)) {
+                parsed.port = '';
+                parsed.pathname = '';
+                parsed.search = '';
+                parsed.hash = '';
+                return `${parsed.protocol}//${parsed.hostname}`;
+            }
+            return parsed.toString();
+        } catch (_) {
+            return url;
+        }
     }
 
     static resolvePfpUrl(url, isHypertunaPfp = false) {
@@ -80,6 +121,9 @@ export class HypertunaUtils {
     static async persistGatewaySettings(gatewayUrl) {
         const proxyHost = deriveGatewayProxyHost(gatewayUrl);
         const proxyWebsocketProtocol = deriveGatewayWebsocketProtocol(gatewayUrl);
+        if (this.isLoopbackHost(proxyHost)) {
+            return this.getCachedGatewaySettings();
+        }
         return updateGatewaySettings({ gatewayUrl, proxyHost, proxyWebsocketProtocol });
     }
     
@@ -524,7 +568,17 @@ export class HypertunaUtils {
         if (config) {
             const gatewaySettings = await this.getGatewaySettings();
             config.proxy_server_address = this.sanitizeLoopbackHost(config.proxy_server_address || gatewaySettings.proxyHost);
-            config.gatewayUrl = this.sanitizeLoopbackGatewayUrl(config.gatewayUrl || gatewaySettings.gatewayUrl);
+            const sanitizedGatewayUrl = this.sanitizeLoopbackGatewayUrl(config.gatewayUrl || gatewaySettings.gatewayUrl);
+            try {
+                const parsedGateway = sanitizedGatewayUrl ? new URL(sanitizedGatewayUrl) : null;
+                if (parsedGateway && this.isLoopbackHost(parsedGateway.host)) {
+                    config.gatewayUrl = null;
+                } else {
+                    config.gatewayUrl = sanitizedGatewayUrl || null;
+                }
+            } catch (_) {
+                config.gatewayUrl = sanitizedGatewayUrl || null;
+            }
             // Check if bech32 values are missing and generate them
             if (config.nostr_pubkey_hex && !config.nostr_npub) {
                 config.nostr_npub = NostrUtils.hexToNpub(config.nostr_pubkey_hex);

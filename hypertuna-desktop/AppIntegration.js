@@ -8,6 +8,8 @@ import NostrIntegration from './NostrIntegration.js';
 import { NostrUtils } from './NostrUtils.js';
 import { HypertunaUtils } from './HypertunaUtils.js';
 import { ConfigLogger } from './ConfigLogger.js';
+import { GatewayRuntimeStore } from './GatewayRuntimeStore.js';
+import { getGatewayDefaults } from '../shared/config/GatewaySettings.mjs';
 import NostrEvents from './NostrEvents.js';  // Add this import
 import MembersList from './MembersList.js';
 import { AvatarModal } from './AvatarModal.js';
@@ -47,6 +49,29 @@ function integrateNostrRelays(App) {
     
     // Create nostr integration
     App.nostr = new NostrIntegration(App);
+
+    App.gatewayRuntimeStore = GatewayRuntimeStore;
+    App.gatewayBaseUrl = null;
+
+    const applyGatewayRuntimeInfo = (info) => {
+        const runtimeWsBase = info?.wsBaseUrl ? info.wsBaseUrl.replace(/\/$/, '') : null;
+        const runtimeHttpBase = info?.httpBaseUrl ? info.httpBaseUrl.replace(/\/$/, '') : (runtimeWsBase ? runtimeWsBase.replace(/^ws/, 'http') : null);
+
+        App.gatewayBaseUrl = runtimeWsBase;
+        App.gatewayHttpBaseUrl = runtimeHttpBase;
+
+        if (App.nostr?.client && typeof App.nostr.client.setGatewayBase === 'function') {
+            App.nostr.client.setGatewayBase(runtimeWsBase);
+        }
+    };
+
+    App.handleGatewayRuntimeUpdate = function(runtimeInfo) {
+        applyGatewayRuntimeInfo(runtimeInfo || null);
+    };
+
+    const unsubscribeGatewayRuntime = GatewayRuntimeStore.subscribe(applyGatewayRuntimeInfo);
+    App._gatewayRuntimeUnsubscribe = unsubscribeGatewayRuntime;
+    applyGatewayRuntimeInfo(GatewayRuntimeStore.getInfo());
 
     App.gatewayPeerRelayMap = new Map();
     App.gatewayPeerDetails = new Map();
@@ -92,6 +117,17 @@ function integrateNostrRelays(App) {
     };
 
     App.resolveLocalGatewayBase = async function() {
+        if (this.gatewayBaseUrl) {
+            return this.gatewayBaseUrl;
+        }
+
+        const runtimeBase = GatewayRuntimeStore.getWsBase();
+        if (runtimeBase) {
+            this.gatewayBaseUrl = runtimeBase.replace(/\/$/, '');
+            this.gatewayHttpBaseUrl = runtimeBase.replace(/^ws/, 'http').replace(/\/$/, '');
+            return this.gatewayBaseUrl;
+        }
+
         let settings = null;
         try {
             settings = await HypertunaUtils.getGatewaySettings();
@@ -102,28 +138,98 @@ function integrateNostrRelays(App) {
             settings = HypertunaUtils.getCachedGatewaySettings() || {};
         }
 
-        const protocol = settings.proxyWebsocketProtocol || settings.proxy_websocket_protocol || (() => {
-            if (typeof settings.gatewayUrl === 'string') {
-                try {
-                    const parsed = new URL(settings.gatewayUrl);
-                    return parsed.protocol === 'http:' ? 'ws' : 'wss';
-                } catch (_) {}
-            }
-            return 'ws';
-        })();
+        let host = settings.proxyHost || settings.proxy_host || null;
+        let protocol = settings.proxyWebsocketProtocol || settings.proxy_websocket_protocol || null;
 
-        let host = settings.proxyHost || settings.proxy_host;
         if (!host && typeof settings.gatewayUrl === 'string') {
             try {
                 const parsed = new URL(settings.gatewayUrl);
                 host = parsed.host;
             } catch (_) {}
         }
-        if (!host) {
-            host = '127.0.0.1';
+
+        if (host && HypertunaUtils.isLoopbackHost(host)) {
+            host = null;
         }
 
-        return `${protocol}://${host}`.replace(/\/$/, '');
+        const defaults = getGatewayDefaults();
+        if (host && defaults?.proxyHost && host === defaults.proxyHost) {
+            host = null;
+        }
+        if (host && settings.gatewayUrl && defaults?.gatewayUrl && settings.gatewayUrl === defaults.gatewayUrl) {
+            host = null;
+        }
+
+        if (!host || !protocol) {
+            if (this.nostr?.client?.waitForGatewayBase) {
+                try {
+                    const runtime = await this.nostr.client.waitForGatewayBase();
+                    if (runtime) {
+                        this.gatewayBaseUrl = runtime.replace(/\/$/, '');
+                        this.gatewayHttpBaseUrl = runtime.replace(/^ws/, 'http').replace(/\/$/, '');
+                        return this.gatewayBaseUrl;
+                    }
+                } catch (_) {}
+            }
+            return null;
+        }
+
+        const fallbackBase = `${protocol}://${host}`.replace(/\/$/, '');
+        this.gatewayBaseUrl = fallbackBase;
+        this.gatewayHttpBaseUrl = fallbackBase.replace(/^ws/, 'http');
+        return fallbackBase;
+    };
+
+    App.resolveGatewayHttpBase = async function() {
+        if (this.gatewayHttpBaseUrl) {
+            return this.gatewayHttpBaseUrl;
+        }
+
+        const runtimeInfo = GatewayRuntimeStore.getInfo();
+        if (runtimeInfo?.httpBaseUrl) {
+            this.gatewayHttpBaseUrl = runtimeInfo.httpBaseUrl.replace(/\/$/, '');
+            return this.gatewayHttpBaseUrl;
+        }
+
+        const wsBase = await this.resolveLocalGatewayBase();
+        if (wsBase) {
+            try {
+                const parsed = new URL(wsBase.replace(/^ws/, 'http'));
+                this.gatewayHttpBaseUrl = `${parsed.protocol}//${parsed.host}`.replace(/\/$/, '');
+                return this.gatewayHttpBaseUrl;
+            } catch (_) {
+                this.gatewayHttpBaseUrl = wsBase.replace(/^ws/, 'http').replace(/\/$/, '');
+                return this.gatewayHttpBaseUrl;
+            }
+        }
+
+        if (this.nostr?.client?.waitForGatewayBase) {
+            try {
+                const runtimeWs = await this.nostr.client.waitForGatewayBase();
+                if (runtimeWs) {
+                    const converted = runtimeWs.replace(/^ws/, 'http').replace(/\/$/, '');
+                    this.gatewayBaseUrl = runtimeWs.replace(/\/$/, '');
+                    this.gatewayHttpBaseUrl = converted;
+                    return converted;
+                }
+            } catch (_) {}
+        }
+
+        const settings = await HypertunaUtils.getGatewaySettings();
+        const fallback = settings?.gatewayUrl;
+        if (fallback) {
+            try {
+                const parsed = new URL(fallback);
+                const defaults = getGatewayDefaults();
+                const isDefault = defaults?.gatewayUrl === fallback || defaults?.proxyHost === parsed.host;
+                if (!HypertunaUtils.isLoopbackHost(parsed.host) && !isDefault) {
+                    this.gatewayHttpBaseUrl = `${parsed.protocol}//${parsed.host}`.replace(/\/$/, '');
+                    return this.gatewayHttpBaseUrl;
+                }
+            } catch (_) {}
+        }
+
+        return null;
     };
 
     App.updateGatewayPeers = function({ relayMap, peerDetails } = {}) {
@@ -876,9 +982,10 @@ function integrateNostrRelays(App) {
             const buffer = result.buffer;
             const fileHash = await NostrUtils.computeSha256(buffer);
             const base64 = result.base64 || uint8ArrayToBase64(buffer);
-            const gatewaySettings = await HypertunaUtils.getGatewaySettings();
-            const cachedSettings = HypertunaUtils.getCachedGatewaySettings() || {};
-            const baseUrl = (gatewaySettings.gatewayUrl || cachedSettings.gatewayUrl || '').replace(/\/$/, '');
+            const baseUrl = await this.resolveGatewayHttpBase();
+            if (!baseUrl) {
+                throw new Error('Gateway address unavailable. Start the worker to obtain the current gateway URL.');
+            }
             const owner = this.currentUser.pubkey;
             const fileName = `${fileHash}${result.extension}`;
             const pictureUrl = `${baseUrl}/pfp/${owner}/${fileName}`;
@@ -934,9 +1041,10 @@ function integrateNostrRelays(App) {
             const buffer = result.buffer;
             const fileHash = await NostrUtils.computeSha256(buffer);
             const base64 = result.base64 || uint8ArrayToBase64(buffer);
-            const gatewaySettings = await HypertunaUtils.getGatewaySettings();
-            const cachedSettings = HypertunaUtils.getCachedGatewaySettings() || {};
-            const baseUrl = (gatewaySettings.gatewayUrl || cachedSettings.gatewayUrl || '').replace(/\/$/, '');
+            const baseUrl = await this.resolveGatewayHttpBase();
+            if (!baseUrl) {
+                throw new Error('Gateway address unavailable. Start the worker to obtain the current gateway URL.');
+            }
             const fileName = `${fileHash}${result.extension}`;
             const pictureUrl = `${baseUrl}/pfp/${fileName}`;
 
@@ -985,9 +1093,10 @@ function integrateNostrRelays(App) {
             const buffer = result.buffer;
             const fileHash = await NostrUtils.computeSha256(buffer);
             const base64 = result.base64 || uint8ArrayToBase64(buffer);
-            const gatewaySettings = await HypertunaUtils.getGatewaySettings();
-            const cachedSettings = HypertunaUtils.getCachedGatewaySettings() || {};
-            const baseUrl = (gatewaySettings.gatewayUrl || cachedSettings.gatewayUrl || '').replace(/\/$/, '');
+            const baseUrl = await this.resolveGatewayHttpBase();
+            if (!baseUrl) {
+                throw new Error('Gateway address unavailable. Start the worker to obtain the current gateway URL.');
+            }
             const fileName = `${fileHash}${result.extension}`;
             const pictureUrl = `${baseUrl}/pfp/${fileName}`;
 
@@ -1035,8 +1144,20 @@ function integrateNostrRelays(App) {
 
         try {
             const config = this.currentUser.hypertunaConfig;
-            const gatewaySettings = await HypertunaUtils.getGatewaySettings();
-            const placeholderGateway = gatewaySettings.gatewayUrl;
+            const runtimeInfo = GatewayRuntimeStore.getInfo();
+            let placeholderGateway = runtimeInfo?.httpBaseUrl || null;
+            if (!placeholderGateway) {
+                const gatewaySettings = await HypertunaUtils.getGatewaySettings();
+                const candidate = gatewaySettings?.gatewayUrl;
+                if (candidate) {
+                    try {
+                        const parsed = new URL(candidate);
+                        if (!HypertunaUtils.isLoopbackHost(parsed.host)) {
+                            placeholderGateway = candidate;
+                        }
+                    } catch (_) {}
+                }
+            }
 
             const pubkeyInput = document.getElementById('hypertuna-pubkey-display');
             if (pubkeyInput) {
@@ -1050,8 +1171,15 @@ function integrateNostrRelays(App) {
 
             const gatewayInput = document.getElementById('hypertuna-gateway-url');
             if (gatewayInput) {
-                gatewayInput.placeholder = placeholderGateway;
-                gatewayInput.value = config.gatewayUrl || placeholderGateway;
+                gatewayInput.placeholder = placeholderGateway || '';
+                const existing = config.gatewayUrl;
+                if (existing && !HypertunaUtils.isLoopbackHost(existing)) {
+                    gatewayInput.value = existing;
+                } else if (placeholderGateway) {
+                    gatewayInput.value = placeholderGateway;
+                } else {
+                    gatewayInput.value = '';
+                }
             }
 
             const togglePrivBtn = document.getElementById('btn-toggle-hypertuna-privkey');
@@ -2338,9 +2466,22 @@ App.syncHypertunaConfigToFile = async function() {
             );
 
             // Send the event to the gateway
-            const gatewaySettings = await HypertunaUtils.getGatewaySettings();
-            const gatewayUrl = this.currentUser.hypertunaConfig?.gatewayUrl || gatewaySettings.gatewayUrl;
-            const response = await fetch(`${gatewayUrl}/post/join/${this.currentGroupId}`, {
+            let gatewayBase = await this.resolveGatewayHttpBase();
+            const configGateway = this.currentUser.hypertunaConfig?.gatewayUrl || null;
+            if (!gatewayBase && configGateway) {
+                try {
+                    const parsed = new URL(configGateway);
+                    if (!HypertunaUtils.isLoopbackHost(parsed.host)) {
+                        gatewayBase = configGateway.replace(/\/$/, '');
+                    }
+                } catch (_) {}
+            }
+
+            if (!gatewayBase) {
+                throw new Error('Gateway address unavailable. Start the worker to obtain the current gateway URL.');
+            }
+
+            const response = await fetch(`${gatewayBase}/post/join/${this.currentGroupId}`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ event })
@@ -2849,7 +2990,7 @@ App.loadDiscoverRelays = async function(force = false) {
             const hypertunaId = groupData?.hypertunaId || identifier;
             const avatarUrl = metadata.avatarUrl || (groupData ? this.resolveGroupAvatar(groupData) : null);
             const gatewayPath = this.normalizeGatewayPath(identifier, metadata);
-            const connectionUrl = gatewayPath ? `${gatewayBaseUrl}/${gatewayPath}` : null;
+            const connectionUrl = gatewayBaseUrl && gatewayPath ? `${gatewayBaseUrl}/${gatewayPath}` : null;
 
             entries.push({
                 identifier,

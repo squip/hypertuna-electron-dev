@@ -3,6 +3,7 @@
 // Desktop controller logic for Hypertuna when running inside Electron.
 import { ConfigLogger } from './ConfigLogger.js';
 import { HypertunaUtils } from './HypertunaUtils.js';
+import { GatewayRuntimeStore } from './GatewayRuntimeStore.js';
 
 const electronAPI = window.electronAPI || null;
 const isElectron = !!electronAPI;
@@ -926,21 +927,40 @@ async function handleWorkerMessage(message) {
     case 'gateway-url-updated':
       if (message.gatewayUrl) {
         console.log('[App] Gateway URL updated:', message.gatewayUrl)
-        HypertunaUtils.persistGatewaySettings(message.gatewayUrl).catch((error) => {
-          console.error('[App] Failed to persist gateway settings from worker:', error)
-        })
-        if (window.App && window.App.currentUser && window.App.currentUser.hypertunaConfig) {
-          window.App.currentUser.hypertunaConfig.gatewayUrl = message.gatewayUrl
-          if (message.proxyHost) {
-            window.App.currentUser.hypertunaConfig.proxy_server_address = message.proxyHost
+        let shouldPersist = true
+        try {
+          const parsed = new URL(message.gatewayUrl)
+          if (HypertunaUtils.isLoopbackHost(parsed.hostname)) {
+            shouldPersist = false
           }
-          if (message.proxyWebsocketProtocol) {
-            window.App.currentUser.hypertunaConfig.proxy_websocket_protocol = message.proxyWebsocketProtocol
-          }
-          if (typeof window.App.saveUserToLocalStorage === 'function') {
-            window.App.saveUserToLocalStorage()
+        } catch (_) {
+          shouldPersist = true
+        }
+
+        if (shouldPersist) {
+          HypertunaUtils.persistGatewaySettings(message.gatewayUrl).catch((error) => {
+            console.error('[App] Failed to persist gateway settings from worker:', error)
+          })
+          if (window.App && window.App.currentUser && window.App.currentUser.hypertunaConfig) {
+            window.App.currentUser.hypertunaConfig.gatewayUrl = message.gatewayUrl
+            if (message.proxyHost) {
+              window.App.currentUser.hypertunaConfig.proxy_server_address = message.proxyHost
+            }
+            if (message.proxyWebsocketProtocol) {
+              window.App.currentUser.hypertunaConfig.proxy_websocket_protocol = message.proxyWebsocketProtocol
+            }
+            if (typeof window.App.saveUserToLocalStorage === 'function') {
+              window.App.saveUserToLocalStorage()
+            }
           }
         }
+      }
+      break
+
+    case 'gateway-runtime-info':
+      GatewayRuntimeStore.update(message.info || null)
+      if (window.App && typeof window.App.handleGatewayRuntimeUpdate === 'function') {
+        window.App.handleGatewayRuntimeUpdate(message.info || null)
       }
       break
 
@@ -978,6 +998,7 @@ async function handleWorkerMessage(message) {
       } else {
         updateGatewayPeerState({})
       }
+      GatewayRuntimeStore.update(null)
       break
 
     case 'gateway-error':

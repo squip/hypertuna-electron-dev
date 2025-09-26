@@ -13,6 +13,8 @@ import { prepareFileAttachment } from './FileAttachmentHelper.js';
 const electronAPI = window.electronAPI || null;
 const isElectron = !!electronAPI;
 
+const LOOPBACK_HOST_REGEX = /^(?:127\.0\.0\.1|localhost)$/i;
+
 function sendWorkerMessage(message) {
     if (!isElectron || !electronAPI?.sendToWorker) {
         return Promise.resolve({ success: false, error: 'Worker bridge unavailable' });
@@ -62,6 +64,9 @@ class NostrGroupClient {
         this.groupSubscriptions = new Map(); // Map of groupId -> Set of subscription IDs
         this.invites = new Map(); // Map of inviteId -> invite data
         this.joinRequests = new Map(); // Map of groupId -> Map of pubkey -> event
+
+        this.gatewayRuntimeBase = null;
+        this.gatewayRuntimeHost = null;
 
         // Setup default event handlers
         this._setupEventHandlers();
@@ -283,15 +288,22 @@ class NostrGroupClient {
      */
     queueRelayConnection(publicIdentifier, relayUrl) {
         if (!this.pendingRelayConnections.has(publicIdentifier)) {
-            this.pendingRelayConnections.set(publicIdentifier, {
+            const entry = {
                 identifier: publicIdentifier,
                 relayUrl,  // May be base URL; token appended once initialized
                 attempts: 0,
                 status: 'pending',
                 isInitialized: false,
-                isRegistered: false
-            });
+                isRegistered: false,
+                gatewayPath: null,
+                originalQuery: '',
+                authToken: null,
+                baseHost: null,
+                isGatewayManaged: undefined
+            };
+            this.pendingRelayConnections.set(publicIdentifier, entry);
             console.log(`[NostrGroupClient] Queued connection for relay ${publicIdentifier} with URL ${relayUrl}`);
+            this._captureGatewayMetadata(entry);
     
             // Apply any readiness state that arrived before queueing
             if (this.relayReadyStates.has(publicIdentifier)) {
@@ -300,26 +312,25 @@ class NostrGroupClient {
                 
                 if (state.isInitialized) {
                     connection.isInitialized = true;
-                    // Prefer the URL from state if it has a token
-                    if (state.relayUrl && state.relayUrl.includes('?token=')) {
-                        connection.relayUrl = state.relayUrl;
-                    }
+                }
+                if (state.relayUrl) {
+                    connection.relayUrl = state.relayUrl;
+                    this._captureGatewayMetadata(connection);
                 }
                 if (state.isRegistered) {
                     connection.isRegistered = true;
                 }
-                if (state.authToken && !connection.relayUrl.includes('?token=')) {
-                    // Append token if not already present
-                    try {
-                        const u = new URL(connection.relayUrl);
-                        u.searchParams.set('token', state.authToken);
-                        connection.relayUrl = u.toString();
-                    } catch (e) {
-                        console.warn('Failed to append token to URL:', e);
-                    }
+                if (state.authToken) {
+                    this._applyAuthToken(connection, state.authToken);
                 }
                 
                 this._attemptConnectionIfReady(publicIdentifier);
+            }
+        } else {
+            const existing = this.pendingRelayConnections.get(publicIdentifier);
+            if (relayUrl && relayUrl !== existing.relayUrl) {
+                existing.relayUrl = relayUrl;
+                this._captureGatewayMetadata(existing);
             }
         }
     }
@@ -339,23 +350,20 @@ class NostrGroupClient {
             console.log(`[NostrGroupClient] Mapped internal key ${identifier} to public identifier ${targetId}`);
         }
     
-        // Always prefer URLs with tokens
         const connection = this.pendingRelayConnections.get(targetId);
         if (connection) {
-            // Only update URL if the new one has a token or the existing one doesn't
-            const newUrlHasToken = gatewayUrl && gatewayUrl.includes('?token=');
-            const existingUrlHasToken = connection.relayUrl && connection.relayUrl.includes('?token=');
-            
-            if (newUrlHasToken || !existingUrlHasToken) {
-                connection.relayUrl = gatewayUrl;
-                console.log(`[NostrGroupClient] Updated relay URL for ${targetId} to: ${gatewayUrl}`);
-            }
-            
             connection.isInitialized = true;
+            if (gatewayUrl) {
+                connection.relayUrl = gatewayUrl;
+                this._captureGatewayMetadata(connection);
+            }
             if (authToken) {
                 this.relayAuthTokens.set(targetId, authToken);
+                this._applyAuthToken(connection, authToken);
+            } else if (connection.authToken) {
+                this._applyAuthToken(connection, connection.authToken);
             }
-            
+
             console.log(`[NostrGroupClient] Relay ${targetId} is now initialized. Checking readiness...`);
             this._attemptConnectionIfReady(targetId);
         } else {
@@ -377,7 +385,7 @@ class NostrGroupClient {
     // Update _attemptConnectionIfReady to add more logging:
     async _attemptConnectionIfReady(identifier) {
         const connection = this.pendingRelayConnections.get(identifier);
-    
+
         if (!connection) {
             console.log(`[NostrGroupClient] No pending connection for ${identifier} yet.`);
             return;
@@ -419,6 +427,38 @@ class NostrGroupClient {
         }
     }
 
+    setGatewayBase(baseUrl) {
+        const normalized = this._normalizeBaseUrl(baseUrl);
+        if (normalized === this.gatewayRuntimeBase) {
+            return;
+        }
+
+        const previous = this.gatewayRuntimeBase;
+        this.gatewayRuntimeBase = normalized;
+        this.gatewayRuntimeHost = this._extractHostFromBase(normalized);
+
+        console.log('[NostrGroupClient] Gateway base updated:', {
+            previous,
+            next: normalized,
+            host: this.gatewayRuntimeHost
+        });
+
+        for (const connection of this.pendingRelayConnections.values()) {
+            this._captureGatewayMetadata(connection);
+            if (!connection.isGatewayManaged) continue;
+
+            this._rebuildGatewayUrl(connection);
+
+            if (connection.status !== 'pending') {
+                connection.status = 'pending';
+            }
+
+            if (connection.isInitialized && connection.isRegistered) {
+                this._attemptConnectionIfReady(connection.identifier);
+            }
+        }
+    }
+
     /**
      * Handle relay registered signal from the app layer.
      * This is the final signal to proceed with the connection.
@@ -444,6 +484,27 @@ class NostrGroupClient {
         this.relayReadyStates.set(targetId, {
             ...existing,
             isRegistered: true
+        });
+    }
+
+    async waitForGatewayBase(timeoutMs = 3000) {
+        if (this.gatewayRuntimeBase) {
+            return this.gatewayRuntimeBase;
+        }
+
+        return new Promise((resolve, reject) => {
+            const timeout = setTimeout(() => {
+                unsubscribe();
+                reject(new Error('Gateway base unavailable'));
+            }, timeoutMs);
+
+            const unsubscribe = window.GatewayRuntimeStore?.subscribe?.((info) => {
+                if (!info?.wsBaseUrl) return;
+                clearTimeout(timeout);
+                unsubscribe();
+                this.setGatewayBase(info.wsBaseUrl);
+                resolve(this.gatewayRuntimeBase);
+            }) || (() => {});
         });
     }
 
@@ -3286,6 +3347,102 @@ async fetchMultipleProfiles(pubkeys) {
                 console.error(`Error in event listener for ${eventName}:`, e);
             }
         });
+    }
+
+    _captureGatewayMetadata(connection) {
+        if (!connection || !connection.relayUrl) {
+            return;
+        }
+
+        try {
+            const parsed = new URL(connection.relayUrl);
+            connection.gatewayPath = parsed.pathname.replace(/^\/+/, '') || null;
+            connection.originalQuery = parsed.search || '';
+            connection.baseHost = parsed.host;
+
+            const token = parsed.searchParams.get('token');
+            if (token) {
+                connection.authToken = token;
+            }
+
+            const isManaged = this._isLoopbackHost(parsed.hostname) || (this.gatewayRuntimeHost && parsed.host === this.gatewayRuntimeHost);
+            if (isManaged) {
+                connection.isGatewayManaged = true;
+            } else if (connection.isGatewayManaged === undefined) {
+                connection.isGatewayManaged = false;
+            }
+        } catch (error) {
+            console.warn('[NostrGroupClient] Failed to capture gateway metadata:', error);
+        }
+    }
+
+    _applyAuthToken(connection, token) {
+        if (!connection) return;
+        connection.authToken = token;
+
+        if (connection.relayUrl) {
+            try {
+                const url = new URL(connection.relayUrl);
+                url.searchParams.set('token', token);
+                connection.relayUrl = url.toString();
+            } catch (error) {
+                console.warn('[NostrGroupClient] Failed to apply auth token to URL:', error);
+                const separator = connection.relayUrl.includes('?') ? '&' : '?';
+                connection.relayUrl = `${connection.relayUrl}${separator}token=${token}`;
+            }
+        }
+
+        this._rebuildGatewayUrl(connection);
+    }
+
+    _rebuildGatewayUrl(connection) {
+        if (!connection || !connection.isGatewayManaged) {
+            return;
+        }
+        if (!this.gatewayRuntimeBase || !connection.gatewayPath) {
+            return;
+        }
+
+        try {
+            const base = this.gatewayRuntimeBase.replace(/\/$/, '');
+            const rebuilt = new URL(`${base}/${connection.gatewayPath}`);
+            if (connection.authToken) {
+                rebuilt.searchParams.set('token', connection.authToken);
+            } else if (connection.originalQuery) {
+                rebuilt.search = connection.originalQuery;
+            }
+            connection.relayUrl = rebuilt.toString();
+            connection.baseHost = rebuilt.host;
+        } catch (error) {
+            console.warn('[NostrGroupClient] Failed to rebuild gateway URL:', error);
+        }
+    }
+
+    _normalizeBaseUrl(baseUrl) {
+        if (!baseUrl) return null;
+        try {
+            const parsed = new URL(baseUrl);
+            return `${parsed.protocol}//${parsed.host}`;
+        } catch (_) {
+            if (typeof baseUrl !== 'string') return null;
+            const trimmed = baseUrl.trim();
+            if (!trimmed) return null;
+            return trimmed.replace(/\/$/, '');
+        }
+    }
+
+    _extractHostFromBase(base) {
+        if (!base) return null;
+        try {
+            return new URL(base).host;
+        } catch (_) {
+            return base.replace(/^wss?:\/\//, '').replace(/\/$/, '');
+        }
+    }
+
+    _isLoopbackHost(hostname) {
+        if (!hostname) return false;
+        return LOOPBACK_HOST_REGEX.test(hostname.toLowerCase());
     }
 }
 

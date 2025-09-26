@@ -86,6 +86,59 @@ function deriveGatewayHostFromStatus(status) {
   }
 }
 
+function buildGatewayRuntimeInfo(status) {
+  if (!status || !status.urls) {
+    return null
+  }
+
+  let wsBaseUrl = status.urls.hostname || null
+  const localUrls = Array.isArray(status.urls.local) ? status.urls.local : []
+  if (!wsBaseUrl && localUrls.length > 0) {
+    wsBaseUrl = localUrls[0]
+  }
+
+  let httpBaseUrl = null
+  let proxyHost = null
+  let protocol = null
+
+  if (wsBaseUrl) {
+    try {
+      const parsed = new URL(wsBaseUrl)
+      proxyHost = parsed.host
+      protocol = parsed.protocol
+      const httpProtocol = protocol === 'wss:' ? 'https:' : 'http:'
+      httpBaseUrl = `${httpProtocol}//${parsed.host}`
+      wsBaseUrl = `${parsed.protocol}//${parsed.host}`
+    } catch (error) {
+      console.warn('[Worker] Failed to build runtime info from ws URL:', error)
+    }
+  }
+
+  if (!proxyHost && typeof status.hostname === 'string' && status.port) {
+    proxyHost = `${status.hostname}:${status.port}`
+    wsBaseUrl = `${status.secure ? 'wss' : 'ws'}://${proxyHost}`
+    httpBaseUrl = `${status.secure ? 'https' : 'http'}://${proxyHost}`
+  }
+
+  if (!proxyHost) {
+    return null
+  }
+
+  return {
+    wsBaseUrl,
+    httpBaseUrl,
+    proxyHost,
+    port: status.port || null,
+    isLoopback: isLoopbackHost(proxyHost),
+    timestamp: Date.now()
+  }
+}
+
+function emitGatewayRuntimeInfo(status) {
+  const info = buildGatewayRuntimeInfo(status)
+  sendMessage({ type: 'gateway-runtime-info', info })
+}
+
 async function initializeGatewayOptionsFromSettings() {
   try {
     const settings = await loadGatewaySettings()
@@ -173,17 +226,22 @@ async function startGatewayService(options = {}) {
         gatewayOptions.hostname = status.hostname
       }
       sendMessage({ type: 'gateway-status', status })
+      emitGatewayRuntimeInfo(status)
       if (status?.running) {
         const { httpUrl, proxyHost, wsProtocol } = deriveGatewayHostFromStatus(status)
         if (!gatewaySettingsApplied) {
+          const settingsUpdate = {
+            advertiseLan: !!gatewayOptions.detectLanAddresses,
+            detectPublicIp: !!gatewayOptions.detectPublicIp
+          }
+          if (!isLoopbackHost(proxyHost)) {
+            settingsUpdate.gatewayUrl = httpUrl
+            settingsUpdate.proxyHost = proxyHost
+            settingsUpdate.proxyWebsocketProtocol = wsProtocol
+          }
+
           try {
-            await updateGatewaySettings({
-              gatewayUrl: httpUrl,
-              proxyHost,
-              proxyWebsocketProtocol: wsProtocol,
-              advertiseLan: !!gatewayOptions.detectLanAddresses,
-              detectPublicIp: !!gatewayOptions.detectPublicIp
-            })
+            await updateGatewaySettings(settingsUpdate)
             gatewaySettingsApplied = true
           } catch (error) {
             console.error('[Worker] Failed to update gateway settings:', error)
@@ -225,6 +283,7 @@ async function startGatewayService(options = {}) {
     if (typeof status?.hostname === 'string' && status.hostname) {
       mergedOptions.hostname = status.hostname
     }
+    emitGatewayRuntimeInfo(status)
     gatewayOptions = mergedOptions
   } catch (error) {
     console.error('[Worker] Failed to start gateway service:', error)
@@ -236,6 +295,7 @@ async function stopGatewayService() {
   if (!gatewayService) return
   try {
     await gatewayService.stop()
+    emitGatewayRuntimeInfo(null)
   } catch (error) {
     console.error('[Worker] Failed to stop gateway service:', error)
     throw error
@@ -286,6 +346,10 @@ function stripLoopbackPort(host) {
   if (typeof host !== 'string') return host
   if (!LOOPBACK_HOST_REGEX.test(host)) return host
   return host.replace(/:(\d+)$/, '')
+}
+
+function isLoopbackHost(host) {
+  return typeof host === 'string' && LOOPBACK_HOST_REGEX.test(host)
 }
 
 function sanitizeLoopbackHost(host, fallback = '127.0.0.1') {

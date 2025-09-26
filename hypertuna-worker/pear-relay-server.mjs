@@ -56,7 +56,7 @@ function isLoopbackHost(host) {
 
 function stripLoopbackHostPort(host) {
   if (!isLoopbackHost(host)) return host;
-  return host.replace(/:(\d+)$/, '');
+  return host.trim();
 }
 
 function stripLoopbackUrlPort(url) {
@@ -64,11 +64,11 @@ function stripLoopbackUrlPort(url) {
   try {
     const parsed = new URL(url);
     if (isLoopbackHost(parsed.host)) {
-      parsed.port = '';
       parsed.pathname = '';
       parsed.search = '';
       parsed.hash = '';
-      return `${parsed.protocol}//${parsed.hostname}`;
+      const hostPort = parsed.host || parsed.hostname;
+      return `${parsed.protocol}//${hostPort}`;
     }
     return parsed.toString();
   } catch (_) {

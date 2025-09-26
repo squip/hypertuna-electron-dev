@@ -68,6 +68,34 @@ function deriveProxyHost(value) {
   }
 }
 
+function isLoopbackHost(host) {
+  if (typeof host !== 'string') return false;
+  const trimmed = host.trim().toLowerCase();
+  return trimmed === 'localhost' || trimmed === '127.0.0.1' || trimmed === 'localhost:' || trimmed.startsWith('localhost:') || trimmed.startsWith('127.0.0.1:');
+}
+
+function stripLoopbackPort(host) {
+  if (!isLoopbackHost(host)) return host;
+  return host.replace(/:(\d+)$/, '');
+}
+
+function stripLoopbackGatewayUrl(url) {
+  if (typeof url !== 'string') return url;
+  try {
+    const parsed = new URL(url);
+    if (isLoopbackHost(parsed.host)) {
+      parsed.port = '';
+      parsed.pathname = '';
+      parsed.search = '';
+      parsed.hash = '';
+      return `${parsed.protocol}//${parsed.hostname}`;
+    }
+    return parsed.toString();
+  } catch (_) {
+    return url;
+  }
+}
+
 function deriveProxyWebsocketProtocol(value) {
   if (!value || typeof value !== 'string') return DEFAULT_SETTINGS.proxyWebsocketProtocol;
   try {
@@ -96,6 +124,14 @@ function withDefaults(raw = {}) {
 
   if (!merged.proxyWebsocketProtocol) {
     merged.proxyWebsocketProtocol = deriveProxyWebsocketProtocol(merged.gatewayUrl);
+  }
+
+  if (merged.proxyHost && isLoopbackHost(merged.proxyHost)) {
+    merged.proxyHost = stripLoopbackPort(merged.proxyHost);
+  }
+
+  if (merged.gatewayUrl) {
+    merged.gatewayUrl = stripLoopbackGatewayUrl(merged.gatewayUrl);
   }
 
   return merged;

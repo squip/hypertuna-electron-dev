@@ -173,6 +173,7 @@ export class GatewayService extends EventEmitter {
     this.peerHealthManager = new PeerHealthManager();
     this.activePeers = [];
     this.activeRelays = new Map();
+    this.gatewayPathIndex = new Map();
     this.wsConnections = new Map();
     this.messageQueues = new Map();
     this.logs = [];
@@ -667,7 +668,29 @@ export class GatewayService extends EventEmitter {
         return res.status(503).json({ error: 'No Hyperswarm peers available' });
       }
 
-      const targetPeer = hyperswarmPeers[Math.floor(Math.random() * hyperswarmPeers.length)];
+      let targetPeer = null;
+      const relayTarget = this._extractRelayIdentifierFromRequest(req);
+
+      if (relayTarget.matched) {
+        if (!relayTarget.identifier) {
+          return res.status(404).json({ error: 'Relay not found' });
+        }
+
+        if (!this.activeRelays.has(relayTarget.identifier)) {
+          return res.status(404).json({ error: 'Relay not found' });
+        }
+
+        const healthyPeer = await this.findHealthyPeerForRelay(relayTarget.identifier, true);
+        if (!healthyPeer) {
+          return res.status(503).json({ error: 'No healthy peers available for this relay' });
+        }
+        targetPeer = healthyPeer;
+      }
+
+      if (!targetPeer) {
+        targetPeer = hyperswarmPeers[Math.floor(Math.random() * hyperswarmPeers.length)];
+      }
+
       try {
         const response = await forwardRequestToPeer(targetPeer, {
           method: req.method,
@@ -762,6 +785,9 @@ export class GatewayService extends EventEmitter {
 
         const prevMetadata = relayData.metadata || {};
         const nextMetadata = { ...prevMetadata };
+        const previousGatewayPath = typeof prevMetadata.gatewayPath === 'string'
+          ? prevMetadata.gatewayPath
+          : null;
 
         if (relayObj.name && relayObj.name !== prevMetadata.name) {
           nextMetadata.name = relayObj.name;
@@ -799,6 +825,8 @@ export class GatewayService extends EventEmitter {
         }
 
         relayData.metadata = nextMetadata;
+
+        this._recordRelayPaths(identifier, nextMetadata.gatewayPath || null, previousGatewayPath);
       });
     }
 
@@ -882,6 +910,107 @@ export class GatewayService extends EventEmitter {
     }
     const parsed = Date.parse(value);
     return Number.isFinite(parsed) ? parsed : null;
+  }
+
+  _normalizeRelayIdentifier(value) {
+    if (!value || typeof value !== 'string') return null;
+    const trimmed = value.trim().replace(/^\/+|\/+$/g, '');
+    if (!trimmed) return null;
+
+    if (trimmed.includes(':')) {
+      return trimmed;
+    }
+
+    const parts = trimmed.split('/').filter(Boolean);
+    if (parts.length >= 2) {
+      return `${parts[0]}:${parts.slice(1).join('/')}`;
+    }
+    return trimmed;
+  }
+
+  _identifierToPath(identifier) {
+    if (!identifier || typeof identifier !== 'string') return null;
+    return identifier.replace(':', '/');
+  }
+
+  _normalizePathKey(value) {
+    if (!value || typeof value !== 'string') return null;
+    return value.trim().replace(/^\/+|\/+$/g, '');
+  }
+
+  _recordRelayPaths(identifier, gatewayPath = null, previousGatewayPath = null) {
+    const normalizedIdentifier = this._normalizeRelayIdentifier(identifier);
+    if (!normalizedIdentifier) return;
+
+    const identifierPath = this._identifierToPath(normalizedIdentifier);
+    const identifierKey = this._normalizePathKey(identifierPath);
+    if (identifierKey) {
+      this.gatewayPathIndex.set(identifierKey, normalizedIdentifier);
+    }
+
+    if (previousGatewayPath) {
+      const previousKey = this._normalizePathKey(previousGatewayPath);
+      if (previousKey && this.gatewayPathIndex.get(previousKey) === normalizedIdentifier) {
+        this.gatewayPathIndex.delete(previousKey);
+      }
+    }
+
+    if (gatewayPath) {
+      const pathKey = this._normalizePathKey(gatewayPath);
+      if (pathKey) {
+        this.gatewayPathIndex.set(pathKey, normalizedIdentifier);
+      }
+    }
+  }
+
+  _extractRelayIdentifierFromRequest(req) {
+    const result = { identifier: null, matched: false };
+
+    const rawPath = typeof req?.path === 'string' && req.path
+      ? req.path
+      : typeof req?.url === 'string'
+        ? req.url
+        : '';
+    if (!rawPath) {
+      return result;
+    }
+
+    const sanitizedPath = rawPath.split('?')[0];
+    const segments = sanitizedPath.split('/').filter(Boolean);
+    if (!segments.length) {
+      return result;
+    }
+
+    const maybeJoinOrRelay = (segments[0] === 'post' &&
+      (segments[1] === 'join' || segments[1] === 'relay'))
+      ? segments.slice(2)
+      : null;
+
+    if (maybeJoinOrRelay && maybeJoinOrRelay.length) {
+      result.matched = true;
+      const identifierCandidate = this._normalizeRelayIdentifier(maybeJoinOrRelay.join('/'));
+      result.identifier = identifierCandidate;
+      return result;
+    }
+
+    for (let i = segments.length; i >= 2; i--) {
+      const candidatePath = this._normalizePathKey(segments.slice(0, i).join('/'));
+      if (!candidatePath) continue;
+      if (this.gatewayPathIndex.has(candidatePath)) {
+        result.matched = true;
+        result.identifier = this.gatewayPathIndex.get(candidatePath) || null;
+        return result;
+      }
+    }
+
+    const lastSegment = segments[segments.length - 1];
+    const normalizedIdentifier = this._normalizeRelayIdentifier(lastSegment);
+    if (normalizedIdentifier && normalizedIdentifier.includes(':')) {
+      result.matched = true;
+      result.identifier = normalizedIdentifier;
+    }
+
+    return result;
   }
 
   _normalizeGatewayPath(identifier, gatewayPath = null, legacyUrl = null) {
