@@ -49,6 +49,33 @@ import {
 import { getFile, getPfpFile } from './hyperdrive-manager.mjs';
 import { loadGatewaySettings, getCachedGatewaySettings } from '../shared/config/GatewaySettings.mjs';
 
+function isLoopbackHost(host) {
+  if (typeof host !== 'string') return false;
+  return /^(?:127\.0\.0\.1|localhost)(?::\d+)?$/.test(host.trim());
+}
+
+function stripLoopbackHostPort(host) {
+  if (!isLoopbackHost(host)) return host;
+  return host.replace(/:(\d+)$/, '');
+}
+
+function stripLoopbackUrlPort(url) {
+  if (typeof url !== 'string') return url;
+  try {
+    const parsed = new URL(url);
+    if (isLoopbackHost(parsed.host)) {
+      parsed.port = '';
+      parsed.pathname = '';
+      parsed.search = '';
+      parsed.hash = '';
+      return `${parsed.protocol}//${parsed.hostname}`;
+    }
+    return parsed.toString();
+  } catch (_) {
+    return url;
+  }
+}
+
 
 // Global state
 let config = null;
@@ -57,6 +84,7 @@ let gatewayRegistrationInterval = null;
 let gatewayConnection = null;
 let pendingRegistrations = []; // Queue registrations until gateway connects
 let connectedPeers = new Map(); // Track all connected peers
+let autoConnectDeferred = false;
 
 // Enhanced health state tracking
 let healthState = {
@@ -137,6 +165,14 @@ export async function initializeRelayServer(customConfig = {}) {
     pfpDriveKey: customConfig.pfpDriveKey || null,
     ...customConfig
   };
+
+  if (isLoopbackHost(config.proxy_server_address)) {
+    config.proxy_server_address = stripLoopbackHostPort(config.proxy_server_address);
+  }
+
+  if (typeof config.gatewayUrl === 'string') {
+    config.gatewayUrl = stripLoopbackUrlPort(config.gatewayUrl);
+  }
   
   console.log('[RelayServer] Configuration:', {
     proxy_server_address: config.proxy_server_address,
@@ -165,62 +201,29 @@ export async function initializeRelayServer(customConfig = {}) {
   // Auto-connect to stored relays
   try {
     console.log('[RelayServer] Starting auto-connection to stored relays...');
-    const connectedRelays = await autoConnectStoredRelays(config);
+
+    let connectedRelays = [];
+
+    if (isLoopbackHost(config.proxy_server_address) && !config.proxy_server_address.includes(':')) {
+      autoConnectDeferred = true;
+      console.log('[RelayServer] Auto-connect deferred until gateway port assignment');
+    } else {
+      connectedRelays = await autoConnectStoredRelays(config);
+      console.log('[RelayServer] Auto-connected relays:', connectedRelays.length);
+    }
+
     console.log(`[RelayServer] Auto-connected to ${connectedRelays.length} relays`);
-    
+
     // Update health state after auto-connect
     await updateHealthState();
-    
-    // If we have relays and gateway registration is enabled, register them
-    if (connectedRelays.length > 0 && config.registerWithGateway) {
-        console.log('[RelayServer] Registering auto-connected relays with gateway...');
-        
-        // Register each connected relay
-        for (const relayKey of connectedRelays) {
-            try {
-                const profile = await getRelayProfileByKey(relayKey);
-                if (profile) {
-                  await registerWithGateway(profile);
 
-                  // Determine auth token for current user if required
-                  let userAuthToken = null;
-                  if (profile.auth_config?.requiresAuth && config.nostr_pubkey_hex) {
-                      const authorizedUsers = calculateAuthorizedUsers(
-                          profile.auth_config.auth_adds || [],
-                          profile.auth_config.auth_removes || []
-                      );
-                      const userAuth = authorizedUsers.find(u => u.pubkey === config.nostr_pubkey_hex);
-                      userAuthToken = userAuth?.token || null;
-                  }
-              
-                  // Build connection URL including public identifier and token
-                  const identifierPath = profile.public_identifier ?
-                      profile.public_identifier.replace(':', '/') :
-                      relayKey;
-                  const baseUrl = `${buildGatewayWebsocketBase(config)}/${identifierPath}`;
-                  const connectionUrl = userAuthToken ? `${baseUrl}?token=${userAuthToken}` : baseUrl;
-              
-                  // Send registration complete message with CORRECT URL
-                  if (global.sendMessage) {
-                      global.sendMessage({
-                          type: 'relay-registration-complete',
-                          relayKey: relayKey,
-                          publicIdentifier: profile.public_identifier,
-                          gatewayUrl: connectionUrl,  // Use the full authenticated URL
-                          authToken: userAuthToken,
-                          timestamp: new Date().toISOString()
-                      });
-                  }
-              }
-            } catch (regError) {
-                console.error(`[RelayServer] Failed to register relay ${relayKey}:`, regError);
-            }
-        }
+    if (connectedRelays.length > 0) {
+      await announceRelaysToGateway(connectedRelays);
     }
 } catch (error) {
     console.error('[RelayServer] Error during auto-connection:', error);
 }
-  
+
   // Start internal health monitoring
   startHealthMonitoring();
   
@@ -264,13 +267,114 @@ export async function initializeRelayServer(customConfig = {}) {
   return true;
 }
 
+export async function updateGatewayConnectionSettings(update = {}) {
+  if (!config) {
+    console.warn('[RelayServer] updateGatewayConnectionSettings called before initialization');
+    return {
+      proxy_server_address: null,
+      gatewayUrl: null,
+      proxy_websocket_protocol: null
+    };
+  }
+
+  const {
+    gatewayUrl = null,
+    proxyHost = null,
+    proxyProtocol = null
+  } = update;
+
+  let changed = false;
+
+  if (typeof proxyHost === 'string' && proxyHost && proxyHost !== config.proxy_server_address) {
+    config.proxy_server_address = proxyHost;
+    changed = true;
+  }
+
+  if (typeof gatewayUrl === 'string' && gatewayUrl && gatewayUrl !== config.gatewayUrl) {
+    config.gatewayUrl = gatewayUrl;
+    changed = true;
+  }
+
+  if (typeof proxyProtocol === 'string' && proxyProtocol && proxyProtocol !== config.proxy_websocket_protocol) {
+    config.proxy_websocket_protocol = proxyProtocol;
+    changed = true;
+  }
+
+  if (!changed) {
+    return {
+      proxy_server_address: config.proxy_server_address,
+      gatewayUrl: config.gatewayUrl,
+      proxy_websocket_protocol: config.proxy_websocket_protocol
+    };
+  }
+
+  console.log('[RelayServer] Gateway connection settings updated:', {
+    proxy_server_address: config.proxy_server_address,
+    gatewayUrl: config.gatewayUrl,
+    proxy_websocket_protocol: config.proxy_websocket_protocol
+  });
+
+  try {
+    await saveConfig(config);
+  } catch (error) {
+    console.error('[RelayServer] Failed to persist gateway settings update:', error?.message || error);
+  }
+
+  try {
+    const connectedRelays = await autoConnectStoredRelays(config);
+    console.log('[RelayServer] Broadcast updated gateway URLs for relays:', connectedRelays.length);
+    autoConnectDeferred = false;
+
+    if (connectedRelays.length > 0) {
+      await announceRelaysToGateway(connectedRelays);
+    }
+  } catch (error) {
+    console.error('[RelayServer] Failed to refresh relay connections after gateway update:', error?.message || error);
+  }
+
+  if (config.registerWithGateway) {
+    setTimeout(() => {
+      registerWithGateway(null).catch((error) => {
+        console.error('[RelayServer] Gateway re-registration failed after settings update:', error?.message || error);
+      });
+      processPendingRegistrations().catch((error) => {
+        console.error('[RelayServer] Failed to process pending registrations after gateway update:', error?.message || error);
+      });
+    }, 0);
+  }
+
+  if (global.sendMessage) {
+    global.sendMessage({
+      type: 'gateway-url-updated',
+      gatewayUrl: config.gatewayUrl,
+      proxyHost: config.proxy_server_address,
+      proxyWebsocketProtocol: config.proxy_websocket_protocol
+    });
+  }
+
+  return {
+    proxy_server_address: config.proxy_server_address,
+    gatewayUrl: config.gatewayUrl,
+    proxy_websocket_protocol: config.proxy_websocket_protocol
+  };
+}
+
 function generateHexKey() {
   return crypto.randomBytes(32).toString('hex');
 }
 
 async function saveConfig(configData) {
   const configPath = join(config.storage || '.', 'relay-config.json');
-  await fs.writeFile(configPath, JSON.stringify(configData, null, 2));
+  const persistable = { ...configData };
+
+  if (isLoopbackHost(persistable.proxy_server_address)) {
+    persistable.proxy_server_address = stripLoopbackHostPort(persistable.proxy_server_address);
+  }
+  if (typeof persistable.gatewayUrl === 'string') {
+    persistable.gatewayUrl = stripLoopbackUrlPort(persistable.gatewayUrl);
+  }
+
+  await fs.writeFile(configPath, JSON.stringify(persistable, null, 2));
   console.log('[RelayServer] Config saved to:', configPath);
 }
 
@@ -348,6 +452,52 @@ async function startHyperswarmServer() {
     console.error('[RelayServer] Error stack:', error.stack);
     healthState.services.hyperswarmStatus = 'error';
     throw error;
+  }
+}
+
+async function announceRelaysToGateway(relayKeys = []) {
+  if (!Array.isArray(relayKeys) || relayKeys.length === 0) return;
+
+  console.log('[RelayServer] Announcing relays to gateway:', relayKeys.length);
+
+  for (const relayKey of relayKeys) {
+    try {
+      const profile = await getRelayProfileByKey(relayKey);
+      if (!profile) continue;
+
+      if (config.registerWithGateway) {
+        await registerWithGateway(profile);
+      }
+
+      let userAuthToken = null;
+      if (profile.auth_config?.requiresAuth && config.nostr_pubkey_hex) {
+        const authorizedUsers = calculateAuthorizedUsers(
+          profile.auth_config.auth_adds || [],
+          profile.auth_config.auth_removes || []
+        );
+        const userAuth = authorizedUsers.find((u) => u.pubkey === config.nostr_pubkey_hex);
+        userAuthToken = userAuth?.token || null;
+      }
+
+      const identifierPath = profile.public_identifier
+        ? profile.public_identifier.replace(':', '/')
+        : relayKey;
+      const baseUrl = `${buildGatewayWebsocketBase(config)}/${identifierPath}`;
+      const connectionUrl = userAuthToken ? `${baseUrl}?token=${userAuthToken}` : baseUrl;
+
+      if (global.sendMessage) {
+        global.sendMessage({
+          type: 'relay-registration-complete',
+          relayKey,
+          publicIdentifier: profile.public_identifier,
+          gatewayUrl: connectionUrl,
+          authToken: userAuthToken,
+          timestamp: new Date().toISOString()
+        });
+      }
+    } catch (error) {
+      console.error(`[RelayServer] Failed to announce relay ${relayKey}:`, error?.message || error);
+    }
   }
 }
 
@@ -1795,6 +1945,16 @@ async function registerWithGateway(relayProfileInfo = null, options = {}) {
     console.log('[RelayServer] Gateway registration is DISABLED in config');
     console.log('[RelayServer] ========================================');
     return { skipped: true };
+  }
+
+  if (isLoopbackHost(config.proxy_server_address) && !config.proxy_server_address.includes(':')) {
+    console.log('[RelayServer] Gateway port not yet assigned; deferring registration');
+    if (!skipQueue) {
+      pendingRegistrations.push(relayProfileInfo || null);
+      console.log('[RelayServer] Pending registrations queued (awaiting port assignment):', pendingRegistrations.length);
+    }
+    console.log('[RelayServer] ========================================');
+    return { queued: true };
   }
 
   const publicKey = config.swarmPublicKey;

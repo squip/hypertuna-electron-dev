@@ -21,6 +21,7 @@ const hypercoreCrypto = window.hypercoreCrypto || null;
 const electronAPI = window.electronAPI || null;
 const isElectron = !!electronAPI;
 const ELECTRON_CONFIG_PATH = 'electron-storage/relay-config.json';
+const LOOPBACK_HOST_REGEX = /^(?:127\.0\.0\.1|localhost)(?::\d+)?$/;
 
 export class HypertunaUtils {
     /**
@@ -522,6 +523,8 @@ export class HypertunaUtils {
         // Ensure bech32 values are present (for backward compatibility)
         if (config) {
             const gatewaySettings = await this.getGatewaySettings();
+            config.proxy_server_address = this.sanitizeLoopbackHost(config.proxy_server_address || gatewaySettings.proxyHost);
+            config.gatewayUrl = this.sanitizeLoopbackGatewayUrl(config.gatewayUrl || gatewaySettings.gatewayUrl);
             // Check if bech32 values are missing and generate them
             if (config.nostr_pubkey_hex && !config.nostr_npub) {
                 config.nostr_npub = NostrUtils.hexToNpub(config.nostr_pubkey_hex);
@@ -564,7 +567,7 @@ export class HypertunaUtils {
             }
 
             if (!config.proxy_server_address && gatewaySettings.proxyHost) {
-                config.proxy_server_address = gatewaySettings.proxyHost;
+                config.proxy_server_address = this.sanitizeLoopbackHost(gatewaySettings.proxyHost);
             }
 
             if (!config.proxy_websocket_protocol) {
@@ -631,4 +634,70 @@ export class HypertunaUtils {
         return enhancedConfig;
     }
 
+
+    static sanitizeLoopbackHost(host) {
+        if (typeof host !== 'string' || !host.trim()) return '127.0.0.1';
+        const trimmed = host.trim();
+        if (LOOPBACK_HOST_REGEX.test(trimmed)) {
+            return trimmed.replace(/:(\d+)$/, '') || '127.0.0.1';
+        }
+        return trimmed;
+    }
+
+    static sanitizeLoopbackGatewayUrl(url) {
+        if (typeof url !== 'string' || !url.trim()) return 'http://127.0.0.1';
+        try {
+            const parsed = new URL(url);
+            if (LOOPBACK_HOST_REGEX.test(parsed.host)) {
+                const protocol = parsed.protocol || 'http:';
+                const hostname = parsed.hostname || '127.0.0.1';
+                return `${protocol}//${hostname}`;
+            }
+            return parsed.toString().replace(/\/$/, '');
+        } catch (_) {
+            return 'http://127.0.0.1';
+        }
+    }
+
+    static getRuntimeGatewayHttpBase() {
+        const status = window.currentGatewayStatus;
+        if (status?.urls?.hostname) {
+            try {
+                const wsUrl = new URL(status.urls.hostname);
+                const protocol = wsUrl.protocol === 'wss:' ? 'https:' : 'http:';
+                if (wsUrl.host) {
+                    return `${protocol}//${wsUrl.host}`;
+                }
+            } catch (_) {}
+        }
+
+        if (status && typeof status?.port === 'number' && status.port > 0) {
+            const host = this.sanitizeLoopbackHost(status.hostname || '127.0.0.1');
+            return `http://${host}:${status.port}`;
+        }
+
+        const cached = this.getCachedGatewaySettings();
+        if (cached?.gatewayUrl) {
+            return cached.gatewayUrl;
+        }
+        return 'http://127.0.0.1';
+    }
+
+    static normalizeDriveUrl(url) {
+        if (typeof url !== 'string') return url;
+        try {
+            const parsed = new URL(url);
+            if (!/\/drive\//.test(parsed.pathname)) {
+                return url;
+            }
+
+            const runtimeBase = this.getRuntimeGatewayHttpBase();
+            const runtime = new URL(runtimeBase);
+            parsed.protocol = runtime.protocol;
+            parsed.host = runtime.host;
+            return parsed.toString();
+        } catch (_) {
+            return url;
+        }
+    }
 }

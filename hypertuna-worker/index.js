@@ -74,8 +74,11 @@ function deriveGatewayHostFromStatus(status) {
       }
     }
   } catch (_) {}
-  const port = status?.port || gatewayOptions.port || 8443
-  const host = `${gatewayOptions.hostname || '127.0.0.1'}:${port}`
+  const fallbackHostname = gatewayOptions.hostname || '127.0.0.1'
+  const portCandidate = typeof status?.port === 'number' && status.port > 0
+    ? status.port
+    : (typeof gatewayOptions.port === 'number' && gatewayOptions.port > 0 ? gatewayOptions.port : null)
+  const host = portCandidate ? `${fallbackHostname}:${portCandidate}` : fallbackHostname
   return {
     httpUrl: `http://${host}`,
     proxyHost: host,
@@ -104,6 +107,71 @@ async function startGatewayService(options = {}) {
     })
     gatewayService.on('status', async (status) => {
       gatewayStatusCache = status
+      if (typeof status?.port === 'number' && status.port > 0) {
+        gatewayOptions.port = status.port
+      }
+      let proxyHost = null
+      let wsProtocol = null
+      let httpGatewayUrl = null
+
+      if (status?.urls?.hostname) {
+        try {
+          const parsed = new URL(status.urls.hostname)
+          proxyHost = parsed.host
+          wsProtocol = parsed.protocol === 'wss:' ? 'wss' : 'ws'
+          httpGatewayUrl = `${wsProtocol === 'wss' ? 'https' : 'http'}://${proxyHost}`
+          if (parsed.hostname) {
+            gatewayOptions.hostname = parsed.hostname
+          }
+        } catch (error) {
+          console.warn('[Worker] Failed to parse gateway status hostname URL:', error)
+        }
+      }
+
+      if (!proxyHost) {
+        const hostBase = typeof status?.hostname === 'string' && status.hostname
+          ? status.hostname
+          : (gatewayOptions.hostname || '127.0.0.1')
+        const portPart = typeof status?.port === 'number' && status.port > 0
+          ? status.port
+          : (typeof gatewayOptions.port === 'number' && gatewayOptions.port > 0 ? gatewayOptions.port : null)
+        proxyHost = portPart ? `${hostBase}:${portPart}` : hostBase
+        wsProtocol = wsProtocol || 'ws'
+        httpGatewayUrl = httpGatewayUrl || `${wsProtocol === 'wss' ? 'https' : 'http'}://${proxyHost}`
+        if (hostBase) {
+          gatewayOptions.hostname = hostBase
+        }
+      }
+
+      if (config) {
+        if (httpGatewayUrl) config.gatewayUrl = httpGatewayUrl
+        if (proxyHost) config.proxy_server_address = proxyHost
+        if (wsProtocol) config.proxy_websocket_protocol = wsProtocol
+      }
+
+      const hostChanged = Boolean(
+        proxyHost && wsProtocol && (
+          proxyHost !== lastSyncedGatewayHost || wsProtocol !== lastSyncedGatewayProtocol
+        )
+      )
+
+      if (hostChanged && relayServer?.updateGatewayConnectionSettings) {
+        try {
+          await relayServer.updateGatewayConnectionSettings({
+            gatewayUrl: httpGatewayUrl,
+            proxyHost,
+            proxyProtocol: wsProtocol
+          })
+          lastSyncedGatewayHost = proxyHost
+          lastSyncedGatewayProtocol = wsProtocol
+        } catch (error) {
+          console.error('[Worker] Failed to sync relay gateway settings:', error)
+        }
+      }
+
+      if (typeof status?.hostname === 'string' && status.hostname) {
+        gatewayOptions.hostname = status.hostname
+      }
       sendMessage({ type: 'gateway-status', status })
       if (status?.running) {
         const { httpUrl, proxyHost, wsProtocol } = deriveGatewayHostFromStatus(status)
@@ -150,6 +218,13 @@ async function startGatewayService(options = {}) {
   try {
     gatewaySettingsApplied = false
     await gatewayService.start(mergedOptions)
+    const status = gatewayService.getStatus()
+    if (typeof status?.port === 'number' && status.port > 0) {
+      mergedOptions.port = status.port
+    }
+    if (typeof status?.hostname === 'string' && status.hostname) {
+      mergedOptions.hostname = status.hostname
+    }
     gatewayOptions = mergedOptions
   } catch (error) {
     console.error('[Worker] Failed to start gateway service:', error)
@@ -201,7 +276,43 @@ let storedParentConfig = null
 let gatewayService = null
 let gatewayStatusCache = null
 let gatewaySettingsApplied = false
-let gatewayOptions = { port: 8443, hostname: '127.0.0.1', listenHost: '127.0.0.1', detectLanAddresses: false, detectPublicIp: false }
+let gatewayOptions = { port: null, hostname: '127.0.0.1', listenHost: '127.0.0.1', detectLanAddresses: false, detectPublicIp: false }
+let lastSyncedGatewayHost = null
+let lastSyncedGatewayProtocol = null
+
+const LOOPBACK_HOST_REGEX = /^(?:127\.0\.0\.1|localhost)(?::\d+)?$/
+
+function stripLoopbackPort(host) {
+  if (typeof host !== 'string') return host
+  if (!LOOPBACK_HOST_REGEX.test(host)) return host
+  return host.replace(/:(\d+)$/, '')
+}
+
+function sanitizeLoopbackHost(host, fallback = '127.0.0.1') {
+  if (typeof host !== 'string' || !host.trim()) return fallback
+  const trimmed = host.trim()
+  if (LOOPBACK_HOST_REGEX.test(trimmed)) {
+    return stripLoopbackPort(trimmed) || fallback
+  }
+  return trimmed
+}
+
+function sanitizeLoopbackGatewayUrl(url, fallback = 'http://127.0.0.1') {
+  if (typeof url !== 'string' || !url.trim()) return fallback
+  try {
+    const parsed = new URL(url)
+    if (LOOPBACK_HOST_REGEX.test(parsed.host)) {
+      parsed.port = ''
+      parsed.pathname = ''
+      parsed.search = ''
+      parsed.hash = ''
+      return `${parsed.protocol}//${parsed.hostname}`
+    }
+    return parsed.toString().replace(/\/$/, '')
+  } catch (_) {
+    return fallback
+  }
+}
 
 async function appendFilekeyDbEntry (relayKey, fileHash) {
   if (!config?.driveKey || !config?.nostr_pubkey_hex) {
@@ -319,11 +430,13 @@ async function loadOrCreateConfig(customDir = null) {
   const cachedGatewaySettings = getCachedGatewaySettings()
   const defaultGatewayUrl = gatewaySettings.gatewayUrl || cachedGatewaySettings.gatewayUrl
   const defaultProxyHost = gatewaySettings.proxyHost || cachedGatewaySettings.proxyHost
+  const sanitizedDefaultGatewayUrl = sanitizeLoopbackGatewayUrl(defaultGatewayUrl)
+  const sanitizedDefaultProxyHost = sanitizeLoopbackHost(defaultProxyHost)
 
   const defaultConfig = {
     port: 1945,
-    gatewayUrl: defaultGatewayUrl,
-    proxy_server_address: defaultProxyHost,
+    gatewayUrl: sanitizedDefaultGatewayUrl,
+    proxy_server_address: sanitizedDefaultProxyHost,
     proxy_websocket_protocol: gatewaySettings.proxyWebsocketProtocol || cachedGatewaySettings.proxyWebsocketProtocol,
     registerWithGateway: true,
     registerInterval: 300000,
@@ -349,6 +462,8 @@ async function loadOrCreateConfig(customDir = null) {
       loadedConfig.proxy_websocket_protocol = defaultConfig.proxy_websocket_protocol
       needsPersist = true
     }
+    loadedConfig.gatewayUrl = sanitizeLoopbackGatewayUrl(loadedConfig.gatewayUrl || sanitizedDefaultGatewayUrl)
+    loadedConfig.proxy_server_address = sanitizeLoopbackHost(loadedConfig.proxy_server_address || sanitizedDefaultProxyHost)
     if (needsPersist) {
       await fs.writeFile(configPath, JSON.stringify(loadedConfig, null, 2))
     }

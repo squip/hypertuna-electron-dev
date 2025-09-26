@@ -18,7 +18,6 @@ import {
 } from './HyperswarmClient.mjs';
 
 const MAX_LOG_ENTRIES = 500;
-const DEFAULT_PORT = 8443;
 
 class MessageQueue {
   constructor() {
@@ -348,13 +347,13 @@ export class GatewayService extends EventEmitter {
       return;
     }
 
-    const port = Number(config.port) || DEFAULT_PORT;
+    const port = this.#normalizePort(config.port);
     const hostname = config.hostname || 'localhost';
     const listenHost = config.listenHost || '127.0.0.1';
     const detectLan = !!config.detectLanAddresses;
     const detectPublicIp = !!config.detectPublicIp;
 
-    this.log('info', `Starting gateway on port ${port}`);
+    this.log('info', `Starting gateway (preferred port: ${port ?? 'auto'})`);
 
     global.joinSessions = global.joinSessions || new Map();
 
@@ -373,22 +372,24 @@ export class GatewayService extends EventEmitter {
 
     this.setupRoutes();
 
-    const { server, wss } = this.gatewayServer.startServer(
+    const { server, wss } = await this.gatewayServer.startServer(
       (ws, req) => this.handleGatewayWebSocketConnection(ws, req),
-      this.app,
-      () => this.log('info', `Gateway listening on port ${port}`)
+      this.app
     );
 
     this.server = server;
     this.wss = wss;
     await this.connectionPool.initialize();
+    const activePort = this.gatewayServer?.config?.port ?? port ?? null;
+    const urls = this.gatewayServer.getServerUrls();
+    this.log('info', `Gateway listening on port ${activePort}`);
     this.config = {
       hostname,
-      port,
+      port: activePort,
       listenHost,
       detectLanAddresses: detectLan,
       detectPublicIp,
-      urls: this.gatewayServer.getServerUrls()
+      urls
     };
 
     this.isRunning = true;
@@ -475,7 +476,7 @@ export class GatewayService extends EventEmitter {
 
     return {
       running: this.isRunning,
-      port: this.config?.port || DEFAULT_PORT,
+      port: this.config?.port ?? this.gatewayServer?.config?.port ?? null,
       hostname: this.config?.hostname || 'localhost',
       startedAt: this.startedAt,
       urls: this.config?.urls || this.gatewayServer?.getServerUrls() || null,
@@ -515,6 +516,14 @@ export class GatewayService extends EventEmitter {
 
   getLogs() {
     return [...this.logs];
+  }
+
+  #normalizePort(port) {
+    if (port === null || port === undefined) return null;
+    const parsed = typeof port === 'string' ? Number.parseInt(port, 10) : port;
+    if (!Number.isInteger(parsed)) return null;
+    if (parsed < 0 || parsed > 65535) return null;
+    return parsed;
   }
 
   setupRoutes() {

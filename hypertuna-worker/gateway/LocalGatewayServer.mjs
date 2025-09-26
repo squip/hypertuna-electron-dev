@@ -1,5 +1,6 @@
 import http from 'node:http';
 import https from 'node:https';
+import net from 'node:net';
 import os from 'node:os';
 import { promises as dns } from 'node:dns';
 import { WebSocketServer } from 'ws';
@@ -9,7 +10,7 @@ export class LocalGatewayServer {
     const {
       hostname = 'localhost',
       ip = null,
-      port = 8443,
+      port = null,
       protocol,
       listenHost = '127.0.0.1',
       requestHandler = null,
@@ -45,6 +46,62 @@ export class LocalGatewayServer {
   async init() {
     await this.#detectIpAddresses();
     return this;
+  }
+
+  #normalizePort(port) {
+    const parsed = typeof port === 'string' ? Number.parseInt(port, 10) : port;
+    if (!Number.isInteger(parsed)) return null;
+    return parsed >= 0 && parsed <= 65535 ? parsed : null;
+  }
+
+  #findAvailablePort(preferredPort, host) {
+    const attemptPort = (portToTry) => new Promise((resolve, reject) => {
+      const tester = net.createServer();
+      tester.unref();
+
+      const cleanup = () => {
+        tester.removeAllListeners('error');
+        tester.removeAllListeners('listening');
+      };
+
+      tester.once('error', (error) => {
+        cleanup();
+        reject(error);
+      });
+
+      tester.once('listening', () => {
+        const address = tester.address();
+        const openPort = typeof address === 'object' && address
+          ? address.port
+          : portToTry;
+        tester.close((closeError) => {
+          cleanup();
+          if (closeError) {
+            reject(closeError);
+            return;
+          }
+          resolve(openPort);
+        });
+      });
+
+      tester.listen({ port: portToTry, host, exclusive: true });
+    });
+
+    const hostToUse = host || '0.0.0.0';
+
+    if (typeof preferredPort === 'number' && preferredPort > 0) {
+      return attemptPort(preferredPort).catch((error) => {
+        if (error && (error.code === 'EADDRINUSE' || error.code === 'EACCES')) {
+          console.warn(
+            `[LocalGatewayServer] Preferred port ${preferredPort} unavailable on ${hostToUse}, selecting a random port`
+          );
+          return attemptPort(0);
+        }
+        throw error;
+      });
+    }
+
+    return attemptPort(0);
   }
 
   async #detectIpAddresses() {
@@ -137,42 +194,95 @@ export class LocalGatewayServer {
     });
   }
 
-  startServer(connectionHandler, requestHandler, onListening) {
+  async startServer(connectionHandler, requestHandler, onListening) {
     const httpHandler = typeof requestHandler === 'function'
       ? requestHandler
       : this.config.requestHandler || this.#buildDefaultRequestHandler();
 
-    this.server = this.config.tlsOptions
-      ? https.createServer(this.config.tlsOptions, httpHandler)
-      : http.createServer(httpHandler);
+    const normalizedPort = this.#normalizePort(this.config.port);
+    const listenHost = this.config.listenHost || '0.0.0.0';
 
-    this.wss = new WebSocketServer({ server: this.server });
+    const createServerPair = () => {
+      const serverInstance = this.config.tlsOptions
+        ? https.createServer(this.config.tlsOptions, httpHandler)
+        : http.createServer(httpHandler);
+      const wssInstance = new WebSocketServer({ server: serverInstance });
 
-    if (typeof connectionHandler === 'function') {
-      this.wss.on('connection', connectionHandler);
-    } else {
-      this.wss.on('connection', (ws, req) => {
-        const clientIp = req.socket.remoteAddress;
-        console.log('[LocalGatewayServer] Client connected:', clientIp);
-        ws.on('message', (message) => ws.send(message));
-      });
-    }
-
-    const httpProtocol = this.config.tlsOptions ? 'https' : 'http';
-    this.server.listen(this.config.port, this.config.listenHost, () => {
-      console.log(`[LocalGatewayServer] Listening on ${httpProtocol}://${this.config.hostname}:${this.config.port}`);
-      if (typeof onListening === 'function') {
-        Promise.resolve(onListening({
-          server: this.server,
-          wss: this.wss,
-          urls: this.getServerUrls()
-        })).catch(error => {
-          console.error('[LocalGatewayServer] onListening callback failed:', error);
+      if (typeof connectionHandler === 'function') {
+        wssInstance.on('connection', connectionHandler);
+      } else {
+        wssInstance.on('connection', (ws, req) => {
+          const clientIp = req.socket.remoteAddress;
+          console.log('[LocalGatewayServer] Client connected:', clientIp);
+          ws.on('message', (message) => ws.send(message));
         });
       }
-    });
 
-    return { server: this.server, wss: this.wss };
+      return { serverInstance, wssInstance };
+    };
+
+    const startListening = async (preferredPort, allowRetry) => {
+      const { serverInstance, wssInstance } = createServerPair();
+      this.server = serverInstance;
+      this.wss = wssInstance;
+
+      const portToUse = await this.#findAvailablePort(preferredPort, listenHost);
+
+      return new Promise((resolve, reject) => {
+        let hasRetried = false;
+
+        const handleError = async (error) => {
+          this.server.off('listening', handleListening);
+          if (!hasRetried && allowRetry && error && (error.code === 'EADDRINUSE' || error.code === 'EACCES')) {
+            hasRetried = true;
+            console.warn(
+              `[LocalGatewayServer] Port ${portToUse} became unavailable on ${listenHost}, retrying with a random port`
+            );
+            this.wss?.close();
+            this.server.close(async () => {
+              try {
+                const result = await startListening(0, false);
+                resolve(result);
+              } catch (retryError) {
+                reject(retryError);
+              }
+            });
+            return;
+          }
+          reject(error);
+        };
+
+        const handleListening = () => {
+          this.server.off('error', handleError);
+          const address = this.server.address();
+          const activePort = typeof address === 'object' && address ? address.port : portToUse;
+          this.config.port = activePort;
+
+          const httpProtocol = this.config.tlsOptions ? 'https' : 'http';
+          console.log(
+            `[LocalGatewayServer] Listening on ${httpProtocol}://${this.config.hostname}:${this.config.port}`
+          );
+
+          const onListeningResult = typeof onListening === 'function'
+            ? Promise.resolve(onListening({
+              server: this.server,
+              wss: this.wss,
+              urls: this.getServerUrls()
+            })).catch(error => {
+              console.error('[LocalGatewayServer] onListening callback failed:', error);
+            })
+            : Promise.resolve();
+
+          onListeningResult.finally(() => resolve({ server: this.server, wss: this.wss }));
+        };
+
+        this.server.once('error', handleError);
+        this.server.once('listening', handleListening);
+        this.server.listen(portToUse, listenHost);
+      });
+    };
+
+    return startListening(normalizedPort ?? 0, normalizedPort !== null && normalizedPort > 0);
   }
 
   stopServer() {

@@ -120,7 +120,7 @@ function integrateNostrRelays(App) {
             } catch (_) {}
         }
         if (!host) {
-            host = '127.0.0.1:8443';
+            host = '127.0.0.1';
         }
 
         return `${protocol}://${host}`.replace(/\/$/, '');
@@ -1964,7 +1964,8 @@ App.syncHypertunaConfigToFile = async function() {
         let lastIndex = 0;
         const text = this.escapeHtml(message.content);
         for (const match of text.matchAll(urlRegex)) {
-            const url = match[0];
+            const rawUrl = match[0];
+            const url = HypertunaUtils.normalizeDriveUrl(rawUrl);
             parts.push(text.slice(lastIndex, match.index));
             let replacement = `<a href="${url}" target="_blank" rel="noopener">${url}</a>`;
             if (this.isMediaUrl(url)) {

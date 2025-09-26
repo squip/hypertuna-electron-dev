@@ -44,9 +44,7 @@ export async function prepareFileAttachment(filePath, identifier) {
   const fileHash = await NostrUtils.computeSha256(buffer);
   const ext = getExtension(filePath);
   const fileId = `${fileHash}${ext}`;
-  const gatewaySettings = await HypertunaUtils.getGatewaySettings();
-  const sanitizedGatewayUrl = gatewaySettings.gatewayUrl || HypertunaUtils.getCachedGatewayUrl();
-  const baseUrl = sanitizedGatewayUrl.replace(/\/$/, '');
+  const baseUrl = HypertunaUtils.getRuntimeGatewayHttpBase().replace(/\/$/, '');
   const fileUrl = `${baseUrl}/drive/${identifier}/${fileId}`;
   const metadata = {
     mimeType: mimeFromExtension(ext),

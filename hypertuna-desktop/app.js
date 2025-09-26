@@ -171,6 +171,7 @@ async function syncGatewayOptions() {
 
 function updateGatewayUI(status) {
   gatewayStatusInfo = status || { running: false }
+  window.currentGatewayStatus = gatewayStatusInfo
   const running = !!gatewayStatusInfo.running
 
   if (gatewayStatusIndicatorEl) {
@@ -920,6 +921,27 @@ async function handleWorkerMessage(message) {
       gatewayRegistered = true
       addLog('Successfully registered with gateway', 'status')
       updateHealthStatus(healthState) // Update display
+      break
+
+    case 'gateway-url-updated':
+      if (message.gatewayUrl) {
+        console.log('[App] Gateway URL updated:', message.gatewayUrl)
+        HypertunaUtils.persistGatewaySettings(message.gatewayUrl).catch((error) => {
+          console.error('[App] Failed to persist gateway settings from worker:', error)
+        })
+        if (window.App && window.App.currentUser && window.App.currentUser.hypertunaConfig) {
+          window.App.currentUser.hypertunaConfig.gatewayUrl = message.gatewayUrl
+          if (message.proxyHost) {
+            window.App.currentUser.hypertunaConfig.proxy_server_address = message.proxyHost
+          }
+          if (message.proxyWebsocketProtocol) {
+            window.App.currentUser.hypertunaConfig.proxy_websocket_protocol = message.proxyWebsocketProtocol
+          }
+          if (typeof window.App.saveUserToLocalStorage === 'function') {
+            window.App.saveUserToLocalStorage()
+          }
+        }
+      }
       break
 
     case 'gateway-status':
