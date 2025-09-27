@@ -42,6 +42,10 @@ hypertuna-worker/node_modules/
 hypertuna-worker/test/
 hypertuna-worker/package-lock.json
 hypertuna-desktop/node_modules/
+public-gateway/node_modules/
+public-gateway/package-lock.json
+shared/package-lock.json
+shared/node_modules/
 hypertuna-desktop/test/
 hypertuna-desktop/package-lock.json
 legacy-pear-codebase/

@@ -1,0 +1,6 @@
+shared/node_modules
+shared/public-gateway/node_modules
+.git
+.gitignore
+.DS_Store
+npm-debug.log
