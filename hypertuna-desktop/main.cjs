@@ -9,11 +9,14 @@ let pendingWorkerMessages = [];
 let gatewayStatusCache = null;
 let gatewayLogsCache = [];
 let gatewayOptionsCache = { detectLanAddresses: false, detectPublicIp: false };
+let publicGatewayConfigCache = null;
+let publicGatewayStatusCache = null;
 
 const userDataPath = app.getPath('userData');
 const storagePath = path.join(userDataPath, 'hypertuna-data');
 const logFilePath = path.join(storagePath, 'desktop-console.log');
 const gatewaySettingsPath = path.join(storagePath, 'gateway-settings.json');
+const publicGatewaySettingsPath = path.join(storagePath, 'public-gateway-settings.json');
 const DEFAULT_CERT_ALLOWLIST = new Set(['relay.nostr.band', 'relay.damus.io', 'nos.lol']);
 const envAllowlist = (process.env.NOSTR_CERT_ALLOWLIST || '')
   .split(',')
@@ -126,6 +129,10 @@ async function startWorkerProcess() {
           if (message.options && typeof message.options === 'object') {
             gatewayOptionsCache = { ...gatewayOptionsCache, ...message.options };
           }
+        } else if (message.type === 'public-gateway-status') {
+          publicGatewayStatusCache = message.state || null;
+        } else if (message.type === 'public-gateway-config') {
+          publicGatewayConfigCache = message.config || null;
         }
       }
 
@@ -149,6 +156,8 @@ async function startWorkerProcess() {
       pendingWorkerMessages = [];
       gatewayStatusCache = null;
       gatewayLogsCache = [];
+      publicGatewayStatusCache = null;
+      publicGatewayConfigCache = null;
       if (mainWindow) {
         mainWindow.webContents.send('worker-exit', code ?? signal ?? 0);
       }
@@ -271,6 +280,71 @@ ipcMain.handle('gateway-set-options', async (_event, options) => {
   return sendGatewayCommand('set-gateway-options', { options });
 });
 
+ipcMain.handle('public-gateway-get-config', async () => {
+  if (workerProcess) {
+    workerProcess.send({ type: 'get-public-gateway-config' });
+  } else if (!publicGatewayConfigCache) {
+    try {
+      await ensureStorageDir();
+      const data = await fs.readFile(publicGatewaySettingsPath, 'utf8');
+      publicGatewayConfigCache = JSON.parse(data);
+    } catch (error) {
+      if (!error || error.code !== 'ENOENT') {
+        console.warn('[Main] Failed to read public gateway settings:', error?.message || error);
+      }
+    }
+  }
+  return { success: true, config: publicGatewayConfigCache };
+});
+
+ipcMain.handle('public-gateway-set-config', async (_event, config) => {
+  if (workerProcess) {
+    return sendGatewayCommand('set-public-gateway-config', { config });
+  }
+
+  try {
+    await ensureStorageDir();
+    await fs.writeFile(publicGatewaySettingsPath, JSON.stringify(config || {}, null, 2), 'utf8');
+    publicGatewayConfigCache = config || null;
+    if (mainWindow) {
+      mainWindow.webContents.send('worker-message', { type: 'public-gateway-config', config: publicGatewayConfigCache });
+    }
+    return { success: true };
+  } catch (error) {
+    console.error('[Main] Failed to write public gateway settings', error);
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('public-gateway-get-status', async () => {
+  if (workerProcess) {
+    workerProcess.send({ type: 'get-public-gateway-status' });
+  }
+  return { success: true, status: publicGatewayStatusCache };
+});
+
+ipcMain.handle('public-gateway-generate-token', async (_event, payload) => {
+  if (!workerProcess) {
+    return { success: false, error: 'Worker not running' };
+  }
+  return sendGatewayCommand('generate-public-gateway-token', payload || {});
+});
+
+ipcMain.handle('public-gateway-refresh-relay', async (_event, data) => {
+  if (!workerProcess) {
+    return { success: false, error: 'Worker not running' };
+  }
+  const relayKey = typeof data === 'string' ? data : data?.relayKey;
+  return sendGatewayCommand('refresh-public-gateway-relay', { relayKey });
+});
+
+ipcMain.handle('public-gateway-refresh-all', async () => {
+  if (!workerProcess) {
+    return { success: false, error: 'Worker not running' };
+  }
+  return sendGatewayCommand('refresh-public-gateway-all');
+});
+
 ipcMain.handle('read-config', async () => {
   try {
     await ensureStorageDir();
@@ -315,6 +389,35 @@ ipcMain.handle('write-gateway-settings', async (_event, settings) => {
     return { success: true };
   } catch (error) {
     console.error('[Main] Failed to write gateway settings', error);
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('read-public-gateway-settings', async () => {
+  try {
+    await ensureStorageDir();
+    const data = await fs.readFile(publicGatewaySettingsPath, 'utf8');
+    return { success: true, data: JSON.parse(data) };
+  } catch (error) {
+    if (error && error.code === 'ENOENT') {
+      return { success: true, data: null };
+    }
+    console.error('[Main] Failed to read public gateway settings', error);
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('write-public-gateway-settings', async (_event, settings) => {
+  try {
+    await ensureStorageDir();
+    await fs.writeFile(publicGatewaySettingsPath, JSON.stringify(settings || {}, null, 2), 'utf8');
+    publicGatewayConfigCache = settings || null;
+    if (mainWindow) {
+      mainWindow.webContents.send('worker-message', { type: 'public-gateway-config', config: publicGatewayConfigCache });
+    }
+    return { success: true };
+  } catch (error) {
+    console.error('[Main] Failed to write public gateway settings', error);
     return { success: false, error: error.message };
   }
 });

@@ -45,7 +45,12 @@ import {
 import { ensureMirrorsForProviders, stopAllMirrors } from './mirror-sync-manager.mjs';
 import { NostrUtils } from './nostr-utils.js';
 import { getRelayKeyFromPublicIdentifier } from './relay-lookup-utils.mjs';
-import { loadGatewaySettings, getCachedGatewaySettings, updateGatewaySettings } from '../shared/config/GatewaySettings.mjs';
+import { loadGatewaySettings, getCachedGatewaySettings, updateGatewaySettings } from '../shared/config/GatewaySettings.mjs'
+import {
+  loadPublicGatewaySettings,
+  updatePublicGatewaySettings,
+  getCachedPublicGatewaySettings
+} from '../shared/config/PublicGatewaySettings.mjs'
 
 const pearRuntime = globalThis?.Pear
 const __dirname = process.env.APP_DIR || pearRuntime?.config?.dir || process.cwd()
@@ -96,14 +101,30 @@ async function initializeGatewayOptionsFromSettings() {
   }
 }
 
+async function ensurePublicGatewaySettingsLoaded() {
+  if (publicGatewaySettings) return publicGatewaySettings
+  try {
+    publicGatewaySettings = await loadPublicGatewaySettings()
+  } catch (error) {
+    console.warn('[Worker] Failed to load public gateway settings:', error)
+    publicGatewaySettings = getCachedPublicGatewaySettings()
+  }
+  return publicGatewaySettings
+}
+
 async function startGatewayService(options = {}) {
+  await ensurePublicGatewaySettingsLoaded()
+
   if (!gatewayService) {
-    gatewayService = new GatewayService()
+    gatewayService = new GatewayService({ publicGateway: publicGatewaySettings })
     gatewayService.on('log', (entry) => {
       sendMessage({ type: 'gateway-log', entry })
     })
     gatewayService.on('status', async (status) => {
       gatewayStatusCache = status
+      if (status?.publicGateway) {
+        publicGatewayStatusCache = status.publicGateway
+      }
       sendMessage({ type: 'gateway-status', status })
       if (status?.running) {
         const { httpUrl, proxyHost, wsProtocol } = deriveGatewayHostFromStatus(status)
@@ -123,10 +144,20 @@ async function startGatewayService(options = {}) {
         }
       }
     })
+    gatewayService.on('public-gateway-status', (state) => {
+      publicGatewayStatusCache = state
+      sendMessage({ type: 'public-gateway-status', state })
+    })
   }
+
+  gatewayService.updatePublicGatewayConfig(publicGatewaySettings)
+  sendMessage({ type: 'public-gateway-config', config: publicGatewaySettings })
+  publicGatewayStatusCache = gatewayService.getPublicGatewayState()
+  sendMessage({ type: 'public-gateway-status', state: publicGatewayStatusCache })
 
   const mergedOptions = { ...gatewayOptions, ...options }
   mergedOptions.listenHost = mergedOptions.detectLanAddresses ? '0.0.0.0' : '127.0.0.1'
+  mergedOptions.publicGateway = publicGatewaySettings
 
   const needsRestart = gatewayService?.isRunning && (
     mergedOptions.port !== gatewayOptions.port ||
@@ -161,6 +192,8 @@ async function stopGatewayService() {
   if (!gatewayService) return
   try {
     await gatewayService.stop()
+    publicGatewayStatusCache = gatewayService.getPublicGatewayState()
+    sendMessage({ type: 'public-gateway-status', state: publicGatewayStatusCache })
   } catch (error) {
     console.error('[Worker] Failed to stop gateway service:', error)
     throw error
@@ -202,6 +235,8 @@ let gatewayService = null
 let gatewayStatusCache = null
 let gatewaySettingsApplied = false
 let gatewayOptions = { port: 8443, hostname: '127.0.0.1', listenHost: '127.0.0.1', detectLanAddresses: false, detectPublicIp: false }
+let publicGatewaySettings = null
+let publicGatewayStatusCache = null
 
 async function appendFilekeyDbEntry (relayKey, fileHash) {
   if (!config?.driveKey || !config?.nostr_pubkey_hex) {
@@ -942,6 +977,96 @@ async function handleMessageObject(message) {
 
     case 'get-gateway-options': {
       sendMessage({ type: 'gateway-options-set', options: gatewayOptions })
+      break
+    }
+
+    case 'get-public-gateway-config': {
+      await ensurePublicGatewaySettingsLoaded()
+      sendMessage({ type: 'public-gateway-config', config: publicGatewaySettings })
+      break
+    }
+
+    case 'set-public-gateway-config': {
+      await ensurePublicGatewaySettingsLoaded()
+      try {
+        const next = await updatePublicGatewaySettings(message.config || {})
+        publicGatewaySettings = next
+        if (gatewayService) {
+          gatewayService.updatePublicGatewayConfig(next)
+          publicGatewayStatusCache = gatewayService.getPublicGatewayState()
+          sendMessage({ type: 'public-gateway-status', state: publicGatewayStatusCache })
+        }
+        sendMessage({ type: 'public-gateway-config', config: next })
+      } catch (err) {
+        sendMessage({ type: 'public-gateway-error', message: err.message })
+      }
+      break
+    }
+
+    case 'get-public-gateway-status': {
+      if (gatewayService) {
+        const state = gatewayService.getPublicGatewayState()
+        publicGatewayStatusCache = state
+        sendMessage({ type: 'public-gateway-status', state })
+      } else if (publicGatewayStatusCache) {
+        sendMessage({ type: 'public-gateway-status', state: publicGatewayStatusCache })
+      } else {
+        await ensurePublicGatewaySettingsLoaded()
+        sendMessage({
+          type: 'public-gateway-status',
+          state: {
+            enabled: !!publicGatewaySettings?.enabled,
+            baseUrl: publicGatewaySettings?.baseUrl || null,
+            defaultTokenTtl: publicGatewaySettings?.defaultTokenTtl || 3600,
+            wsBase: null,
+            lastUpdatedAt: null,
+            relays: {}
+          }
+        })
+      }
+      break
+    }
+
+    case 'generate-public-gateway-token': {
+      try {
+        if (!gatewayService) throw new Error('Gateway service not initialized')
+        const result = gatewayService.issuePublicGatewayToken(message.relayKey, {
+          ttlSeconds: message.ttlSeconds
+        })
+        sendMessage({ type: 'public-gateway-token', result })
+      } catch (err) {
+        sendMessage({
+          type: 'public-gateway-token-error',
+          relayKey: message.relayKey || null,
+          error: err.message
+        })
+      }
+      break
+    }
+
+    case 'refresh-public-gateway-relay': {
+      try {
+        if (!gatewayService) throw new Error('Gateway service not initialized')
+        await gatewayService.syncPublicGatewayRelay(message.relayKey)
+        const state = gatewayService.getPublicGatewayState()
+        publicGatewayStatusCache = state
+        sendMessage({ type: 'public-gateway-status', state })
+      } catch (err) {
+        sendMessage({ type: 'public-gateway-error', message: err.message })
+      }
+      break
+    }
+
+    case 'refresh-public-gateway-all': {
+      try {
+        if (!gatewayService) throw new Error('Gateway service not initialized')
+        await gatewayService.resyncPublicGateway()
+        const state = gatewayService.getPublicGatewayState()
+        publicGatewayStatusCache = state
+        sendMessage({ type: 'public-gateway-status', state })
+      } catch (err) {
+        sendMessage({ type: 'public-gateway-error', message: err.message })
+      }
       break
     }
 

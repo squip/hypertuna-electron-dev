@@ -16,6 +16,7 @@ import {
   requestFileFromPeer,
   requestPfpFromPeer
 } from './HyperswarmClient.mjs';
+import PublicGatewayRegistrar from './PublicGatewayRegistrar.mjs';
 
 const MAX_LOG_ENTRIES = 500;
 const DEFAULT_PORT = 8443;
@@ -202,6 +203,106 @@ export class GatewayService extends EventEmitter {
     this.pfpOwnerIndex = new Map(); // owner -> Set<peerPublicKey>
     this.pfpDriveKeys = new Map(); // peerPublicKey -> driveKey
     this.peerHandshakes = new Map();
+    this.loggerBridge = null;
+    this.publicGatewaySettings = this.#normalizePublicGatewayConfig(options.publicGateway);
+    this.publicGatewayRegistrar = null;
+    this.publicGatewayRelayState = new Map();
+    this.publicGatewayWsBase = null;
+    this.publicGatewayStatusUpdatedAt = null;
+
+    this.#configurePublicGateway();
+  }
+
+  #normalizePublicGatewayConfig(rawConfig = {}) {
+    const envEnabled = process.env.PUBLIC_GATEWAY_ENABLED === 'true';
+    const enabled = rawConfig?.enabled ?? envEnabled;
+    const baseUrl = (rawConfig?.baseUrl ?? process.env.PUBLIC_GATEWAY_URL ?? '').trim();
+    const sharedSecret = (rawConfig?.sharedSecret ?? process.env.PUBLIC_GATEWAY_SECRET ?? '').trim();
+    const defaultTokenTtl = (() => {
+      const envValue = process.env.PUBLIC_GATEWAY_DEFAULT_TOKEN_TTL;
+      const rawTtl = rawConfig?.defaultTokenTtl ?? (envValue ? Number(envValue) : undefined);
+      const ttlNumber = Number(rawTtl);
+      return Number.isFinite(ttlNumber) && ttlNumber > 0 ? Math.round(ttlNumber) : 3600;
+    })();
+
+    if (!enabled) {
+      return { enabled: false, baseUrl: '', sharedSecret: '', defaultTokenTtl };
+    }
+
+    if (!baseUrl || !sharedSecret) {
+      this.log('warn', '[PublicGateway] Enabled but missing baseUrl or sharedSecret');
+      return { enabled: false, baseUrl: '', sharedSecret: '', defaultTokenTtl };
+    }
+
+    return { enabled: true, baseUrl, sharedSecret, defaultTokenTtl };
+  }
+
+  #configurePublicGateway() {
+    const config = this.publicGatewaySettings || { enabled: false };
+
+    if (!this.loggerBridge) {
+      this.loggerBridge = this.#createExternalLogger();
+    }
+
+    if (config.enabled && config.baseUrl && config.sharedSecret) {
+      this.publicGatewayRegistrar = new PublicGatewayRegistrar({
+        baseUrl: config.baseUrl,
+        sharedSecret: config.sharedSecret,
+        logger: this.loggerBridge
+      });
+      this.publicGatewayWsBase = this.#computePublicGatewayWsBase(config.baseUrl);
+    } else {
+      this.publicGatewayRegistrar = null;
+      this.publicGatewayWsBase = null;
+      this.publicGatewayRelayState.clear();
+    }
+
+    this.#emitPublicGatewayStatus();
+  }
+
+  #createExternalLogger() {
+    return {
+      info: (message, meta) => this.#logExternal('info', message, meta),
+      warn: (message, meta) => this.#logExternal('warn', message, meta),
+      error: (message, meta) => this.#logExternal('error', message, meta),
+      debug: (message, meta) => this.#logExternal('debug', message, meta)
+    };
+  }
+
+  #logExternal(level, message, meta) {
+    const parts = ['[PublicGateway]'];
+    if (message) parts.push(message);
+    if (meta && Object.keys(meta).length) {
+      try {
+        parts.push(JSON.stringify(meta));
+      } catch (_) {
+        parts.push(String(meta));
+      }
+    }
+    this.log(level, parts.join(' '));
+  }
+
+  #computePublicGatewayWsBase(baseUrl) {
+    if (!baseUrl) return null;
+    try {
+      const parsed = new URL(baseUrl);
+      if (parsed.protocol === 'http:') parsed.protocol = 'ws:';
+      else if (parsed.protocol === 'https:') parsed.protocol = 'wss:';
+      else if (parsed.protocol !== 'ws:' && parsed.protocol !== 'wss:') {
+        this.log('warn', `[PublicGateway] Unsupported protocol for base URL: ${parsed.protocol}`);
+        return null;
+      }
+      return parsed.toString().replace(/\/$/, '');
+    } catch (error) {
+      this.log('warn', `[PublicGateway] Invalid base URL: ${error.message}`);
+      return null;
+    }
+  }
+
+  #emitPublicGatewayStatus() {
+    this.publicGatewayStatusUpdatedAt = Date.now();
+    const state = this.getPublicGatewayState();
+    this.emit('public-gateway-status', state);
   }
 
   _normalizeOwnerKey(owner) {
@@ -264,6 +365,87 @@ export class GatewayService extends EventEmitter {
         done();
       }
     });
+  }
+
+  async #syncPublicGatewayRelay(relayKey) {
+    const enabled = this.publicGatewaySettings?.enabled && this.publicGatewayRegistrar?.isEnabled?.();
+
+    if (!enabled) {
+      this.publicGatewayRelayState.delete(relayKey);
+      this.#emitPublicGatewayStatus();
+      return;
+    }
+
+    const relayData = this.activeRelays.get(relayKey);
+    if (!relayData) {
+      this.publicGatewayRelayState.delete(relayKey);
+      this.#emitPublicGatewayStatus();
+      return;
+    }
+
+    const peers = Array.from(relayData.peers || []);
+    const metadata = relayData.metadata || {};
+    const metadataCopy = metadata ? { ...metadata } : {};
+    const now = Date.now();
+
+    if (!peers.length) {
+      try {
+        await this.publicGatewayRegistrar.unregisterRelay(relayKey);
+        this.publicGatewayRelayState.set(relayKey, {
+          relayKey,
+          status: 'offline',
+          peerCount: 0,
+          lastSyncedAt: now,
+          message: 'No peers connected',
+          metadata: metadataCopy,
+          peers: []
+        });
+      } catch (error) {
+        this.publicGatewayRelayState.set(relayKey, {
+          relayKey,
+          status: 'error',
+          peerCount: 0,
+          lastSyncedAt: now,
+          message: error.message,
+          metadata: metadataCopy,
+          peers: []
+        });
+        this.log('warn', `[PublicGateway] Failed to unregister relay ${relayKey}: ${error.message}`);
+      }
+      this.#emitPublicGatewayStatus();
+      return;
+    }
+
+    const payload = {
+      peers,
+      metadata: metadataCopy
+    };
+
+    try {
+      await this.publicGatewayRegistrar.registerRelay(relayKey, payload);
+      this.publicGatewayRelayState.set(relayKey, {
+        relayKey,
+        status: 'registered',
+        peerCount: peers.length,
+        lastSyncedAt: now,
+        message: null,
+        metadata: metadataCopy,
+        peers
+      });
+    } catch (error) {
+      this.publicGatewayRelayState.set(relayKey, {
+        relayKey,
+        status: 'error',
+        peerCount: peers.length,
+        lastSyncedAt: now,
+        message: error.message,
+        metadata: metadataCopy,
+        peers
+      });
+      this.log('warn', `[PublicGateway] Failed to sync relay ${relayKey}: ${error.message}`);
+    }
+
+    this.#emitPublicGatewayStatus();
   }
 
   async _fetchPfpFromPeers(owner, file) {
@@ -503,6 +685,100 @@ export class GatewayService extends EventEmitter {
     this.emit('status', this.getStatus());
   }
 
+  getPublicGatewayState() {
+    const relays = {};
+    for (const [key, value] of this.publicGatewayRelayState.entries()) {
+      relays[key] = { ...value };
+    }
+
+    const enabled = !!(this.publicGatewaySettings?.enabled && this.publicGatewayRegistrar?.isEnabled?.());
+
+    return {
+      enabled,
+      baseUrl: enabled ? this.publicGatewaySettings?.baseUrl || null : null,
+      defaultTokenTtl: this.publicGatewaySettings?.defaultTokenTtl || 3600,
+      wsBase: enabled ? this.publicGatewayWsBase : null,
+      lastUpdatedAt: this.publicGatewayStatusUpdatedAt,
+      relays
+    };
+  }
+
+  async syncPublicGatewayRelay(relayKey) {
+    await this.#syncPublicGatewayRelay(relayKey);
+  }
+
+  async resyncPublicGateway() {
+    const enabled = this.publicGatewaySettings?.enabled && this.publicGatewayRegistrar?.isEnabled?.();
+    if (!enabled) {
+      this.publicGatewayRelayState.clear();
+      this.#emitPublicGatewayStatus();
+      return;
+    }
+
+    for (const key of this.activeRelays.keys()) {
+      // Sequential resync to avoid saturating registrar
+      // eslint-disable-next-line no-await-in-loop
+      await this.#syncPublicGatewayRelay(key);
+    }
+  }
+
+  updatePublicGatewayConfig(rawConfig = {}) {
+    this.publicGatewaySettings = this.#normalizePublicGatewayConfig(rawConfig);
+    this.#configurePublicGateway();
+    if (this.publicGatewayRegistrar?.isEnabled?.()) {
+      this.resyncPublicGateway().catch((error) => {
+        this.log('warn', `[PublicGateway] Resync failed: ${error.message}`);
+      });
+    }
+  }
+
+  issuePublicGatewayToken(relayKey, options = {}) {
+    if (!relayKey) {
+      throw new Error('relayKey is required');
+    }
+
+    if (!this.publicGatewayRegistrar?.isEnabled?.() || !this.publicGatewaySettings?.enabled) {
+      throw new Error('Public gateway bridge is disabled');
+    }
+
+    const relayData = this.activeRelays.get(relayKey);
+    if (!relayData) {
+      throw new Error('Relay not registered with gateway');
+    }
+
+    const ttl = Number(options?.ttlSeconds);
+    const ttlSeconds = Number.isFinite(ttl) && ttl > 0
+      ? Math.round(ttl)
+      : this.publicGatewaySettings?.defaultTokenTtl || 3600;
+
+    const token = this.publicGatewayRegistrar.issueClientToken(relayKey, { ttlSeconds });
+    const expiresAt = Date.now() + ttlSeconds * 1000;
+    const metadata = relayData.metadata || {};
+    let gatewayPath = metadata.gatewayPath || null;
+    if (!gatewayPath) {
+      gatewayPath = this._normalizeGatewayPath(relayKey, metadata.gatewayPath, metadata.connectionUrl);
+    }
+    if (!gatewayPath) {
+      gatewayPath = relayKey.includes(':') ? relayKey.replace(':', '/') : relayKey;
+    }
+
+    if (!this.publicGatewayWsBase) {
+      throw new Error('Invalid public gateway base URL');
+    }
+
+    const connectionUrl = `${this.publicGatewayWsBase}/${gatewayPath}?token=${encodeURIComponent(token)}`;
+
+    return {
+      relayKey,
+      token,
+      connectionUrl,
+      expiresAt,
+      ttlSeconds,
+      gatewayPath,
+      baseUrl: this.publicGatewaySettings.baseUrl
+    };
+  }
+
   getStatus() {
     const peerRelayMap = {};
     for (const [identifier, relay] of this.activeRelays.entries()) {
@@ -540,7 +816,8 @@ export class GatewayService extends EventEmitter {
       peers: this.activePeers.length,
       relays: this.activeRelays.size,
       peerRelayMap,
-      peerDetails
+      peerDetails,
+      publicGateway: this.getPublicGatewayState()
     };
   }
 
@@ -869,6 +1146,8 @@ export class GatewayService extends EventEmitter {
       this.pfpDriveKeys.delete(publicKey);
     }
 
+    const updatedRelays = [];
+
     if (Array.isArray(relays)) {
       relays.forEach(entry => {
         const identifier = typeof entry === 'string' ? entry : entry?.identifier;
@@ -934,11 +1213,18 @@ export class GatewayService extends EventEmitter {
         }
 
         relayData.metadata = nextMetadata;
+        updatedRelays.push(identifier);
       });
     }
 
     peer.address = address || null;
     peer.lastSeen = Date.now();
+
+    updatedRelays.forEach(identifier => {
+      this.#syncPublicGatewayRelay(identifier).catch(error => {
+        this.log('warn', `[PublicGateway] Sync error for ${identifier}: ${error.message}`);
+      });
+    });
 
     this.healthState.activeRelaysCount = this.activeRelays.size;
     this.healthState.services.hyperswarmStatus = 'connected';

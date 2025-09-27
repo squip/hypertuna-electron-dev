@@ -46,7 +46,9 @@ hypertuna-desktop/test/
 hypertuna-desktop/package-lock.json
 legacy-pear-codebase/
 hyperswarm-documentation/
+hyperbeam-documentation/
 jspm_packages/
+deploy/.env
 
 # Snowpack dependency directory (https://snowpack.dev/)
 web_modules/

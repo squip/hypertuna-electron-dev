@@ -1,0 +1,53 @@
+version: '3.9'
+
+services:
+  proxy:
+    image: traefik:v3.0
+    command:
+      - --providers.docker=true
+      - --providers.docker.exposedbydefault=false
+      - --entrypoints.web.address=:80
+      - --entrypoints.websecure.address=:443
+      - --certificatesresolvers.le.acme.httpchallenge=true
+      - --certificatesresolvers.le.acme.httpchallenge.entrypoint=web
+      - --certificatesresolvers.le.acme.email=${LETSENCRYPT_EMAIL}
+      - --certificatesresolvers.le.acme.storage=/letsencrypt/acme.json
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - traefik-lets:/letsencrypt
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--save", "300", "1"]
+    volumes:
+      - redis-data:/data
+    restart: unless-stopped
+
+  public-gateway:
+    build:
+      context: ..
+      dockerfile: public-gateway/Dockerfile
+    environment:
+      GATEWAY_PUBLIC_URL: https://${GATEWAY_HOST}
+      GATEWAY_REGISTRATION_SECRET: ${GATEWAY_REGISTRATION_SECRET}
+      GATEWAY_REGISTRATION_REDIS: redis://redis:6379
+      GATEWAY_REGISTRATION_REDIS_PREFIX: "public-gateway:${GATEWAY_HOST}:"
+      GATEWAY_DEFAULT_TOKEN_TTL: 3600
+    depends_on:
+      - redis
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.gateway.rule=Host(`${GATEWAY_HOST}`)
+      - traefik.http.routers.gateway.entrypoints=websecure
+      - traefik.http.routers.gateway.tls=true
+      - traefik.http.routers.gateway.tls.certresolver=le
+      - traefik.http.services.gateway.loadbalancer.server.port=4430
+    restart: unless-stopped
+
+volumes:
+  traefik-lets:
+  redis-data:

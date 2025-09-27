@@ -75,6 +75,28 @@ let gatewayLogsContainer = null
 let gatewayToggleLogsButton = null
 let gatewayLanToggle = null
 let gatewayPublicToggle = null
+let publicGatewayEnableToggle = null
+let publicGatewayUrlInput = null
+let publicGatewaySecretInput = null
+let publicGatewaySaveButton = null
+let publicGatewayDefaultTtlInput = null
+let publicGatewayRelaySelect = null
+let publicGatewayCustomTtlInput = null
+let publicGatewayGenerateButton = null
+let publicGatewayTokenOutput = null
+let publicGatewayCopyButton = null
+let publicGatewayStatusContainer = null
+let publicGatewayStatusList = null
+let publicGatewayTokenFeedback = null
+let publicGatewayMeta = null
+
+let publicGatewayConfig = {
+  enabled: false,
+  baseUrl: '',
+  sharedSecret: '',
+  defaultTokenTtl: 3600
+}
+let publicGatewayState = null
 
 // Log functions
 function formatDuration(ms) {
@@ -281,6 +303,9 @@ function updateGatewayPeerState(status = {}) {
       status
     });
   }
+
+  populatePublicGatewayRelayOptions();
+  renderPublicGatewayStatus(publicGatewayState);
 }
 
 function renderGatewayLogs() {
@@ -295,6 +320,377 @@ function renderGatewayLogs() {
     gatewayLogsContainer.appendChild(row)
   }
   gatewayLogsContainer.scrollTop = gatewayLogsContainer.scrollHeight
+}
+
+function normalizePublicGatewayConfig(config = {}) {
+  const enabled = !!config.enabled
+  const baseUrl = typeof config.baseUrl === 'string' ? config.baseUrl.trim() : ''
+  const sharedSecret = typeof config.sharedSecret === 'string' ? config.sharedSecret.trim() : ''
+  const ttlRaw = Number(config.defaultTokenTtl)
+  const defaultTokenTtl = Number.isFinite(ttlRaw) && ttlRaw > 0 ? Math.max(60, Math.round(ttlRaw)) : 3600
+  return { enabled, baseUrl, sharedSecret, defaultTokenTtl }
+}
+
+function applyPublicGatewayConfigToUI() {
+  if (publicGatewayEnableToggle) {
+    publicGatewayEnableToggle.checked = !!publicGatewayConfig.enabled
+  }
+  if (publicGatewayUrlInput) {
+    publicGatewayUrlInput.value = publicGatewayConfig.baseUrl || ''
+  }
+  if (publicGatewaySecretInput) {
+    publicGatewaySecretInput.value = publicGatewayConfig.sharedSecret || ''
+  }
+  if (publicGatewayDefaultTtlInput) {
+    const minutes = Math.max(1, Math.round((publicGatewayConfig.defaultTokenTtl || 3600) / 60))
+    publicGatewayDefaultTtlInput.value = String(minutes)
+  }
+  updatePublicGatewayFormState()
+}
+
+function updatePublicGatewayFormState() {
+  const bridgeEnabled = !!publicGatewayConfig.enabled
+  const remoteActive = !!publicGatewayState?.enabled
+  const relayCount = gatewayPeerRelayMap.size
+
+  if (publicGatewayGenerateButton) {
+    publicGatewayGenerateButton.disabled = !remoteActive || relayCount === 0
+  }
+  if (publicGatewayRelaySelect) {
+    publicGatewayRelaySelect.disabled = !remoteActive || relayCount === 0
+  }
+  if (publicGatewayTokenOutput) {
+    publicGatewayTokenOutput.disabled = !remoteActive
+  }
+  if (publicGatewayCopyButton) {
+    publicGatewayCopyButton.disabled = !remoteActive || !publicGatewayTokenOutput?.value
+  }
+
+  if (publicGatewayStatusContainer) {
+    publicGatewayStatusContainer.classList.toggle('disabled', !remoteActive)
+  }
+}
+
+function populatePublicGatewayRelayOptions() {
+  if (!publicGatewayRelaySelect) return
+
+  const entries = Array.from(gatewayPeerRelayMap.entries())
+  entries.sort((a, b) => {
+    const nameA = a[1]?.metadata?.name || a[0]
+    const nameB = b[1]?.metadata?.name || b[0]
+    return nameA.localeCompare(nameB)
+  })
+
+  const previous = publicGatewayRelaySelect.value
+  publicGatewayRelaySelect.innerHTML = ''
+
+  if (!entries.length) {
+    const option = document.createElement('option')
+    option.value = ''
+    option.textContent = 'No relays available'
+    option.disabled = true
+    option.selected = true
+    publicGatewayRelaySelect.appendChild(option)
+  } else {
+    for (const [identifier, info] of entries) {
+      const option = document.createElement('option')
+      option.value = identifier
+      const displayName = info?.metadata?.name || identifier
+      option.textContent = displayName
+      publicGatewayRelaySelect.appendChild(option)
+    }
+    const hasPrevious = entries.some(([identifier]) => identifier === previous)
+    publicGatewayRelaySelect.value = hasPrevious ? previous : entries[0][0]
+  }
+
+  updatePublicGatewayFormState()
+}
+
+function renderPublicGatewayStatus(state) {
+  publicGatewayState = state || null
+  if (!publicGatewayStatusContainer) return
+
+  const relays = state?.relays ? Object.entries(state.relays) : []
+  relays.sort((a, b) => a[0].localeCompare(b[0]))
+
+  if (publicGatewayMeta) {
+    if (state?.enabled && state?.baseUrl) {
+      const ttlMinutes = Math.max(1, Math.round((state.defaultTokenTtl || 3600) / 60))
+      publicGatewayMeta.textContent = `Bridge host: ${state.baseUrl} • Default token TTL: ${ttlMinutes}m`
+    } else if (publicGatewayConfig.enabled && publicGatewayConfig.baseUrl) {
+      const minutes = Math.max(1, Math.round((publicGatewayConfig.defaultTokenTtl || 3600) / 60))
+      publicGatewayMeta.textContent = `Configured host: ${publicGatewayConfig.baseUrl} • Default token TTL: ${minutes}m`
+    } else {
+      publicGatewayMeta.textContent = 'Bridge disabled'
+    }
+  }
+
+  if (publicGatewayStatusList) {
+    publicGatewayStatusList.innerHTML = ''
+    if (!state?.enabled) {
+      const muted = document.createElement('p')
+      muted.className = 'muted'
+      muted.textContent = publicGatewayConfig.enabled
+        ? 'Awaiting worker registration with the public gateway.'
+        : 'Public gateway bridge is disabled.'
+      publicGatewayStatusList.appendChild(muted)
+    } else if (!relays.length) {
+      const info = document.createElement('p')
+      info.className = 'muted'
+      info.textContent = 'No relays have been registered with the public gateway yet.'
+      publicGatewayStatusList.appendChild(info)
+    } else {
+      for (const [identifier, info] of relays) {
+        const item = document.createElement('div')
+        item.className = 'public-gateway-relay'
+        const name = gatewayPeerRelayMap.get(identifier)?.metadata?.name || identifier
+        const status = info?.status || 'unknown'
+        const statusLabel = document.createElement('span')
+        statusLabel.className = `relay-status-tag status-${status}`
+        statusLabel.textContent = status
+        const title = document.createElement('div')
+        title.className = 'relay-name'
+        title.textContent = name
+        const details = document.createElement('div')
+        details.className = 'relay-details'
+        const peers = info?.peerCount ?? (Array.isArray(info?.peers) ? info.peers.length : 0)
+        const lastSync = info?.lastSyncedAt ? formatRelativeTime(info.lastSyncedAt) : '—'
+        const gatewayPath = info?.metadata?.gatewayPath ? ` • Path: ${info.metadata.gatewayPath}` : ''
+        details.textContent = `Peers: ${peers} • Synced: ${lastSync}${gatewayPath}`
+
+        if (info?.message) {
+          const notice = document.createElement('div')
+          notice.className = 'relay-error'
+          notice.textContent = info.message
+          details.appendChild(notice)
+        }
+
+        const actions = document.createElement('div')
+        actions.className = 'relay-actions'
+        const refreshBtn = document.createElement('button')
+        refreshBtn.type = 'button'
+        refreshBtn.className = 'btn btn-tertiary btn-small'
+        refreshBtn.textContent = 'Resync'
+        refreshBtn.addEventListener('click', () => {
+          if (!isElectron) return
+          refreshPublicGatewayRelay(identifier).catch((error) => {
+            addLog(`Public gateway resync failed for ${identifier}: ${error.message}`, 'error')
+          })
+        })
+        actions.appendChild(refreshBtn)
+
+        item.appendChild(title)
+        item.appendChild(statusLabel)
+        item.appendChild(details)
+        item.appendChild(actions)
+        publicGatewayStatusList.appendChild(item)
+      }
+    }
+  }
+
+  updatePublicGatewayFormState()
+}
+
+function setPublicGatewayTokenFeedback(message, variant = 'info') {
+  if (!publicGatewayTokenFeedback) return
+  publicGatewayTokenFeedback.textContent = message || ''
+  publicGatewayTokenFeedback.classList.remove('success', 'error', 'hidden', 'info')
+  if (variant === 'success') {
+    publicGatewayTokenFeedback.classList.add('success')
+  } else if (variant === 'error') {
+    publicGatewayTokenFeedback.classList.add('error')
+  } else {
+    publicGatewayTokenFeedback.classList.add('info')
+  }
+}
+
+function clearPublicGatewayTokenFeedback() {
+  if (!publicGatewayTokenFeedback) return
+  publicGatewayTokenFeedback.textContent = ''
+  publicGatewayTokenFeedback.classList.add('hidden')
+  publicGatewayTokenFeedback.classList.remove('success', 'error', 'info')
+}
+
+async function loadPublicGatewayConfig() {
+  if (!isElectron || !electronAPI?.getPublicGatewayConfig) return
+  try {
+    const response = await electronAPI.getPublicGatewayConfig()
+    if (response && response.config) {
+      publicGatewayConfig = normalizePublicGatewayConfig(response.config)
+    } else if ((!response || response.config == null) && electronAPI.readPublicGatewaySettings) {
+      const fallback = await electronAPI.readPublicGatewaySettings()
+      if (fallback?.data) {
+        publicGatewayConfig = normalizePublicGatewayConfig(fallback.data)
+      }
+    }
+  } catch (error) {
+    console.error('[App] Failed to load public gateway config:', error)
+    if (electronAPI?.readPublicGatewaySettings) {
+      try {
+        const fallback = await electronAPI.readPublicGatewaySettings()
+        if (fallback?.data) {
+          publicGatewayConfig = normalizePublicGatewayConfig(fallback.data)
+        }
+      } catch (fallbackError) {
+        console.error('[App] Failed to read public gateway settings fallback:', fallbackError)
+      }
+    }
+  }
+
+  applyPublicGatewayConfigToUI()
+}
+
+async function refreshPublicGatewayStatus({ requestLatest = true } = {}) {
+  if (!isElectron || !electronAPI?.getPublicGatewayStatus) return
+  try {
+    if (requestLatest) {
+      const response = await electronAPI.getPublicGatewayStatus()
+      if (response && response.status) {
+        publicGatewayState = response.status
+      }
+    }
+  } catch (error) {
+    console.error('[App] Failed to refresh public gateway status:', error)
+  }
+
+  renderPublicGatewayStatus(publicGatewayState)
+}
+
+async function refreshPublicGatewayRelay(relayKey) {
+  if (!isElectron || !electronAPI?.refreshPublicGatewayRelay) return
+  try {
+    await electronAPI.refreshPublicGatewayRelay(relayKey)
+  } catch (error) {
+    console.error('[App] Failed to request public gateway relay refresh:', error)
+  }
+}
+
+async function handlePublicGatewaySave(event) {
+  if (event) {
+    event.preventDefault()
+    event.stopPropagation()
+  }
+  clearPublicGatewayTokenFeedback()
+  if (!isElectron || !electronAPI?.setPublicGatewayConfig) return
+
+  const enabled = !!publicGatewayEnableToggle?.checked
+  const baseUrl = publicGatewayUrlInput?.value?.trim() || ''
+  const sharedSecret = publicGatewaySecretInput?.value?.trim() || ''
+  const ttlMinutes = Number(publicGatewayDefaultTtlInput?.value)
+  const ttlSecondsRaw = Number.isFinite(ttlMinutes) && ttlMinutes > 0 ? Math.round(ttlMinutes * 60) : publicGatewayConfig.defaultTokenTtl
+  const ttlSeconds = Math.max(60, ttlSecondsRaw)
+
+  if (enabled && (!baseUrl || !sharedSecret)) {
+    setPublicGatewayTokenFeedback('Base URL and shared secret are required when enabling the public gateway.', 'error')
+    return
+  }
+
+  const nextConfig = normalizePublicGatewayConfig({ enabled, baseUrl, sharedSecret, defaultTokenTtl: ttlSeconds })
+
+  try {
+    const response = await electronAPI.setPublicGatewayConfig(nextConfig)
+    if (response && response.success === false) {
+      throw new Error(response.error || 'Failed to update public gateway config')
+    }
+    publicGatewayConfig = nextConfig
+    applyPublicGatewayConfigToUI()
+    setPublicGatewayTokenFeedback('Public gateway settings saved.', 'success')
+    if (publicGatewayTokenOutput) {
+      publicGatewayTokenOutput.value = ''
+    }
+    if (publicGatewayCopyButton) {
+      publicGatewayCopyButton.disabled = true
+    }
+    await refreshPublicGatewayStatus({ requestLatest: true })
+  } catch (error) {
+    console.error('[App] Failed to save public gateway settings:', error)
+    setPublicGatewayTokenFeedback(`Failed to save settings: ${error.message}`, 'error')
+  }
+}
+
+async function handlePublicGatewayGenerate(event) {
+  if (event) {
+    event.preventDefault()
+    event.stopPropagation()
+  }
+  clearPublicGatewayTokenFeedback()
+  if (publicGatewayCustomTtlInput) publicGatewayCustomTtlInput.classList.remove('input-warning')
+
+  if (!isElectron || !electronAPI?.generatePublicGatewayToken) {
+    setPublicGatewayTokenFeedback('Token generation is only available in the desktop app.', 'error')
+    return
+  }
+
+  if (!publicGatewayState?.enabled) {
+    setPublicGatewayTokenFeedback('Enable the public gateway bridge before generating tokens.', 'error')
+    return
+  }
+
+  const relayKey = publicGatewayRelaySelect?.value
+  if (!relayKey) {
+    setPublicGatewayTokenFeedback('Select a relay to generate a link.', 'error')
+    return
+  }
+
+  const ttlMinutes = Number(publicGatewayCustomTtlInput?.value)
+  const ttlSecondsRaw = Number.isFinite(ttlMinutes) && ttlMinutes > 0
+    ? Math.round(ttlMinutes * 60)
+    : publicGatewayConfig.defaultTokenTtl
+  const ttlSeconds = Math.max(60, ttlSecondsRaw)
+
+  if (publicGatewayGenerateButton) publicGatewayGenerateButton.disabled = true
+  setPublicGatewayTokenFeedback('Generating share link...', 'info')
+
+  try {
+    const response = await electronAPI.generatePublicGatewayToken({ relayKey, ttlSeconds })
+    if (response && response.success === false) {
+      throw new Error(response.error || 'Failed to request token')
+    }
+  } catch (error) {
+    console.error('[App] Failed to request public gateway token:', error)
+    setPublicGatewayTokenFeedback(`Token request failed: ${error.message}`, 'error')
+  } finally {
+    if (publicGatewayGenerateButton) publicGatewayGenerateButton.disabled = false
+  }
+}
+
+async function handlePublicGatewayCopy(event) {
+  if (event) {
+    event.preventDefault()
+    event.stopPropagation()
+  }
+  if (!publicGatewayTokenOutput || !publicGatewayTokenOutput.value) return
+
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(publicGatewayTokenOutput.value)
+    } else {
+      publicGatewayTokenOutput.select()
+      document.execCommand('copy')
+      publicGatewayTokenOutput.blur()
+    }
+    setPublicGatewayTokenFeedback('Link copied to clipboard.', 'success')
+  } catch (error) {
+    console.error('[App] Failed to copy token link:', error)
+    setPublicGatewayTokenFeedback('Unable to copy link automatically. Copy it manually from the box above.', 'error')
+  }
+}
+
+function handlePublicGatewayTokenResult(result) {
+  if (!result) return
+  if (publicGatewayTokenOutput) {
+    publicGatewayTokenOutput.value = result.connectionUrl || ''
+  }
+  const expiresAt = result.expiresAt ? new Date(result.expiresAt).toLocaleString() : 'soon'
+  setPublicGatewayTokenFeedback(`Share link generated. Expires ${expiresAt}.`, 'success')
+  if (publicGatewayCopyButton) {
+    publicGatewayCopyButton.disabled = !publicGatewayTokenOutput?.value
+  }
+}
+
+function handlePublicGatewayTokenError(message, relayKey) {
+  const text = relayKey ? `Relay ${relayKey}: ${message}` : message
+  setPublicGatewayTokenFeedback(text || 'Failed to generate token.', 'error')
 }
 
 async function refreshGatewayStatus({ fetchOptions = true } = {}) {
@@ -399,6 +795,9 @@ async function initializeGatewayControls() {
 
   await syncGatewayOptions()
   await refreshGatewayStatus({ fetchOptions: false })
+  await loadPublicGatewayConfig()
+  await refreshPublicGatewayStatus({ requestLatest: true })
+  populatePublicGatewayRelayOptions()
 }
 
 function handleGatewayLogEntry(entry) {
@@ -976,7 +1375,35 @@ async function handleWorkerMessage(message) {
       }
       break
 
-      
+    case 'public-gateway-config':
+      if (message.config) {
+        publicGatewayConfig = normalizePublicGatewayConfig(message.config)
+        applyPublicGatewayConfigToUI()
+      }
+      break
+
+    case 'public-gateway-status':
+      if (message.state) {
+        renderPublicGatewayStatus(message.state)
+      }
+      break
+
+    case 'public-gateway-token':
+      handlePublicGatewayTokenResult(message.result)
+      break
+
+    case 'public-gateway-token-error':
+      handlePublicGatewayTokenError(message.error, message.relayKey)
+      break
+
+    case 'public-gateway-error':
+      if (message.message) {
+        addLog(`Public gateway error: ${message.message}`, 'error')
+        setPublicGatewayTokenFeedback(message.message, 'error')
+      }
+      break
+
+    
     default:
       addLog(`Unknown worker message: ${JSON.stringify(message)}`, 'info')
   }
@@ -1509,6 +1936,49 @@ function setupEventListeners() {
       syncGatewayOptions()
     })
   }
+
+  if (publicGatewayEnableToggle) {
+    publicGatewayEnableToggle.addEventListener('change', () => {
+      publicGatewayConfig.enabled = !!publicGatewayEnableToggle.checked
+      updatePublicGatewayFormState()
+    })
+  }
+
+  if (publicGatewaySaveButton) {
+    publicGatewaySaveButton.addEventListener('click', handlePublicGatewaySave)
+  }
+
+  if (publicGatewayGenerateButton) {
+    publicGatewayGenerateButton.addEventListener('click', handlePublicGatewayGenerate)
+  }
+
+  if (publicGatewayCopyButton) {
+    publicGatewayCopyButton.addEventListener('click', handlePublicGatewayCopy)
+  }
+
+  if (publicGatewayRelaySelect) {
+    publicGatewayRelaySelect.addEventListener('change', () => {
+      clearPublicGatewayTokenFeedback()
+      if (publicGatewayTokenOutput) publicGatewayTokenOutput.value = ''
+      updatePublicGatewayFormState()
+    })
+  }
+
+  if (publicGatewayCustomTtlInput) {
+    publicGatewayCustomTtlInput.addEventListener('input', () => {
+      const raw = publicGatewayCustomTtlInput.value.trim()
+      if (!raw) {
+        publicGatewayCustomTtlInput.classList.remove('input-warning')
+        return
+      }
+      const value = Number(raw)
+      if (!Number.isFinite(value) || value <= 0) {
+        publicGatewayCustomTtlInput.classList.add('input-warning')
+      } else {
+        publicGatewayCustomTtlInput.classList.remove('input-warning')
+      }
+    })
+  }
   
   // Input field event listeners
   const relayNameInput = document.getElementById('relay-name')
@@ -1583,6 +2053,20 @@ function initializeDOMElements() {
   gatewayToggleLogsButton = document.getElementById('gateway-toggle-logs')
   gatewayLanToggle = document.getElementById('gateway-lan-toggle')
   gatewayPublicToggle = document.getElementById('gateway-public-toggle')
+  publicGatewayEnableToggle = document.getElementById('public-gateway-enable')
+  publicGatewayUrlInput = document.getElementById('public-gateway-url')
+  publicGatewaySecretInput = document.getElementById('public-gateway-secret')
+  publicGatewaySaveButton = document.getElementById('public-gateway-save')
+  publicGatewayDefaultTtlInput = document.getElementById('public-gateway-token-ttl')
+  publicGatewayRelaySelect = document.getElementById('public-gateway-relay-select')
+  publicGatewayCustomTtlInput = document.getElementById('public-gateway-token-custom-ttl')
+  publicGatewayGenerateButton = document.getElementById('public-gateway-generate')
+  publicGatewayTokenOutput = document.getElementById('public-gateway-token-output')
+  publicGatewayCopyButton = document.getElementById('public-gateway-copy')
+  publicGatewayStatusContainer = document.getElementById('public-gateway-status')
+  publicGatewayStatusList = document.getElementById('public-gateway-relay-status')
+  publicGatewayTokenFeedback = document.getElementById('public-gateway-token-feedback')
+  publicGatewayMeta = document.getElementById('public-gateway-meta')
   
   // Log element status
   const elements = {
@@ -1611,7 +2095,21 @@ function initializeDOMElements() {
     gatewayLogsContainer,
     gatewayToggleLogsButton,
     gatewayLanToggle,
-    gatewayPublicToggle
+    gatewayPublicToggle,
+    publicGatewayEnableToggle,
+    publicGatewayUrlInput,
+    publicGatewaySecretInput,
+    publicGatewaySaveButton,
+    publicGatewayDefaultTtlInput,
+    publicGatewayRelaySelect,
+    publicGatewayCustomTtlInput,
+    publicGatewayGenerateButton,
+    publicGatewayTokenOutput,
+    publicGatewayCopyButton,
+    publicGatewayStatusContainer,
+    publicGatewayStatusList,
+    publicGatewayTokenFeedback,
+    publicGatewayMeta
   }
   
   console.log('[App] Element initialization results:');

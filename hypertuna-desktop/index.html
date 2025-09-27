@@ -543,6 +543,56 @@
                                 <button id="gateway-start" class="btn btn-primary">Start</button>
                                 <button id="gateway-stop" class="btn btn-secondary">Stop</button>
                             </div>
+                            <div class="gateway-remote">
+                                <h4>Public Gateway Bridge</h4>
+                                <p class="muted">Register your relays with a hosted gateway to reach them from anywhere.</p>
+                                <label class="toggle-label inline-toggle">
+                                    <input type="checkbox" id="public-gateway-enable" class="toggle-checkbox">
+                                    <span class="toggle-switch"></span>
+                                    <span class="toggle-text">Enable Public Gateway Bridge</span>
+                                </label>
+                                <div class="gateway-remote-form">
+                                    <div class="form-group">
+                                        <label for="public-gateway-url">Public Gateway URL</label>
+                                        <input type="text" id="public-gateway-url" class="form-input" placeholder="https://hypertuna.com">
+                                    </div>
+                                    <div class="form-group">
+                                        <label for="public-gateway-secret">Shared Secret</label>
+                                        <input type="password" id="public-gateway-secret" class="form-input" placeholder="Gateway shared secret" autocomplete="off">
+                                    </div>
+                                    <div class="form-group-inline">
+                                        <div class="form-group small">
+                                            <label for="public-gateway-token-ttl">Default Token TTL (minutes)</label>
+                                            <input type="number" id="public-gateway-token-ttl" class="form-input" min="1" value="60">
+                                        </div>
+                                        <button id="public-gateway-save" class="btn btn-secondary">Save</button>
+                                    </div>
+                                </div>
+                                <div id="public-gateway-status" class="public-gateway-status-card">
+                                    <div id="public-gateway-meta" class="public-gateway-meta muted"></div>
+                                    <div id="public-gateway-relay-status" class="public-gateway-relay-list"></div>
+                                </div>
+                                <div class="public-gateway-token-card">
+                                    <h5>Generate Share Link</h5>
+                                    <p class="muted">Create a temporary WebSocket URL that routes through the public gateway.</p>
+                                    <div class="form-group">
+                                        <label for="public-gateway-relay-select">Relay</label>
+                                        <select id="public-gateway-relay-select" class="form-input"></select>
+                                    </div>
+                                    <div class="form-group-inline">
+                                        <div class="form-group small">
+                                            <label for="public-gateway-token-custom-ttl">Token TTL (minutes)</label>
+                                            <input type="number" id="public-gateway-token-custom-ttl" class="form-input" min="1" placeholder="Optional">
+                                        </div>
+                                        <button id="public-gateway-generate" class="btn btn-primary">Generate Link</button>
+                                    </div>
+                                    <div class="copy-field">
+                                        <input type="text" id="public-gateway-token-output" class="form-input" readonly placeholder="wss://hypertuna.com/relay/token">
+                                        <button id="public-gateway-copy" class="btn btn-secondary btn-small">Copy</button>
+                                    </div>
+                                    <div id="public-gateway-token-feedback" class="status-message hidden"></div>
+                                </div>
+                            </div>
                         </div>
                     </div>
 
