@@ -132,7 +132,11 @@ class PublicGatewayService {
 
   #handleWebSocket(ws, req) {
     this.#initializeSession(ws, req).catch((error) => {
-      this.logger.error?.('Failed to initialize websocket session', { error: error.message });
+      this.logger.error?.('Failed to initialize websocket session', {
+        error: error?.message || 'unknown error',
+        stack: error?.stack || null,
+        relayKey: error?.relayKey || null
+      });
       try {
         ws.close(1011, 'Internal error');
       } catch (_) {}
@@ -142,6 +146,7 @@ class PublicGatewayService {
 
   async #initializeSession(ws, req) {
     if (!this.sharedSecret) {
+      this.logger.error?.('WebSocket rejected: shared secret missing');
       ws.close(1011, 'Gateway not configured');
       ws.terminate();
       return;
@@ -150,12 +155,16 @@ class PublicGatewayService {
     const { relayKey, token } = this.#parseWebSocketRequest(req);
 
     if (!relayKey) {
+      this.logger.warn?.('WebSocket rejected: invalid relay key', {
+        url: req?.url || null
+      });
       ws.close(4404, 'Invalid relay key');
       ws.terminate();
       return;
     }
 
     if (!token) {
+      this.logger.warn?.('WebSocket rejected: token missing', { relayKey });
       ws.close(4403, 'Token required');
       ws.terminate();
       return;
@@ -163,6 +172,7 @@ class PublicGatewayService {
 
     const tokenPayload = this.#validateToken(token, relayKey);
     if (!tokenPayload) {
+      this.logger.warn?.('WebSocket rejected: token validation failed', { relayKey });
       ws.close(4403, 'Invalid token');
       ws.terminate();
       return;
@@ -170,6 +180,7 @@ class PublicGatewayService {
 
     const registration = await this.registrationStore.getRelay(relayKey);
     if (!registration) {
+      this.logger.warn?.('WebSocket rejected: relay not registered', { relayKey });
       ws.close(4404, 'Relay not registered');
       ws.terminate();
       return;
@@ -177,6 +188,7 @@ class PublicGatewayService {
 
     const selection = this.#selectPeer(registration);
     if (!selection) {
+      this.logger.warn?.('WebSocket rejected: no peers available', { relayKey });
       ws.close(1013, 'No peers available');
       ws.terminate();
       return;
@@ -184,7 +196,17 @@ class PublicGatewayService {
 
     const { peerKey, peers, index } = selection;
     const peerIndex = index >= 0 ? index : 0;
-    await this.connectionPool.getConnection(peerKey);
+    try {
+      await this.connectionPool.getConnection(peerKey);
+    } catch (err) {
+      err.relayKey = relayKey;
+      this.logger.error?.('WebSocket rejected: failed to connect to peer', {
+        relayKey,
+        peerKey,
+        error: err?.message || 'unknown error'
+      });
+      throw err;
+    }
 
     const connectionKey = this.#generateConnectionKey();
     const session = {
