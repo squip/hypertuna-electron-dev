@@ -2,6 +2,7 @@ class MemoryRegistrationStore {
   constructor(ttlSeconds = 300) {
     this.ttlSeconds = ttlSeconds;
     this.items = new Map();
+    this.tokenMetadata = new Map();
   }
 
   async upsertRelay(relayKey, payload) {
@@ -24,6 +25,7 @@ class MemoryRegistrationStore {
 
   async removeRelay(relayKey) {
     this.items.delete(relayKey);
+    this.tokenMetadata.delete(relayKey);
   }
 
   pruneExpired() {
@@ -33,6 +35,30 @@ class MemoryRegistrationStore {
         this.items.delete(key);
       }
     }
+
+    for (const [key, metadata] of this.tokenMetadata.entries()) {
+      if (metadata?.expiresAt && metadata.expiresAt < now) {
+        this.tokenMetadata.delete(key);
+      }
+    }
+  }
+
+  async storeTokenMetadata(relayKey, metadata = {}) {
+    const record = {
+      ...metadata,
+      recordedAt: Date.now()
+    };
+    this.tokenMetadata.set(relayKey, record);
+  }
+
+  async getTokenMetadata(relayKey) {
+    const record = this.tokenMetadata.get(relayKey);
+    if (!record) return null;
+    if (record.expiresAt && record.expiresAt < Date.now()) {
+      this.tokenMetadata.delete(relayKey);
+      return null;
+    }
+    return record;
   }
 }
 

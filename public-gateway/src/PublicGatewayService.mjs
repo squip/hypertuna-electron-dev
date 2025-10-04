@@ -15,7 +15,7 @@ import {
   verifySignature,
   verifyClientToken
 } from '../../shared/auth/PublicGatewayTokens.mjs';
-import { metricsMiddleware, sessionGauge, peerGauge } from './metrics.mjs';
+import { metricsMiddleware, sessionGauge, peerGauge, requestCounter } from './metrics.mjs';
 import MemoryRegistrationStore from './stores/MemoryRegistrationStore.mjs';
 import MessageQueue from './utils/MessageQueue.mjs';
 
@@ -171,13 +171,15 @@ class PublicGatewayService {
       return;
     }
 
-    const tokenPayload = this.#validateToken(token, relayKey);
-    if (!tokenPayload) {
+    const tokenValidation = this.#validateToken(token, relayKey);
+    if (!tokenValidation) {
       this.logger.warn?.('WebSocket rejected: token validation failed', { relayKey });
       ws.close(4403, 'Invalid token');
       ws.terminate();
       return;
     }
+
+    const { payload: tokenPayload, relayAuthToken, pubkey: tokenPubkey, scope: tokenScope } = tokenValidation;
 
     const registration = await this.registrationStore.getRelay(relayKey);
     if (!registration) {
@@ -229,8 +231,11 @@ class PublicGatewayService {
       connectionKey,
       relayKey,
       ws,
-      token,
+      clientToken: token,
       tokenPayload,
+      relayAuthToken,
+      clientPubkey: tokenPubkey || null,
+      clientScope: tokenScope || null,
       peerKey,
       peers,
       peerIndex,
@@ -274,7 +279,7 @@ class PublicGatewayService {
             msg,
             session.connectionKey,
             this.connectionPool,
-            session.token
+            session.relayAuthToken
           );
         });
 
@@ -333,7 +338,7 @@ class PublicGatewayService {
             session.relayKey,
             session.connectionKey,
             this.connectionPool,
-            session.token
+            session.relayAuthToken
           );
         });
 
@@ -510,10 +515,70 @@ class PublicGatewayService {
 
   #validateToken(token, relayKey) {
     const payload = verifyClientToken(token, this.sharedSecret);
-    if (!payload) return null;
-    if (payload.relayKey && payload.relayKey !== relayKey) return null;
-    if (payload.expiresAt && payload.expiresAt < Date.now()) return null;
-    return payload;
+    if (!payload) {
+      this.logger.warn?.('Token verification failed - signature mismatch', { relayKey });
+      return null;
+    }
+
+    if (payload.relayKey && payload.relayKey !== relayKey) {
+      this.logger.warn?.('Token verification failed - relay mismatch', {
+        relayKey,
+        tokenRelayKey: payload.relayKey
+      });
+      return null;
+    }
+
+    if (payload.expiresAt && payload.expiresAt < Date.now()) {
+      this.logger.warn?.('Token verification failed - token expired', {
+        relayKey,
+        expiresAt: payload.expiresAt
+      });
+      return null;
+    }
+
+    if (!payload.relayAuthToken || typeof payload.relayAuthToken !== 'string') {
+      this.logger.warn?.('Token verification failed - missing relay auth token', { relayKey });
+      return null;
+    }
+
+    const metadata = {
+      pubkey: payload.pubkey || null,
+      scope: payload.scope || null,
+      issuedAt: payload.issuedAt || null,
+      expiresAt: payload.expiresAt || null,
+      lastValidatedAt: Date.now()
+    };
+
+    try {
+      const maybePromise = this.registrationStore?.storeTokenMetadata?.(relayKey, metadata);
+      if (typeof maybePromise?.catch === 'function') {
+        maybePromise.catch((error) => {
+          this.logger.debug?.('Failed to persist token metadata', {
+            relayKey,
+            error: error?.message || error
+          });
+        });
+      }
+    } catch (error) {
+      this.logger.debug?.('Token metadata persistence threw synchronously', {
+        relayKey,
+        error: error?.message || error
+      });
+    }
+
+    this.logger.info?.('Token validated for relay session', {
+      relayKey,
+      scope: payload.scope || null,
+      pubkey: payload.pubkey ? `${payload.pubkey.slice(0, 16)}...` : null,
+      expiresAt: payload.expiresAt || null
+    });
+
+    return {
+      payload,
+      relayAuthToken: payload.relayAuthToken,
+      pubkey: payload.pubkey || null,
+      scope: payload.scope || null
+    };
   }
 
   #onProtocolCreated() {

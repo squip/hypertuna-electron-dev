@@ -17,6 +17,7 @@ import {
   requestPfpFromPeer
 } from './HyperswarmClient.mjs';
 import PublicGatewayRegistrar from './PublicGatewayRegistrar.mjs';
+import { getRelayAuthStore } from '../relay-auth-store.mjs';
 
 const MAX_LOG_ENTRIES = 500;
 const DEFAULT_PORT = 8443;
@@ -209,6 +210,9 @@ export class GatewayService extends EventEmitter {
     this.publicGatewayRelayState = new Map();
     this.publicGatewayWsBase = null;
     this.publicGatewayStatusUpdatedAt = null;
+    this.getCurrentPubkey = typeof options.getCurrentPubkey === 'function'
+      ? options.getCurrentPubkey
+      : () => options.currentPubkey || null;
 
     this.#configurePublicGateway();
   }
@@ -746,12 +750,52 @@ export class GatewayService extends EventEmitter {
       throw new Error('Relay not registered with gateway');
     }
 
+    const requestingPubkey = this.getCurrentPubkey?.() || null;
+    if (!requestingPubkey) {
+      throw new Error('Unable to determine requesting pubkey for token issuance');
+    }
+
+    const authStore = getRelayAuthStore();
+    const candidateIdentifiers = new Set([relayKey]);
+
+    const metadataIdentifier = relayData.metadata?.identifier;
+    if (metadataIdentifier) {
+      candidateIdentifiers.add(metadataIdentifier);
+    }
+
+    const metadataGatewayPath = relayData.metadata?.gatewayPath;
+    if (metadataGatewayPath && typeof metadataGatewayPath === 'string') {
+      const normalizedPath = this._normalizeRelayIdentifier(metadataGatewayPath);
+      if (normalizedPath) {
+        candidateIdentifiers.add(normalizedPath);
+      }
+    }
+
+    let authRecord = null;
+    for (const identifier of candidateIdentifiers) {
+      authRecord = authStore.getAuthByPubkey(identifier, requestingPubkey);
+      if (authRecord) {
+        break;
+      }
+    }
+
+    if (!authRecord) {
+      throw new Error('No relay authentication token found for requesting user');
+    }
+
+    const relayAuthToken = authRecord.token;
+
     const ttl = Number(options?.ttlSeconds);
     const ttlSeconds = Number.isFinite(ttl) && ttl > 0
       ? Math.round(ttl)
       : this.publicGatewaySettings?.defaultTokenTtl || 3600;
 
-    const token = this.publicGatewayRegistrar.issueClientToken(relayKey, { ttlSeconds });
+    const token = this.publicGatewayRegistrar.issueClientToken(relayKey, {
+      ttlSeconds,
+      relayAuthToken,
+      pubkey: requestingPubkey,
+      scope: options.scope || 'relay-access'
+    });
     const expiresAt = Date.now() + ttlSeconds * 1000;
     const metadata = relayData.metadata || {};
     let gatewayPath = metadata.gatewayPath || null;
@@ -768,6 +812,15 @@ export class GatewayService extends EventEmitter {
 
     const connectionUrl = `${this.publicGatewayWsBase}/${gatewayPath}?token=${encodeURIComponent(token)}`;
 
+    const logDetails = {
+      relayKey,
+      expiresAt,
+      ttlSeconds,
+      gatewayPath,
+      pubkey: `${requestingPubkey.slice(0, 16)}...`
+    };
+    this.log('info', `[PublicGateway] Issued public token ${JSON.stringify(logDetails)}`);
+
     return {
       relayKey,
       token,
@@ -775,7 +828,8 @@ export class GatewayService extends EventEmitter {
       expiresAt,
       ttlSeconds,
       gatewayPath,
-      baseUrl: this.publicGatewaySettings.baseUrl
+      baseUrl: this.publicGatewaySettings.baseUrl,
+      issuedForPubkey: requestingPubkey
     };
   }
 

@@ -81,10 +81,15 @@ class PublicGatewayRegistrar {
 
   issueClientToken(relayKey, options = {}) {
     if (!this.isEnabled()) throw new Error('Public gateway registrar not configured');
+    if (!options?.relayAuthToken) {
+      throw new Error('relayAuthToken is required to issue a public gateway token');
+    }
     const payload = {
       relayKey,
-      expiresAt: options.expiresAt || Date.now() + (options.ttlSeconds || 3600) * 1000,
-      scope: options.scope || 'relay-access'
+      relayAuthToken: options.relayAuthToken,
+      pubkey: options.pubkey || null,
+      scope: options.scope || 'relay-access',
+      expiresAt: options.expiresAt || Date.now() + (options.ttlSeconds || 3600) * 1000
     };
     return issueClientToken(payload, this.sharedSecret);
   }

@@ -116,7 +116,10 @@ async function startGatewayService(options = {}) {
   await ensurePublicGatewaySettingsLoaded()
 
   if (!gatewayService) {
-    gatewayService = new GatewayService({ publicGateway: publicGatewaySettings })
+    gatewayService = new GatewayService({
+      publicGateway: publicGatewaySettings,
+      getCurrentPubkey: () => config?.nostr_pubkey_hex || null
+    })
     gatewayService.on('log', (entry) => {
       sendMessage({ type: 'gateway-log', entry })
     })
