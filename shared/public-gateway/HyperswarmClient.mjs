@@ -329,6 +329,10 @@ class EnhancedHyperswarmPool {
       const publicKey = peerInfo.publicKey.toString('hex');
       const existing = this.connections.get(publicKey);
       if (existing) {
+        if (existing.connecting && !existing.connected) {
+          this.logger?.debug?.('Swarm connection matched pending dial', { peer: publicKey });
+          return;
+        }
         this.logger?.info?.('Replacing existing connection from swarm event', { peer: publicKey });
         existing.destroy();
       }

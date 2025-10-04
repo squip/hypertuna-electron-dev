@@ -537,10 +537,17 @@ function handlePeerConnection(stream, peerInfo) {
     console.log('[RelayServer] Generic request received:', request.method, request.path);
     
     // If this is a registration request from the gateway, identify it
-    if (request.path === '/identify-gateway' && !gatewayConnection) {
+    if (request.path === '/identify-gateway') {
+      if (gatewayConnection && gatewayConnection !== protocol) {
+        console.log('[RelayServer] >>> REPLACING EXISTING GATEWAY CONNECTION <<<');
+        try {
+          gatewayConnection.destroy?.();
+        } catch (_) {}
+      }
+
       console.log('[RelayServer] >>> GATEWAY IDENTIFICATION REQUEST RECEIVED <<<');
       setGatewayConnection(protocol, publicKey);
-      
+
       protocol.sendResponse({
         id: request.id,
         statusCode: 200,
