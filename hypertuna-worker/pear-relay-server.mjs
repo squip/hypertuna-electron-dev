@@ -47,6 +47,26 @@ import {
 import { getFile, getPfpFile } from './hyperdrive-manager.mjs';
 import { loadGatewaySettings, getCachedGatewaySettings } from '../shared/config/GatewaySettings.mjs';
 
+function parseNostrMessagePayload(message) {
+  if (typeof message === 'string') {
+    const trimmed = message.trim();
+    if (!trimmed.length) {
+      throw new Error('Empty NOSTR message payload');
+    }
+    return JSON.parse(trimmed);
+  }
+
+  if (message && message.type === 'Buffer' && Array.isArray(message.data)) {
+    const messageStr = b4a.from(message.data).toString('utf8');
+    if (!messageStr.trim().length) {
+      throw new Error('Empty NOSTR message payload');
+    }
+    return JSON.parse(messageStr);
+  }
+
+  return message;
+}
+
 
 // Global state
 let config = null;
@@ -1226,17 +1246,12 @@ function setupProtocolHandlers(protocol) {
         };
       }
       
-      // Parse the message
+      // Parse the message (supports both string payloads and Buffer objects)
       let nostrMessage;
-      if (message && message.type === 'Buffer' && Array.isArray(message.data)) {
-        const messageStr = b4a.from(message.data).toString('utf8');
-        try {
-          nostrMessage = JSON.parse(messageStr);
-        } catch (parseError) {
-          throw new Error(`Failed to parse NOSTR message: ${parseError.message}`);
-        }
-      } else {
-        nostrMessage = message;
+      try {
+        nostrMessage = parseNostrMessagePayload(message);
+      } catch (parseError) {
+        throw new Error(`Failed to parse NOSTR message: ${parseError.message}`);
       }
   
       if (!Array.isArray(nostrMessage)) {
@@ -2517,4 +2532,4 @@ export async function shutdownRelayServer() {
 }
 
 // Export for testing
-export { config, healthState, getActiveRelays };
+export { config, healthState, getActiveRelays, parseNostrMessagePayload };
