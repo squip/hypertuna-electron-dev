@@ -50,6 +50,7 @@ function integrateNostrRelays(App) {
 
     App.gatewayPeerRelayMap = new Map();
     App.gatewayPeerDetails = new Map();
+    App.publicGatewayState = null;
 
     // Track discovery relay connections displayed in profile UI
     App.discoveryRelays = new Map();
@@ -225,6 +226,10 @@ function integrateNostrRelays(App) {
         if (this.currentListView === 'discover' && typeof this.loadDiscoverRelays === 'function') {
             this.loadDiscoverRelays(true).catch((err) => console.error('Failed to refresh discover relays:', err));
         }
+    };
+
+    App.updatePublicGatewayState = function(state) {
+        this.publicGatewayState = state || null;
     };
 
     App.getRelayPeerEntry = function(identifier = null) {
@@ -1724,6 +1729,7 @@ App.syncHypertunaConfigToFile = async function() {
                 `;
 
                 messageList.appendChild(messageElement);
+                this.setupDriveMediaFallbacks(messageElement);
             }
             
             // Scroll to bottom
@@ -1928,6 +1934,89 @@ App.syncHypertunaConfigToFile = async function() {
         return /\.(png|jpe?g|gif|webp|bmp|svg|mp4|webm|ogg|mov)$/i.test(url);
     };
 
+    App.setupDriveMediaFallbacks = function(root) {
+        if (!root || typeof root.querySelectorAll !== 'function') return;
+
+        const attachFallbackSequence = (element, setSource, alternates) => {
+            if (!element || !alternates || !alternates.length) return;
+            const queue = [...alternates];
+
+            const applyNext = () => {
+                const nextUrl = queue.shift();
+                if (!nextUrl) return;
+
+                if (queue.length) {
+                    const chainedHandler = () => {
+                        element.removeEventListener('error', chainedHandler);
+                        applyNext();
+                    };
+                    element.addEventListener('error', chainedHandler, { once: true });
+                }
+
+                setSource(nextUrl);
+            };
+
+            const onError = () => {
+                element.removeEventListener('error', onError);
+                applyNext();
+            };
+
+            element.addEventListener('error', onError, { once: true });
+        };
+
+        const attachImageFallback = (img) => {
+            if (!img) return;
+            const src = img.getAttribute('src');
+            const info = HypertunaUtils.parseDriveUrl(src);
+            if (!info) return;
+            const driveInfo = HypertunaUtils.buildDriveUrl({
+                identifier: info.identifier,
+                fileId: info.fileId,
+                preferPublic: true
+            });
+            if (!driveInfo) return;
+
+            const alternates = [];
+            if (driveInfo.url && driveInfo.url !== src) alternates.push(driveInfo.url);
+            if (driveInfo.fallbackUrl && driveInfo.fallbackUrl !== src) alternates.push(driveInfo.fallbackUrl);
+            attachFallbackSequence(img, (nextUrl) => {
+                img.setAttribute('src', nextUrl);
+            }, alternates);
+        };
+
+        const attachVideoFallback = (video) => {
+            if (!video) return;
+            const sourceEl = video.querySelector?.('source') || null;
+            const currentSrc = sourceEl?.getAttribute('src') || video.getAttribute('src');
+            const info = HypertunaUtils.parseDriveUrl(currentSrc);
+            if (!info) return;
+            const driveInfo = HypertunaUtils.buildDriveUrl({
+                identifier: info.identifier,
+                fileId: info.fileId,
+                preferPublic: true
+            });
+            if (!driveInfo) return;
+
+            const alternates = [];
+            if (driveInfo.url && driveInfo.url !== currentSrc) alternates.push(driveInfo.url);
+            if (driveInfo.fallbackUrl && driveInfo.fallbackUrl !== currentSrc) alternates.push(driveInfo.fallbackUrl);
+
+            attachFallbackSequence(video, (nextUrl) => {
+                if (sourceEl) {
+                    sourceEl.setAttribute('src', nextUrl);
+                } else {
+                    video.setAttribute('src', nextUrl);
+                }
+                try {
+                    video.load();
+                } catch (_) {}
+            }, alternates);
+        };
+
+        root.querySelectorAll('img[src]').forEach(attachImageFallback);
+        root.querySelectorAll('video').forEach(attachVideoFallback);
+    };
+
     App.fetchPreview = async function(url) {
         try {
             const oembed = `https://noembed.com/embed?url=${encodeURIComponent(url)}`;
@@ -1944,14 +2033,37 @@ App.syncHypertunaConfigToFile = async function() {
         } catch (e) {
             // ignore oEmbed errors
         }
+        const parsedDrive = HypertunaUtils.parseDriveUrl(url);
+        const driveUrls = parsedDrive
+            ? HypertunaUtils.buildDriveUrl({ identifier: parsedDrive.identifier, fileId: parsedDrive.fileId, preferPublic: true })
+            : null;
+        const primaryUrl = driveUrls?.url || url;
+        const fallbackUrl = driveUrls?.fallbackUrl || null;
+
+        const fetchHtml = async (targetUrl, alternateUrl = null) => {
+            const response = await fetch(targetUrl);
+            if (!response.ok) {
+                if (alternateUrl && alternateUrl !== targetUrl) {
+                    return fetchHtml(alternateUrl, null);
+                }
+                throw new Error(`Preview fetch failed with status ${response.status}`);
+            }
+            const text = await response.text();
+            return { text, usedUrl: targetUrl };
+        };
+
         try {
-            const res = await fetch(url);
-            const text = await res.text();
+            const { text, usedUrl } = await fetchHtml(primaryUrl, fallbackUrl);
             const doc = new DOMParser().parseFromString(text, 'text/html');
             const title = doc.querySelector('meta[property="og:title"]')?.getAttribute('content') || doc.title || '';
             const description = doc.querySelector('meta[property="og:description"]')?.getAttribute('content') || '';
-            const thumbnail = doc.querySelector('meta[property="og:image"]')?.getAttribute('content') || '';
-            return { title, description, thumbnail, url };
+            let thumbnail = doc.querySelector('meta[property="og:image"]')?.getAttribute('content') || '';
+            if (thumbnail) {
+                try {
+                    thumbnail = new URL(thumbnail, usedUrl).toString();
+                } catch (_) {}
+            }
+            return { title, description, thumbnail, url: usedUrl };
         } catch (e) {
             console.error('fetchPreview failed', e);
         }

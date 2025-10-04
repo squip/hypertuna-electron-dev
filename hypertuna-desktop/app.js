@@ -408,6 +408,10 @@ function populatePublicGatewayRelayOptions() {
 
 function renderPublicGatewayStatus(state) {
   publicGatewayState = state || null
+  HypertunaUtils.updatePublicGatewayState(publicGatewayState)
+  if (window.App?.updatePublicGatewayState) {
+    window.App.updatePublicGatewayState(publicGatewayState)
+  }
   if (!publicGatewayStatusContainer) return
 
   const relays = state?.relays ? Object.entries(state.relays) : []

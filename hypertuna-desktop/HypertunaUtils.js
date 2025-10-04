@@ -28,6 +28,8 @@ export class HypertunaUtils {
      */
     static DEFAULT_CONTEXT = 'hypertuna-relay-peer';
 
+    static publicGatewayState = null;
+
     static async getGatewaySettings() {
         return loadGatewaySettings();
     }
@@ -44,6 +46,149 @@ export class HypertunaUtils {
     static getCachedGatewayUrl() {
         const settings = getCachedGatewaySettings();
         return settings.gatewayUrl;
+    }
+
+    static sanitizeBaseUrl(value) {
+        if (!value || typeof value !== 'string') return '';
+        const trimmed = value.trim();
+        if (!trimmed) return '';
+        return trimmed.replace(/\/$/, '');
+    }
+
+    static getLocalGatewayBase() {
+        const settings = this.getCachedGatewaySettings() || {};
+        const configured = this.sanitizeBaseUrl(settings.gatewayUrl || '');
+        return configured || 'http://127.0.0.1:8443';
+    }
+
+    static updatePublicGatewayState(state) {
+        if (!state || typeof state !== 'object') {
+            this.publicGatewayState = null;
+            return;
+        }
+
+        const relays = {};
+        if (state.relays && typeof state.relays === 'object') {
+            for (const [key, value] of Object.entries(state.relays)) {
+                relays[key] = value ? { ...value } : value;
+            }
+        }
+
+        this.publicGatewayState = {
+            enabled: !!state.enabled,
+            baseUrl: this.sanitizeBaseUrl(state.baseUrl || ''),
+            relays,
+            defaultTokenTtl: state.defaultTokenTtl || 3600,
+            wsBase: state.wsBase || null,
+            lastUpdatedAt: state.lastUpdatedAt || null
+        };
+    }
+
+    static getPublicGatewayState() {
+        return this.publicGatewayState;
+    }
+
+    static isRelayRegisteredWithPublic(identifier) {
+        const state = this.publicGatewayState;
+        if (!state || !state.enabled || !state.baseUrl) return false;
+        if (!identifier) return false;
+        const entry = state.relays?.[identifier];
+        if (!entry) return false;
+        return entry.status === 'registered';
+    }
+
+    static resolveDrivePath(identifier, fileId) {
+        const safeIdentifier = typeof identifier === 'string' && identifier.trim()
+            ? identifier.trim().replace(/^\/+/, '')
+            : '';
+        const safeFileId = typeof fileId === 'string' && fileId.trim()
+            ? fileId.trim().replace(/^\/+/, '')
+            : '';
+        if (!safeIdentifier || !safeFileId) {
+            return null;
+        }
+        return `/drive/${safeIdentifier}/${safeFileId}`;
+    }
+
+    static resolveDriveBases(identifier, preferPublic = true) {
+        const localBase = this.sanitizeBaseUrl(this.getLocalGatewayBase());
+        const state = this.publicGatewayState;
+        const publicAvailable = Boolean(
+            preferPublic &&
+            state &&
+            state.enabled &&
+            state.baseUrl &&
+            this.isRelayRegisteredWithPublic(identifier)
+        );
+
+        const publicBase = publicAvailable ? state.baseUrl : '';
+
+        let primaryBase = localBase;
+        let fallbackBase = '';
+
+        if (publicAvailable && publicBase) {
+            primaryBase = publicBase;
+            if (localBase && localBase !== publicBase) {
+                fallbackBase = localBase;
+            }
+        } else if (state && state.enabled && state.baseUrl && localBase !== state.baseUrl) {
+            fallbackBase = state.baseUrl;
+        }
+
+        return {
+            primaryBase: primaryBase || '',
+            fallbackBase: fallbackBase || ''
+        };
+    }
+
+    static buildDriveUrl({ identifier, fileId, preferPublic = true } = {}) {
+        const drivePath = this.resolveDrivePath(identifier, fileId);
+        if (!drivePath) {
+            return {
+                url: null,
+                drivePath: null,
+                primaryBase: null,
+                fallbackBase: null,
+                fallbackUrl: null
+            };
+        }
+        const { primaryBase, fallbackBase } = this.resolveDriveBases(identifier, preferPublic);
+        const url = primaryBase ? `${primaryBase}${drivePath}` : drivePath;
+        const fallbackUrl = fallbackBase ? `${fallbackBase}${drivePath}` : null;
+        return {
+            url,
+            drivePath,
+            primaryBase: primaryBase || null,
+            fallbackBase: fallbackBase || null,
+            fallbackUrl
+        };
+    }
+
+    static parseDriveUrl(url) {
+        if (!url || typeof url !== 'string') return null;
+        let parsed;
+        try {
+            parsed = new URL(url, window?.location?.origin || 'http://localhost');
+        } catch (_) {
+            return null;
+        }
+
+        const pathname = parsed.pathname || '';
+        if (!pathname.startsWith('/drive/')) return null;
+        const driveSegment = pathname.slice('/drive/'.length);
+        const lastSlash = driveSegment.lastIndexOf('/');
+        if (lastSlash === -1) return null;
+        const identifier = decodeURIComponent(driveSegment.slice(0, lastSlash));
+        const fileId = decodeURIComponent(driveSegment.slice(lastSlash + 1));
+        const drivePath = `/drive/${driveSegment}`;
+
+        return {
+            baseUrl: this.sanitizeBaseUrl(parsed.origin || ''),
+            identifier,
+            fileId,
+            drivePath,
+            originalUrl: url
+        };
     }
 
     static getGatewayHost(value) {

@@ -9,7 +9,8 @@ import rateLimit from 'express-rate-limit';
 import {
   EnhancedHyperswarmPool,
   forwardMessageToPeerHyperswarm,
-  getEventsFromPeerHyperswarm
+  getEventsFromPeerHyperswarm,
+  requestFileFromPeer
 } from '../../shared/public-gateway/HyperswarmClient.mjs';
 import {
   verifySignature,
@@ -119,6 +120,52 @@ class PublicGatewayService {
 
     app.get('/health', (_req, res) => {
       res.json({ status: 'ok' });
+    });
+
+    app.get('/drive/:identifier/:file', async (req, res) => {
+      const { identifier, file } = req.params;
+      try {
+        const target = await this.#resolveRelayTarget(identifier);
+        if (!target) {
+          this.logger.warn?.('Drive request for unknown relay identifier', { identifier, file });
+          return res.status(404).json({ error: 'Relay not registered with gateway' });
+        }
+
+        const streamResult = await this.#withRelayPeerKey(target.relayKey, async (peerKey) => {
+          const peer = { publicKey: peerKey };
+          const result = await requestFileFromPeer(peer, target.driveIdentifier, file, this.connectionPool);
+          return { peerKey, stream: result };
+        });
+
+        const { stream: bodyStream, peerKey } = streamResult;
+        if (!bodyStream) {
+          this.logger.warn?.('Peer returned empty stream for drive request', { identifier, file, peerKey });
+          return res.status(404).json({ error: 'File not found' });
+        }
+
+        Object.entries(bodyStream.headers || {}).forEach(([key, value]) => {
+          if (value !== undefined) {
+            res.setHeader(key, value);
+          }
+        });
+
+        const statusCode = Number.isInteger(bodyStream.statusCode) ? bodyStream.statusCode : 200;
+        res.status(statusCode);
+        bodyStream.pipe(res);
+      } catch (error) {
+        const statusCode = Number.isInteger(error?.statusCode) ? error.statusCode : 500;
+        this.logger.error?.('Drive request failed', {
+          identifier,
+          file,
+          statusCode,
+          error: error?.message || error
+        });
+        if (!res.headersSent) {
+          res.status(statusCode).json({ error: error?.message || 'Unable to fetch file' });
+        } else {
+          res.end();
+        }
+      }
     });
 
     app.post('/api/relays', (req, res) => this.#handleRelayRegistration(req, res));
@@ -401,6 +448,172 @@ class PublicGatewayService {
     if (!session.peers?.length) return;
     session.peerIndex = (session.peerIndex + 1) % session.peers.length;
     session.peerKey = this.#currentPeer(session);
+  }
+
+  async #withRelayPeerKey(relayKey, handler) {
+    const registration = await this.registrationStore.getRelay(relayKey);
+    if (!registration) {
+      const error = new Error('Relay not registered with gateway');
+      error.statusCode = 404;
+      throw error;
+    }
+
+    const peers = this.#getPeersFromRegistration(registration);
+    if (!peers.length) {
+      const error = new Error('Relay has no available peers');
+      error.statusCode = 503;
+      throw error;
+    }
+
+    const startIndex = this.relayPeerIndex.get(relayKey) || 0;
+    let lastError = null;
+
+    for (let attempt = 0; attempt < peers.length; attempt += 1) {
+      const index = (startIndex + attempt) % peers.length;
+      const peerKey = peers[index];
+
+      try {
+        await this.connectionPool.getConnection(peerKey);
+        this.relayPeerIndex.set(relayKey, (index + 1) % peers.length);
+        return handler(peerKey, registration);
+      } catch (error) {
+        lastError = error;
+        this.logger.warn?.('Failed to use peer for drive request', {
+          relayKey,
+          peerKey,
+          error: error?.message || error
+        });
+      }
+    }
+
+    if (lastError) {
+      throw lastError;
+    }
+
+    const error = new Error('No peers available for relay');
+    error.statusCode = 503;
+    throw error;
+  }
+
+  async #resolveRelayTarget(identifier) {
+    if (!identifier) return null;
+
+    const direct = await this.registrationStore.getRelay(identifier);
+    if (direct) {
+      const driveIdentifier = this.#extractDriveIdentifier(direct, identifier);
+      if (!driveIdentifier) return null;
+      return {
+        relayKey: identifier,
+        driveIdentifier
+      };
+    }
+
+    const allKeys = typeof this.registrationStore.getAllRelayKeys === 'function'
+      ? await this.registrationStore.getAllRelayKeys()
+      : Array.from(this.registrationStore.items?.keys?.() || []);
+
+    for (const relayKey of allKeys) {
+      const registration = await this.registrationStore.getRelay(relayKey);
+      if (!registration) continue;
+
+      const driveIdentifier = this.#extractDriveIdentifier(registration, relayKey);
+      if (!driveIdentifier) continue;
+
+      if (identifier === driveIdentifier) {
+        return { relayKey, driveIdentifier };
+      }
+
+      const gatewayPath = this.#toGatewayPath(driveIdentifier);
+      if (gatewayPath && identifier === gatewayPath) {
+        return { relayKey, driveIdentifier };
+      }
+
+      const metadataPath = this.#normalizePathValue(registration?.metadata?.gatewayPath);
+      if (metadataPath) {
+        if (identifier === metadataPath) {
+          return { relayKey, driveIdentifier };
+        }
+        const colonFromMetadata = this.#toColonIdentifier(metadataPath);
+        if (colonFromMetadata && identifier === colonFromMetadata) {
+          return { relayKey, driveIdentifier: colonFromMetadata };
+        }
+      }
+
+      const connectionUrl = registration?.metadata?.connectionUrl;
+      if (connectionUrl) {
+        try {
+          const parsed = new URL(connectionUrl);
+          const path = this.#normalizePathValue(parsed.pathname);
+          if (path) {
+            if (identifier === path) {
+              return { relayKey, driveIdentifier };
+            }
+            const colonPath = this.#toColonIdentifier(path);
+            if (colonPath && identifier === colonPath) {
+              return { relayKey, driveIdentifier: colonPath };
+            }
+          }
+        } catch (_) {}
+      }
+    }
+
+    return null;
+  }
+
+  #extractDriveIdentifier(registration, fallbackKey) {
+    const identifier = registration?.identifier || registration?.publicIdentifier;
+    if (typeof identifier === 'string' && identifier.trim()) {
+      return identifier.trim();
+    }
+
+    const gatewayPath = this.#normalizePathValue(registration?.metadata?.gatewayPath);
+    if (gatewayPath) {
+      const colon = this.#toColonIdentifier(gatewayPath);
+      if (colon) return colon;
+    }
+
+    const fallback = typeof fallbackKey === 'string' && fallbackKey.trim()
+      ? fallbackKey.trim()
+      : null;
+    if (fallback && fallback.includes(':')) return fallback;
+    if (fallback) {
+      const colonFallback = this.#toColonIdentifier(fallback);
+      if (colonFallback) return colonFallback;
+    }
+    return fallback;
+  }
+
+  #normalizePathValue(value) {
+    if (!value || typeof value !== 'string') return null;
+    const trimmed = value.trim();
+    if (!trimmed) return null;
+    return trimmed.replace(/^\/+/, '').replace(/\/+$/, '');
+  }
+
+  #toGatewayPath(identifier) {
+    if (!identifier || typeof identifier !== 'string') return null;
+    const trimmed = identifier.trim();
+    if (!trimmed) return null;
+    if (trimmed.includes('/')) {
+      return this.#normalizePathValue(trimmed);
+    }
+    const idx = trimmed.indexOf(':');
+    if (idx !== -1) {
+      return `${trimmed.slice(0, idx)}/${trimmed.slice(idx + 1)}`;
+    }
+    return trimmed;
+  }
+
+  #toColonIdentifier(value) {
+    if (!value || typeof value !== 'string') return null;
+    const normalized = this.#normalizePathValue(value);
+    if (!normalized) return null;
+    if (normalized.includes(':')) return normalized;
+    const idx = normalized.indexOf('/');
+    if (idx !== -1) {
+      return `${normalized.slice(0, idx)}:${normalized.slice(idx + 1)}`;
+    }
+    return normalized;
   }
 
   async #withPeer(session, handler) {
