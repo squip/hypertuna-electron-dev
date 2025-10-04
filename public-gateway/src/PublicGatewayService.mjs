@@ -31,6 +31,7 @@ class PublicGatewayService {
     this.server = null;
     this.wss = null;
     this.connectionPool = new EnhancedHyperswarmPool({
+      logger: this.logger,
       onProtocol: this.#onProtocolCreated.bind(this),
       onHandshake: this.#onProtocolHandshake.bind(this)
     });
@@ -186,7 +187,14 @@ class PublicGatewayService {
       return;
     }
 
-    const selection = this.#selectPeer(registration);
+    const availablePeers = this.#getPeersFromRegistration(registration);
+    this.logger.info?.('Initializing websocket session - relay registration fetched', {
+      relayKey,
+      peerCount: availablePeers.length,
+      peers: availablePeers
+    });
+
+    const selection = this.#selectPeer({ ...registration, peers: availablePeers });
     if (!selection) {
       this.logger.warn?.('WebSocket rejected: no peers available', { relayKey });
       ws.close(1013, 'No peers available');
@@ -197,7 +205,15 @@ class PublicGatewayService {
     const { peerKey, peers, index } = selection;
     const peerIndex = index >= 0 ? index : 0;
     try {
+      this.logger.info?.('Attempting hyperswarm connection for websocket session', {
+        relayKey,
+        peerKey
+      });
       await this.connectionPool.getConnection(peerKey);
+      this.logger.info?.('Hyperswarm connection established for websocket session', {
+        relayKey,
+        peerKey
+      });
     } catch (err) {
       err.relayKey = relayKey;
       this.logger.error?.('WebSocket rejected: failed to connect to peer', {
@@ -397,6 +413,10 @@ class PublicGatewayService {
       try {
         const result = await handler(peerKey);
         session.peerKey = peerKey;
+        this.logger.info?.('Peer operation succeeded', {
+          relayKey: session.relayKey,
+          peerKey
+        });
         return result;
       } catch (error) {
         lastError = error;
@@ -404,6 +424,10 @@ class PublicGatewayService {
           relayKey: session.relayKey,
           peerKey,
           error: error.message
+        });
+        this.logger.info?.('Advancing to next peer after failure', {
+          relayKey: session.relayKey,
+          previousPeer: peerKey
         });
         this.#advancePeer(session);
         attempts += 1;

@@ -1,6 +1,9 @@
-FROM node:18-bullseye-slim
+FROM node:20-bookworm-slim
+
 WORKDIR /app/public-gateway
 
+# If you still have other native addons that need compilation,
+# leave this block in; otherwise you can remove it.
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
       build-essential \
@@ -10,16 +13,12 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/*
 
 COPY public-gateway/package*.json ./
-RUN npm install --omit=dev && \
-    npm rebuild sodium-native --build-from-source --unsafe-perm
+RUN npm install --omit=dev
 
 COPY public-gateway/src ./src
 COPY shared /app/shared
 
-RUN npm install --prefix /app/shared --omit=dev && \
-    npm rebuild sodium-native --prefix /app/shared --build-from-source --unsafe-perm
-RUN node -e "require('sodium-native')" && \
-    node -e "require('/app/shared/node_modules/sodium-native')"
+RUN npm install --prefix /app/shared --omit=dev
 
 ENV NODE_PATH=/app/public-gateway/node_modules:/app/shared/node_modules
 EXPOSE 4430

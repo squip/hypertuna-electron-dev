@@ -6,13 +6,6 @@
     "protomux": "^3.10.1",
     "compact-encoding": "^2.16.1",
     "hypercore-crypto": "^3.6.1",
-    "hyperswarm": "^3.0.4",
-    "sodium-native": "3.3.0"
-  },
-  "overrides": {
-  "sodium-native": "3.3.0",
-  "sodium-universal":  {
-    "sodium-native": "3.3.0"
-}
-}
+    "hyperswarm": "^4.14.0"
+  }
 }

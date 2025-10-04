@@ -13,8 +13,7 @@
   "dependencies": {
     "express": "^4.19.2",
     "ws": "^8.18.0",
-    "hyperswarm": "^3.0.4",
-    "sodium-native": "3.3.0",
+    "hyperswarm": "^4.14.0",
     "hypercore-crypto": "^3.5.0",
     "compact-encoding": "^2.12.0",
     "prom-client": "^15.1.0",
@@ -26,12 +25,6 @@
     "helmet": "^7.0.0",
     "express-rate-limit": "^7.2.0"
   },
-    "overrides": {
-    "sodium-native": "3.3.0",
-    "sodium-universal":  {
-      "sodium-native": "3.3.0"
-  }
-},
   "devDependencies": {
     "eslint": "^8.57.0"
   }

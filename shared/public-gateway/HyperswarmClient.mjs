@@ -5,10 +5,11 @@ import { Readable } from 'node:stream';
 import RelayProtocol from './RelayProtocol.mjs';
 
 class HyperswarmConnection {
-  constructor(publicKey, swarm, pool) {
+  constructor(publicKey, swarm, pool, logger = console) {
     this.publicKey = publicKey;
     this.swarm = swarm;
     this.pool = pool;
+    this.logger = logger;
     this.protocol = null;
     this.stream = null;
     this.connected = false;
@@ -24,14 +25,20 @@ class HyperswarmConnection {
     }
 
     if (this.connectPromise) {
+      this.logger?.info?.('Hyperswarm connection already in progress', { peer: this.publicKey });
       return this.connectPromise;
     }
 
     this.connectionAttempts++;
     this.connecting = true;
+    this.logger?.info?.('Hyperswarm connect initiating', {
+      peer: this.publicKey,
+      attempt: this.connectionAttempts
+    });
 
     this.connectPromise = (async () => {
       try {
+        this.logger?.info?.('Ensuring topic joined before dialing peer', { peer: this.publicKey });
         await this.pool.ensureTopicJoined();
         const connection = await this._waitForOrCreateConnection(this.publicKey);
         if (!connection) {
@@ -41,6 +48,7 @@ class HyperswarmConnection {
         this.stream = connection;
         this.protocol = new RelayProtocolWithGateway(connection, false);
         this.pool._configureProtocol(this.publicKey, this.protocol, { isServer: false, connection: this });
+        this.logger?.info?.('Protocol instance created for peer', { peer: this.publicKey });
 
         await new Promise((resolve, reject) => {
           const timeout = setTimeout(() => {
@@ -58,6 +66,7 @@ class HyperswarmConnection {
             cleanup();
             this.connected = true;
             this.connecting = false;
+            this.logger?.info?.('Protocol handshake open', { peer: this.publicKey });
             resolve();
           };
 
@@ -65,6 +74,7 @@ class HyperswarmConnection {
             cleanup();
             this.connected = false;
             this.connecting = false;
+            this.logger?.warn?.('Protocol closed during handshake', { peer: this.publicKey });
             reject(new Error('Protocol closed during handshake'));
           };
 
@@ -72,6 +82,10 @@ class HyperswarmConnection {
             cleanup();
             this.connected = false;
             this.connecting = false;
+            this.logger?.error?.('Protocol error during handshake', {
+              peer: this.publicKey,
+              error: err?.message || err
+            });
             reject(err);
           };
 
@@ -91,6 +105,11 @@ class HyperswarmConnection {
           this.stream.destroy();
           this.stream = null;
         }
+        this.logger?.error?.('Hyperswarm connect failed', {
+          peer: this.publicKey,
+          attempt: this.connectionAttempts,
+          error: err?.message || err
+        });
         throw err;
       } finally {
         this.connecting = false;
@@ -101,51 +120,124 @@ class HyperswarmConnection {
       await this.connectPromise;
     } finally {
       this.connectPromise = null;
+      this.logger?.info?.('Hyperswarm connect finished', {
+        peer: this.publicKey,
+        connected: this.connected
+      });
     }
   }
   
   async _identifyAsGateway() {
     if (!this.protocol) return;
     try {
+      this.logger?.info?.('Sending gateway identification', { peer: this.publicKey });
       await this.protocol.sendRequest({
         method: 'POST',
-        path: '/identify',
+        path: '/identify-gateway',
         headers: { 'content-type': 'application/json' },
         body: Buffer.from(JSON.stringify({ role: 'gateway' }))
       });
+      this.logger?.info?.('Gateway identification acknowledged', { peer: this.publicKey });
     } catch (err) {
       this.connected = false;
+      this.logger?.error?.('Gateway identification request failed', {
+        peer: this.publicKey,
+        error: err?.message || err
+      });
       throw err;
     }
   }
   
   _waitForOrCreateConnection(targetPublicKey) {
-    const targetBuffer = Buffer.from(targetPublicKey, 'hex');
     return new Promise((resolve, reject) => {
-      const direct = this.swarm.get(targetBuffer);
-      if (direct && direct.stream) {
-        resolve(direct.stream);
+      let targetBuffer;
+      try {
+        targetBuffer = Buffer.from(targetPublicKey, 'hex');
+      } catch (error) {
+        const err = new Error('Invalid peer key encountered (non-hex value)');
+        this.logger?.error?.({ peer: targetPublicKey, error: error?.message || error }, 'Failed to parse peer key');
+        reject(err);
         return;
       }
 
-      const timeout = setTimeout(() => {
+      if (!targetBuffer || targetBuffer.length !== 32) {
+        const err = new Error(`Invalid peer key length (${targetBuffer?.length ?? 0}), expected 32 bytes`);
+        this.logger?.error?.({ peer: targetPublicKey }, 'Peer key failed validation');
+        reject(err);
+        return;
+      }
+
+      const existing = this.pool.connections.get(targetPublicKey);
+      if (existing && existing !== this && existing.stream) {
+        this.logger?.info?.({ peer: targetPublicKey }, 'Reusing existing stream for peer');
+        resolve(existing.stream);
+        return;
+      }
+
+      for (const conn of this.pool.swarm?.connections || []) {
+        if (conn.remotePublicKey && conn.remotePublicKey.equals(targetBuffer)) {
+          this.logger?.info?.({ peer: targetPublicKey }, 'Found active swarm connection for peer');
+          resolve(conn);
+          return;
+        }
+      }
+
+      let settled = false;
+
+      const cleanup = () => {
+        settled = true;
+        clearTimeout(timeout);
         this.swarm.removeListener('connection', onConnection);
-        reject(new Error('Connection timeout'));
+        this.pool._releasePeerDiscovery?.(targetPublicKey, targetBuffer);
+      };
+
+      const succeed = (stream) => {
+        if (settled) return;
+        cleanup();
+        this.logger?.info?.({ peer: targetPublicKey }, 'Hyperswarm dial succeeded');
+        resolve(stream);
+      };
+
+      const fail = (error) => {
+        if (settled) return;
+        cleanup();
+        this.logger?.warn?.({
+          peer: targetPublicKey,
+          error: error?.message || error
+        }, 'Hyperswarm dial failed');
+        reject(error instanceof Error ? error : new Error(String(error)));
+      };
+
+      const timeout = setTimeout(() => {
+        fail(new Error('Connection timeout'));
       }, 15000);
 
+      const startTime = Date.now();
       const onConnection = (conn, peerInfo) => {
-        const connKey = peerInfo.publicKey.toString('hex');
         if (peerInfo.publicKey.equals(targetBuffer)) {
-          clearTimeout(timeout);
-          this.swarm.removeListener('connection', onConnection);
-          resolve(conn);
-        } else {
-          // not the target
+          const elapsed = Date.now() - startTime;
+          this.logger?.info?.({ peer: targetPublicKey, elapsedMs: elapsed }, 'Received incoming hyperswarm connection for peer');
+          succeed(conn);
         }
       };
 
+      this.logger?.info?.({ peer: targetPublicKey }, 'Waiting for hyperswarm connection event');
       this.swarm.on('connection', onConnection);
-      this.swarm.flush().catch(() => {});
+
+      try {
+        this.pool._ensurePeerDiscovery?.(targetPublicKey, targetBuffer);
+      } catch (error) {
+        fail(error);
+        return;
+      }
+
+      // Flush to expedite discovery and holepunching attempts
+      this.swarm.flush().catch((error) => {
+        this.logger?.debug?.({
+          peer: targetPublicKey,
+          error: error?.message || error
+        }, 'Hyperswarm flush failed');
+      });
     });
   }
   
@@ -166,6 +258,10 @@ class HyperswarmConnection {
   }
   
   destroy() {
+    this.logger?.info?.('Destroying hyperswarm connection', {
+      peer: this.publicKey,
+      connected: this.connected
+    });
     if (this.protocol) {
       this.protocol.destroy();
     }
@@ -218,32 +314,37 @@ class EnhancedHyperswarmPool {
     this.topicDiscovery = null;
     this.peerDiscoveries = new Map();
     this.options = options || {};
+    this.logger = options.logger || console;
   }
-  
+
   async initialize() {
     if (this.initialized) return;
 
     const seed = crypto.randomBytes(32);
     this.swarmKeyPair = crypto.keyPair(seed);
     this.swarm = new Hyperswarm({ keyPair: this.swarmKeyPair });
+    this.logger?.info?.('Hyperswarm pool initialized with new swarm keypair');
 
     this.swarm.on('connection', (connection, peerInfo) => {
       const publicKey = peerInfo.publicKey.toString('hex');
       const existing = this.connections.get(publicKey);
       if (existing) {
+        this.logger?.info?.('Replacing existing connection from swarm event', { peer: publicKey });
         existing.destroy();
       }
-      const conn = new HyperswarmConnection(publicKey, this.swarm, this);
+      const conn = new HyperswarmConnection(publicKey, this.swarm, this, this.logger);
       conn.stream = connection;
       conn.protocol = new RelayProtocolWithGateway(connection, true);
       conn.connected = true;
       this._configureProtocol(publicKey, conn.protocol, { isServer: true, peerInfo, connection: conn });
       this.connections.set(publicKey, conn);
+      this.logger?.info?.('Registered inbound hyperswarm connection', { peer: publicKey });
     });
 
     const topic = crypto.hash(Buffer.from('hypertuna-relay-network'));
     this.topicDiscovery = this.swarm.join(topic, { server: false, client: true });
     await this.topicDiscovery.flushed();
+    this.logger?.info?.('Hyperswarm topic joined', { topic: 'hypertuna-relay-network' });
     this.initialized = true;
   }
   
@@ -253,18 +354,62 @@ class EnhancedHyperswarmPool {
       const topic = crypto.hash(Buffer.from('hypertuna-relay-network'));
       this.topicDiscovery = this.swarm.join(topic, { server: false, client: true });
       await this.topicDiscovery.flushed();
+      this.logger?.info?.('Hyperswarm topic rejoined', { topic: 'hypertuna-relay-network' });
     }
   }
   
   async getConnection(publicKey) {
     if (!this.initialized) await this.initialize();
+    this.logger?.info?.('Requesting hyperswarm connection', { peer: publicKey });
     let connection = this.connections.get(publicKey);
     if (!connection) {
-      connection = new HyperswarmConnection(publicKey, this.swarm, this);
+      this.logger?.info?.('Creating new connection wrapper for peer', { peer: publicKey });
+      connection = new HyperswarmConnection(publicKey, this.swarm, this, this.logger);
       this.connections.set(publicKey, connection);
     }
     await connection.connect();
+    this.logger?.info?.('Hyperswarm connection ready', {
+      peer: publicKey,
+      connected: connection.connected
+    });
     return connection;
+  }
+
+  _ensurePeerDiscovery(publicKey, keyBuffer) {
+    if (this.peerDiscoveries.has(publicKey)) {
+      this.logger?.debug?.('Reusing existing peer discovery', { peer: publicKey });
+      return true;
+    }
+
+    try {
+      this.swarm.joinPeer(keyBuffer);
+      this.peerDiscoveries.set(publicKey, keyBuffer);
+      this.logger?.info?.('Joined peer for holepunch support', { peer: publicKey });
+    } catch (error) {
+      this.logger?.warn?.('Failed to join peer for holepunch support', {
+        peer: publicKey,
+        error: error?.message || error
+      });
+      throw error;
+    }
+
+    return true;
+  }
+
+  _releasePeerDiscovery(publicKey, keyBuffer) {
+    const stored = this.peerDiscoveries.get(publicKey);
+    if (!stored) return;
+    try {
+      const buffer = stored instanceof Uint8Array ? stored : keyBuffer;
+      this.swarm.leavePeer?.(buffer);
+    } catch (error) {
+      this.logger?.debug?.('leavePeer not supported or failed', {
+        peer: publicKey,
+        error: error?.message || error
+      });
+    }
+    this.peerDiscoveries.delete(publicKey);
+    this.logger?.debug?.('Peer discovery released', { peer: publicKey });
   }
 
   _configureProtocol(publicKey, protocol, context = {}) {
@@ -293,10 +438,14 @@ class EnhancedHyperswarmPool {
   }
   
   async destroy() {
+    this.logger?.info?.('Destroying hyperswarm pool, closing connections', {
+      connectionCount: this.connections.size
+    });
     for (const connection of this.connections.values()) {
       connection.destroy();
     }
     this.connections.clear();
+    this.peerDiscoveries.clear();
     if (this.topicDiscovery) {
       try { await this.topicDiscovery.destroy(); } catch (_) {}
       this.topicDiscovery = null;
@@ -305,6 +454,7 @@ class EnhancedHyperswarmPool {
       try { await this.swarm.destroy(); } catch (_) {}
       this.swarm = null;
     }
+    this.logger?.info?.('Hyperswarm pool destroyed');
     this.initialized = false;
   }
 }
