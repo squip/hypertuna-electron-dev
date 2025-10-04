@@ -104,7 +104,9 @@ class PublicGatewayService {
   #setupHttpServer() {
     const app = this.app;
     app.disable('x-powered-by');
-    app.use(helmet());
+    app.use(helmet({
+      crossOriginResourcePolicy: { policy: 'cross-origin' }
+    }));
     app.use(express.json({ limit: '256kb' }));
 
     if (this.config.rateLimit?.enabled) {
@@ -134,6 +136,22 @@ class PublicGatewayService {
         const streamResult = await this.#withRelayPeerKey(target.relayKey, async (peerKey) => {
           const peer = { publicKey: peerKey };
           const result = await requestFileFromPeer(peer, target.driveIdentifier, file, this.connectionPool);
+
+          if (!result) {
+            const err = new Error('Peer returned empty response');
+            err.statusCode = 502;
+            err.peerKey = peerKey;
+            throw err;
+          }
+
+          const status = Number.isInteger(result.statusCode) ? result.statusCode : 200;
+          if (status >= 400) {
+            const err = new Error(`Peer responded with status ${status}`);
+            err.statusCode = status;
+            err.peerKey = peerKey;
+            throw err;
+          }
+
           return { peerKey, stream: result };
         });
 
