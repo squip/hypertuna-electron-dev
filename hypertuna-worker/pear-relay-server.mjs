@@ -77,6 +77,7 @@ let pendingRegistrations = []; // Queue registrations until gateway connects
 let connectedPeers = new Map(); // Track all connected peers
 let pendingPeerProtocols = new Map(); // Awaiters for outbound connections
 const peerJoinHandles = new Map(); // Persistent joinPeer handles
+let healthMonitorTimer = null;
 
 // Enhanced health state tracking
 let healthState = {
@@ -172,76 +173,88 @@ export async function initializeRelayServer(customConfig = {}) {
   const authStore = getRelayAuthStore();
   console.log('[RelayServer] Auth store initialized');
   
-  // Auto-connect to stored relays
+  console.log('[RelayServer] Base initialization complete (gateway startup deferred)');
+  console.log('[RelayServer] ========================================');
+  
+  return true;
+}
+
+export async function connectStoredRelays() {
+  if (!config) {
+    throw new Error('Relay server not initialized');
+  }
+
+  let connectedRelays = [];
+
   try {
     console.log('[RelayServer] Starting auto-connection to stored relays...');
-    const connectedRelays = await autoConnectStoredRelays(config);
+    connectedRelays = await autoConnectStoredRelays(config);
     console.log(`[RelayServer] Auto-connected to ${connectedRelays.length} relays`);
-    
-    // Update health state after auto-connect
-    await updateHealthState();
-    
-    // If we have relays and gateway registration is enabled, register them
-    if (connectedRelays.length > 0 && config.registerWithGateway) {
-        console.log('[RelayServer] Registering auto-connected relays with gateway...');
-        
-        // Register each connected relay
-        for (const relayKey of connectedRelays) {
-            try {
-                const profile = await getRelayProfileByKey(relayKey);
-                if (profile) {
-                  await registerWithGateway(profile);
 
-                  // Determine auth token for current user if required
-                  let userAuthToken = null;
-                  if (profile.auth_config?.requiresAuth && config.nostr_pubkey_hex) {
-                      const authorizedUsers = calculateAuthorizedUsers(
-                          profile.auth_config.auth_adds || [],
-                          profile.auth_config.auth_removes || []
-                      );
-                      const userAuth = authorizedUsers.find(u => u.pubkey === config.nostr_pubkey_hex);
-                      userAuthToken = userAuth?.token || null;
-                  }
-              
-                  // Build connection URL including public identifier and token
-                  const identifierPath = profile.public_identifier ?
-                      profile.public_identifier.replace(':', '/') :
-                      relayKey;
-                  const baseUrl = `${buildGatewayWebsocketBase(config)}/${identifierPath}`;
-                  const connectionUrl = userAuthToken ? `${baseUrl}?token=${userAuthToken}` : baseUrl;
-              
-                  // Send registration complete message with CORRECT URL
-                  if (global.sendMessage) {
-                      global.sendMessage({
-                          type: 'relay-registration-complete',
-                          relayKey: relayKey,
-                          publicIdentifier: profile.public_identifier,
-                          gatewayUrl: connectionUrl,  // Use the full authenticated URL
-                          authToken: userAuthToken,
-                          timestamp: new Date().toISOString()
-                      });
-                  }
-              }
-            } catch (regError) {
-                console.error(`[RelayServer] Failed to register relay ${relayKey}:`, regError);
-            }
+    if (connectedRelays.length > 0 && config.registerWithGateway) {
+      console.log('[RelayServer] Registering auto-connected relays with gateway...');
+
+      for (const relayKey of connectedRelays) {
+        try {
+          const profile = await getRelayProfileByKey(relayKey);
+          if (!profile) continue;
+
+          await registerWithGateway(profile);
+
+          let userAuthToken = null;
+          if (profile.auth_config?.requiresAuth && config.nostr_pubkey_hex) {
+            const authorizedUsers = calculateAuthorizedUsers(
+              profile.auth_config.auth_adds || [],
+              profile.auth_config.auth_removes || []
+            );
+            const userAuth = authorizedUsers.find(u => u.pubkey === config.nostr_pubkey_hex);
+            userAuthToken = userAuth?.token || null;
+          }
+
+          const identifierPath = profile.public_identifier
+            ? profile.public_identifier.replace(':', '/')
+            : relayKey;
+          const baseUrl = `${buildGatewayWebsocketBase(config)}/${identifierPath}`;
+          const connectionUrl = userAuthToken ? `${baseUrl}?token=${userAuthToken}` : baseUrl;
+
+          if (global.sendMessage) {
+            global.sendMessage({
+              type: 'relay-registration-complete',
+              relayKey,
+              publicIdentifier: profile.public_identifier,
+              gatewayUrl: connectionUrl,
+              authToken: userAuthToken,
+              timestamp: new Date().toISOString()
+            });
+          }
+        } catch (regError) {
+          console.error(`[RelayServer] Failed to register relay ${relayKey}:`, regError);
         }
+      }
     }
-} catch (error) {
+  } catch (error) {
     console.error('[RelayServer] Error during auto-connection:', error);
-}
-  
-  // Start internal health monitoring
+  }
+
+  try {
+    await updateHealthState();
+  } catch (error) {
+    console.warn('[RelayServer] Failed to update health state after auto-connect:', error.message);
+  }
+
   startHealthMonitoring();
-  
-  // Set up periodic registration attempts if enabled
+
   if (config.registerWithGateway) {
     console.log('[RelayServer] Gateway registration is ENABLED');
-    
+
     // Try to register immediately if we have pending registrations
     processPendingRegistrations();
-    
-    // Set up periodic registration
+
+    if (gatewayRegistrationInterval) {
+      clearInterval(gatewayRegistrationInterval);
+      gatewayRegistrationInterval = null;
+    }
+
     gatewayRegistrationInterval = setInterval(() => {
       console.log('[RelayServer] Periodic registration check...');
       if (gatewayConnection) {
@@ -254,24 +267,22 @@ export async function initializeRelayServer(customConfig = {}) {
         console.log('[RelayServer] Connected peers:', Array.from(connectedPeers.keys()).map(k => k.substring(0, 8) + '...'));
       }
     }, config.registerInterval);
+
+    // Trigger initial registration via Hyperswarm after a brief delay
+    setTimeout(async () => {
+      if (!config.registerWithGateway) return;
+      console.log('[RelayServer] Performing initial Hyperswarm registration with gateway...');
+      try {
+        await registerWithGateway();
+      } catch (error) {
+        console.error('[RelayServer] Initial gateway registration failed:', error.message);
+      }
+    }, 2000);
   } else {
     console.log('[RelayServer] Gateway registration is DISABLED');
   }
-  
-  console.log('[RelayServer] Initialization complete');
-  console.log('[RelayServer] ========================================');
-  
-  // Trigger initial registration via Hyperswarm after a delay
-  setTimeout(async () => {
-    console.log('[RelayServer] Performing initial Hyperswarm registration with gateway...');
-    try {
-      await registerWithGateway();
-    } catch (error) {
-      console.error('[RelayServer] Initial gateway registration failed:', error.message);
-    }
-  }, 2000); // Give everything time to stabilize
-  
-  return true;
+
+  return connectedRelays;
 }
 
 function generateHexKey() {
@@ -1851,17 +1862,20 @@ async function updateHealthState() {
 
 // Start health monitoring
 function startHealthMonitoring() {
+  if (healthMonitorTimer) {
+    return;
+  }
+
   console.log('[RelayServer] Starting health monitoring (30s interval)');
-  
-  setInterval(async () => { // Made async
-    await updateHealthState(); // Added await
-    
-    // Check if health state is stale
+
+  healthMonitorTimer = setInterval(async () => {
+    await updateHealthState();
+
     const now = Date.now();
     if (now - healthState.lastCheck > 30000) {
       healthState.status = 'warning';
     }
-    
+
     console.log('[RelayServer] Periodic health check:', {
       status: healthState.status,
       activeRelays: healthState.activeRelaysCount,
@@ -1869,15 +1883,14 @@ function startHealthMonitoring() {
       connectedPeers: connectedPeers.size,
       gatewayConnected: !!gatewayConnection
     });
-    
-    // Send health update to parent
+
     if (global.sendMessage) {
       global.sendMessage({
         type: 'health-update',
         healthState
       });
     }
-  }, 30000); // Every 30 seconds
+  }, 30000);
 }
 
 // Update metrics
@@ -2515,6 +2528,11 @@ export async function shutdownRelayServer() {
   if (gatewayRegistrationInterval) {
     clearInterval(gatewayRegistrationInterval);
     gatewayRegistrationInterval = null;
+  }
+
+  if (healthMonitorTimer) {
+    clearInterval(healthMonitorTimer);
+    healthMonitorTimer = null;
   }
   
   // Clean up all active relays

@@ -3575,11 +3575,14 @@ App.setupFollowingModalListeners = function() {
         state.initialized = true;
         state.initCount++;
         state.lastUrl = data.gatewayUrl;
+        state.requiresAuth = data.requiresAuth === true;
         
         console.log(`[App] Relay ${identifier} state after initialized:`, state);
         
         if (this.nostr) {
-            this.nostr.handleRelayInitialized(identifier, data.gatewayUrl, data.userAuthToken);
+            this.nostr.handleRelayInitialized(identifier, data.gatewayUrl, data.userAuthToken, {
+                requiresAuth: data.requiresAuth === true
+            });
         }
     };
 

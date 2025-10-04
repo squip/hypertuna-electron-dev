@@ -78,9 +78,9 @@ class NostrIntegration {
     /**
      * Handle relay ready notification from worker
      */
-    handleRelayInitialized(identifier, gatewayUrl, authToken = null) {
+    handleRelayInitialized(identifier, gatewayUrl, authToken = null, metadata = {}) {
         if (this.client) {
-            this.client.handleRelayInitialized(identifier, gatewayUrl, authToken);
+            this.client.handleRelayInitialized(identifier, gatewayUrl, authToken, metadata);
         }
     }
 
@@ -90,6 +90,12 @@ class NostrIntegration {
     handleRelayRegistered(identifier) {
         if (this.client) {
             this.client.handleRelayRegistered(identifier);
+        }
+    }
+
+    setGatewayReady(isReady) {
+        if (this.client && typeof this.client.setGatewayReady === 'function') {
+            this.client.setGatewayReady(!!isReady);
         }
     }
     

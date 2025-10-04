@@ -203,6 +203,25 @@ async function stopGatewayService() {
   }
 }
 
+function waitForGatewayReady(timeoutMs = 15000) {
+  if (gatewayStatusCache?.running) {
+    return Promise.resolve(true)
+  }
+
+  return new Promise((resolve) => {
+    const start = Date.now()
+    const interval = setInterval(() => {
+      if (gatewayStatusCache?.running) {
+        clearInterval(interval)
+        resolve(true)
+      } else if (Date.now() - start >= timeoutMs) {
+        clearInterval(interval)
+        resolve(false)
+      }
+    }, 200)
+  })
+}
+
 function getGatewayStatus() {
   if (gatewayService) {
     return gatewayService.getStatus()
@@ -1585,13 +1604,35 @@ async function main() {
       console.log('[Worker] Initializing relay server...')
       await relayServer.initializeRelayServer(config)
       
-      console.log('[Worker] Relay server started successfully with Hyperswarm')
-      
-      // Send initialization complete message with a small delay to ensure parent is ready
-      setTimeout(() => {
-        if (isShuttingDown) return
-        sendMessage({ 
-          type: 'status', 
+      console.log('[Worker] Relay server base initialization complete')
+
+      let gatewayReady = false
+      try {
+        console.log('[Worker] Starting gateway service before auto-connecting relays...')
+        await startGatewayService()
+        gatewayReady = await waitForGatewayReady()
+        if (!gatewayReady) {
+          console.warn('[Worker] Gateway did not report ready status within timeout; proceeding cautiously')
+        }
+      } catch (gatewayError) {
+        console.error('[Worker] Failed to auto-start gateway:', gatewayError)
+        sendMessage({ type: 'gateway-error', message: gatewayError.message })
+      }
+
+      let connectedRelays = []
+      try {
+        connectedRelays = await relayServer.connectStoredRelays()
+      } catch (connectError) {
+        console.error('[Worker] Failed to auto-connect stored relays:', connectError)
+      }
+
+      if (Array.isArray(connectedRelays)) {
+        config.relays = connectedRelays
+      }
+
+      if (!isShuttingDown) {
+        sendMessage({
+          type: 'status',
           message: 'Relay server running with Hyperswarm',
           initialized: true,
           config: {
@@ -1599,21 +1640,15 @@ async function main() {
             proxy_server_address: config.proxy_server_address,
             gatewayUrl: config.gatewayUrl,
             registerWithGateway: config.registerWithGateway,
-            relayCount: config.relays.length,
-            mode: 'hyperswarm'
+            relayCount: Array.isArray(connectedRelays) ? connectedRelays.length : (config.relays?.length || 0),
+            mode: 'hyperswarm',
+            gatewayReady
           }
         })
 
         console.log('[Worker] Sent status message with initialized=true')
-      }, 500)
-
-      try {
-        await startGatewayService()
-      } catch (gatewayError) {
-        console.error('[Worker] Failed to auto-start gateway:', gatewayError)
-        sendMessage({ type: 'gateway-error', message: gatewayError.message })
       }
-      
+
     } catch (error) {
       console.error('[Worker] Failed to start relay server:', error)
       console.log('[Worker] Make sure pear-relay-server.mjs is in the worker directory')

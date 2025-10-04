@@ -1325,6 +1325,11 @@ async function handleWorkerMessage(message) {
       if (message.status) {
         updateGatewayUI(message.status)
         updateGatewayPeerState(message.status)
+
+        const gatewayIsReady = !!message.status?.running
+        if (window.App && window.App.nostr && typeof window.App.nostr.setGatewayReady === 'function') {
+          window.App.nostr.setGatewayReady(gatewayIsReady)
+        }
       }
       break
 

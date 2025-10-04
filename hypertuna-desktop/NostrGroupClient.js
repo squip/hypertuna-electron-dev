@@ -63,6 +63,14 @@ class NostrGroupClient {
         this.invites = new Map(); // Map of inviteId -> invite data
         this.joinRequests = new Map(); // Map of groupId -> Map of pubkey -> event
 
+        this.gatewayReady = false;
+        this.connectionRetryTimers = new Map();
+        this.defaultRetryDelay = 1500;
+        this.maxRetryDelay = 30000;
+        this._authFailureListenerRegistered = false;
+
+        this._registerAuthFailureListener();
+
         // Setup default event handlers
         this._setupEventHandlers();
         
@@ -88,6 +96,38 @@ class NostrGroupClient {
         } catch {
             return url.split('?')[0];
         }
+    }
+
+    _registerAuthFailureListener() {
+        if (this._authFailureListenerRegistered) {
+            return;
+        }
+
+        if (!this.relayManager || typeof this.relayManager.on !== 'function') {
+            return;
+        }
+
+        this.relayManager.on('auth:failed', ({ relayUrl: failedUrl }) => {
+            const match = Array.from(this.groupRelayUrls.entries())
+                .find(([, url]) => url === failedUrl);
+            if (!match) {
+                return;
+            }
+
+            const [groupId] = match;
+            console.error(`[NostrGroupClient] Authentication failed for relay ${groupId}`);
+
+            const connection = this.pendingRelayConnections.get(groupId);
+            if (connection) {
+                connection.status = 'pending';
+                connection.attempts = (connection.attempts || 0) + 1;
+                this._scheduleRelayRetry(groupId, 'auth-failed', 5000);
+            }
+
+            this.emit('relay:auth:failed', { groupId, relayUrl: failedUrl });
+        });
+
+        this._authFailureListenerRegistered = true;
     }
     
     /**
@@ -286,10 +326,12 @@ class NostrGroupClient {
             this.pendingRelayConnections.set(publicIdentifier, {
                 identifier: publicIdentifier,
                 relayUrl,  // May be base URL; token appended once initialized
+                originalUrl: relayUrl,
                 attempts: 0,
                 status: 'pending',
                 isInitialized: false,
-                isRegistered: false
+                isRegistered: false,
+                requiresAuth: false
             });
             console.log(`[NostrGroupClient] Queued connection for relay ${publicIdentifier} with URL ${relayUrl}`);
     
@@ -307,6 +349,9 @@ class NostrGroupClient {
                 }
                 if (state.isRegistered) {
                     connection.isRegistered = true;
+                }
+                if (state.requiresAuth != null) {
+                    connection.requiresAuth = !!state.requiresAuth;
                 }
                 if (state.authToken && !connection.relayUrl.includes('?token=')) {
                     // Append token if not already present
@@ -328,7 +373,7 @@ class NostrGroupClient {
      * Handle relay initialized signal from the app layer.
      * This means the worker has started the relay instance.
      */
-    handleRelayInitialized(identifier, gatewayUrl, authToken = null) {
+    handleRelayInitialized(identifier, gatewayUrl, authToken = null, metadata = {}) {
         console.log(`[NostrGroupClient] Relay initialized signal for ${identifier}.`);
         console.log(`[NostrGroupClient] Gateway URL: ${gatewayUrl}, Has token: ${!!authToken}`);
     
@@ -338,7 +383,9 @@ class NostrGroupClient {
             targetId = this.internalToPublicMap.get(identifier);
             console.log(`[NostrGroupClient] Mapped internal key ${identifier} to public identifier ${targetId}`);
         }
-    
+
+        const requiresAuth = metadata?.requiresAuth ?? this.relayReadyStates.get(targetId)?.requiresAuth ?? false;
+
         // Always prefer URLs with tokens
         const connection = this.pendingRelayConnections.get(targetId);
         if (connection) {
@@ -352,11 +399,13 @@ class NostrGroupClient {
             }
             
             connection.isInitialized = true;
+            connection.requiresAuth = requiresAuth;
             if (authToken) {
                 this.relayAuthTokens.set(targetId, authToken);
             }
             
             console.log(`[NostrGroupClient] Relay ${targetId} is now initialized. Checking readiness...`);
+            this._clearRetryTimer(targetId);
             this._attemptConnectionIfReady(targetId);
         } else {
             // Queue the connection if not already queued
@@ -370,63 +419,87 @@ class NostrGroupClient {
             ...existing,
             isInitialized: true,
             relayUrl: gatewayUrl,
-            authToken: authToken || existing.authToken || null
+            authToken: authToken || existing.authToken || null,
+            requiresAuth
         });
     }
     
-    // Update _attemptConnectionIfReady to add more logging:
     async _attemptConnectionIfReady(identifier) {
         const connection = this.pendingRelayConnections.get(identifier);
-    
+
         if (!connection) {
             console.log(`[NostrGroupClient] No pending connection for ${identifier} yet.`);
             return;
         }
-    
-        console.log(`[NostrGroupClient] Checking readiness for ${identifier}:`, {
-            isInitialized: connection.isInitialized,
-            isRegistered: connection.isRegistered,
-            status: connection.status,
-            hasUrl: !!connection.relayUrl,
-            hasToken: connection.relayUrl?.includes('?token=')
-        });
-    
-        // Only proceed if we have a valid authenticated URL
-        if (connection.isInitialized && connection.isRegistered && 
-            connection.status === 'pending' && connection.relayUrl && 
-            connection.relayUrl.includes('?token=')) {
-            
-            console.log(`[NostrGroupClient] All checks passed for ${identifier}. Connecting to ${connection.relayUrl}`);
-            connection.status = 'connecting';
-            
-            try {
-                await this.connectToGroupRelay(identifier, connection.relayUrl);
-                connection.status = 'connected';
-                this.pendingRelayConnections.delete(identifier);
-                console.log(`[NostrGroupClient] Successfully connected to ${identifier}`);
-            } catch (e) {
-                console.error(`[NostrGroupClient] Final connection attempt failed for ${identifier}:`, e);
-                connection.status = 'failed';
-                // Retry logic could go here
-            }
-        } else {
-            console.log(`[NostrGroupClient] Not ready to connect ${identifier}. Waiting for:`, {
-                needsInit: !connection.isInitialized,
-                needsRegistration: !connection.isRegistered,
-                needsValidUrl: !connection.relayUrl?.includes('?token='),
-                wrongStatus: connection.status !== 'pending'
+
+        const state = this.relayReadyStates.get(identifier) || {};
+
+        if (!connection.isInitialized && state.isInitialized) {
+            connection.isInitialized = true;
+        }
+        if (!connection.isRegistered && state.isRegistered) {
+            connection.isRegistered = true;
+        }
+        if (connection.requiresAuth == null && state.requiresAuth != null) {
+            connection.requiresAuth = !!state.requiresAuth;
+        }
+
+        if (!connection.isInitialized || !connection.isRegistered) {
+            console.log(`[NostrGroupClient] Relay ${identifier} not fully ready`, {
+                initialized: connection.isInitialized,
+                registered: connection.isRegistered
             });
+            this._scheduleRelayRetry(identifier, 'relay-not-ready', 1500);
+            return;
+        }
+
+        if (!this.gatewayReady) {
+            console.log(`[NostrGroupClient] Gateway not ready, delaying connection for ${identifier}`);
+            this._scheduleRelayRetry(identifier, 'gateway-not-ready', 1500);
+            return;
+        }
+
+        const resolvedUrl = this._resolveRelayUrl(connection, identifier, state);
+        if (!resolvedUrl) {
+            console.log(`[NostrGroupClient] Relay URL unavailable for ${identifier}, retrying soon`);
+            this._scheduleRelayRetry(identifier, 'url-unavailable', 2000);
+            return;
+        }
+
+        const requiresAuth = connection.requiresAuth ?? state.requiresAuth ?? false;
+        if (requiresAuth && !resolvedUrl.includes('token=')) {
+            console.log(`[NostrGroupClient] Relay ${identifier} requires auth but token missing, retrying`);
+            this._scheduleRelayRetry(identifier, 'missing-token', 2000);
+            return;
+        }
+
+        this._clearRetryTimer(identifier);
+
+        if (connection.status !== 'pending' && connection.status !== 'failed') {
+            connection.status = 'pending';
+        }
+
+        console.log(`[NostrGroupClient] Attempting connection to ${identifier} using ${resolvedUrl}`);
+        connection.status = 'connecting';
+
+        try {
+            await this.connectToGroupRelay(identifier, resolvedUrl);
+            connection.status = 'connected';
+            connection.attempts = 0;
+            this.pendingRelayConnections.delete(identifier);
+            this._clearRetryTimer(identifier);
+            console.log(`[NostrGroupClient] Successfully connected to ${identifier}`);
+        } catch (e) {
+            console.error(`[NostrGroupClient] Connection attempt failed for ${identifier}:`, e);
+            connection.status = 'pending';
+            connection.attempts = (connection.attempts || 0) + 1;
+            this._scheduleRelayRetry(identifier, 'connection-error');
         }
     }
 
-    /**
-     * Handle relay registered signal from the app layer.
-     * This is the final signal to proceed with the connection.
-     */
     async handleRelayRegistered(identifier) {
         console.log(`[NostrGroupClient] Relay registered signal for ${identifier}.`);
 
-        // Map internal relay keys to public identifiers if available
         let targetId = identifier;
         if (!this.pendingRelayConnections.has(targetId) && this.internalToPublicMap.has(identifier)) {
             targetId = this.internalToPublicMap.get(identifier);
@@ -437,6 +510,7 @@ class NostrGroupClient {
         if (connection) {
             connection.isRegistered = true;
             console.log(`[NostrGroupClient] Relay ${targetId} is now registered. Checking readiness...`);
+            this._clearRetryTimer(targetId);
             this._attemptConnectionIfReady(targetId);
         }
 
@@ -445,6 +519,111 @@ class NostrGroupClient {
             ...existing,
             isRegistered: true
         });
+    }
+
+    _resolveRelayUrl(connection, identifier, state = {}) {
+        let candidate = connection.relayUrl || state.relayUrl || connection.originalUrl || null;
+        if (!candidate) {
+            return null;
+        }
+
+        if (candidate.includes('?token=')) {
+            connection.relayUrl = candidate;
+            return connection.relayUrl;
+        }
+
+        const baseUrl = this._getBaseRelayUrl(candidate);
+        const authToken = this._resolveAuthToken(identifier, state);
+
+        if (authToken) {
+            const withToken = this._appendTokenToUrl(baseUrl, authToken);
+            if (withToken) {
+                connection.relayUrl = withToken;
+                this.relayAuthTokens.set(identifier, authToken);
+                return connection.relayUrl;
+            }
+        }
+
+        connection.relayUrl = baseUrl;
+        return connection.relayUrl;
+    }
+
+    _resolveAuthToken(identifier, state = {}) {
+        if (this.relayAuthTokens.has(identifier)) {
+            return this.relayAuthTokens.get(identifier);
+        }
+        return state.authToken || null;
+    }
+
+    _appendTokenToUrl(url, token) {
+        if (!url || !token) {
+            return url;
+        }
+
+        if (url.includes('token=')) {
+            return url;
+        }
+
+        try {
+            const u = new URL(url);
+            u.searchParams.set('token', token);
+            return u.toString();
+        } catch (_) {
+            const separator = url.includes('?') ? '&' : '?';
+            return `${url}${separator}token=${token}`;
+        }
+    }
+
+    _scheduleRelayRetry(identifier, reason, delayOverride) {
+        const connection = this.pendingRelayConnections.get(identifier);
+        if (!connection) {
+            return;
+        }
+
+        const attempts = connection.attempts || 0;
+        const delay = delayOverride != null
+            ? Math.max(0, delayOverride)
+            : Math.min(this.maxRetryDelay, this.defaultRetryDelay * Math.max(1, attempts + 1));
+
+        this._clearRetryTimer(identifier);
+
+        console.log(`[NostrGroupClient] Scheduling retry for ${identifier} in ${delay}ms (${reason})`);
+
+        const timer = setTimeout(() => {
+            this.connectionRetryTimers.delete(identifier);
+            if (!this.pendingRelayConnections.has(identifier)) {
+                return;
+            }
+            this._attemptConnectionIfReady(identifier);
+        }, delay);
+
+        this.connectionRetryTimers.set(identifier, timer);
+    }
+
+    _clearRetryTimer(identifier) {
+        const timer = this.connectionRetryTimers.get(identifier);
+        if (timer) {
+            clearTimeout(timer);
+            this.connectionRetryTimers.delete(identifier);
+        }
+    }
+
+    setGatewayReady(isReady) {
+        const ready = !!isReady;
+        if (this.gatewayReady === ready) {
+            return;
+        }
+
+        this.gatewayReady = ready;
+
+        if (ready) {
+            console.log('[NostrGroupClient] Gateway reported ready – retrying pending relay connections');
+            for (const identifier of this.pendingRelayConnections.keys()) {
+                this._scheduleRelayRetry(identifier, 'gateway-ready', 0);
+            }
+        } else {
+            console.log('[NostrGroupClient] Gateway became unavailable – deferring relay connection attempts');
+        }
     }
 
 
@@ -477,6 +656,9 @@ class NostrGroupClient {
                 }
                 if (state.authToken) {
                     this.relayAuthTokens.set(identifier, state.authToken);
+                }
+                if (state.requiresAuth != null) {
+                    connection.requiresAuth = !!state.requiresAuth;
                 }
             }
 
@@ -536,14 +718,6 @@ class NostrGroupClient {
                 }
             }
 
-            // Listen for auth failures
-            this.relayManager.on('auth:failed', ({ relayUrl: failedUrl }) => {
-                if (failedUrl === finalUrl) {
-                    console.error(`[NostrGroupClient] Authentication failed for relay ${publicIdentifier}`);
-                    this.emit('relay:auth:failed', { groupId: publicIdentifier, relayUrl });
-                }
-            });
-            
             this.groupRelayUrls.set(publicIdentifier, finalUrl);
             
             // Subscribe to group-specific events only on this relay
