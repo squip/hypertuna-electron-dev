@@ -2,7 +2,7 @@ import http from 'node:http';
 import https from 'node:https';
 import { randomBytes } from 'node:crypto';
 import express from 'express';
-import { WebSocketServer } from 'ws';
+import WebSocket, { WebSocketServer } from 'ws';
 import helmet from 'helmet';
 import rateLimit from 'express-rate-limit';
 
