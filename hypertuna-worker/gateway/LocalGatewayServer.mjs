@@ -1,7 +1,5 @@
 import http from 'node:http';
 import https from 'node:https';
-import os from 'node:os';
-import { promises as dns } from 'node:dns';
 import { WebSocketServer } from 'ws';
 
 export class LocalGatewayServer {
@@ -13,14 +11,7 @@ export class LocalGatewayServer {
       protocol,
       listenHost = '127.0.0.1',
       requestHandler = null,
-      tlsOptions = null,
-      detectLanAddresses = false,
-      detectPublicIp = false,
-      publicIpServices = [
-        'https://api.ipify.org',
-        'https://ifconfig.me/ip',
-        'https://icanhazip.com'
-      ]
+      tlsOptions = null
     } = config;
 
     this.config = {
@@ -30,111 +21,24 @@ export class LocalGatewayServer {
       protocol,
       listenHost,
       requestHandler,
-      tlsOptions,
-      detectLanAddresses,
-      detectPublicIp,
-      publicIpServices
+      tlsOptions
     };
 
     this.server = null;
     this.wss = null;
     this.localIps = [];
-    this.publicIp = null;
   }
 
   async init() {
-    await this.#detectIpAddresses();
+    this.#initializeIpAddresses();
     return this;
   }
 
-  async #detectIpAddresses() {
-    this.localIps = this.#collectLocalIps();
-
-    if (this.config.ip) {
-      if (!this.localIps.includes(this.config.ip)) {
-        this.localIps.push(this.config.ip);
-      }
-    } else {
-      const preferred = this.localIps.find(ip => ip !== '127.0.0.1');
-      this.config.ip = preferred || '127.0.0.1';
-    }
-
-    if (this.config.detectPublicIp) {
-      try {
-        this.publicIp = await this.#resolvePublicIp();
-        if (this.publicIp && !this.localIps.includes(this.publicIp)) {
-          this.localIps.push(this.publicIp);
-        }
-      } catch (error) {
-        console.warn('[LocalGatewayServer] Failed to determine public IP:', error.message);
-      }
-    }
-
-    if (this.config.detectLanAddresses || this.config.detectPublicIp) {
-      try {
-        const resolved = await dns.lookup(this.config.hostname, { all: true });
-        const addresses = resolved.map(entry => entry.address);
-        console.log('[LocalGatewayServer] Hostname resolved addresses:', addresses.join(', ') || 'none');
-      } catch (error) {
-        console.warn('[LocalGatewayServer] Hostname resolution failed:', error.message);
-      }
-    }
-  }
-
-  #collectLocalIps() {
-    const ips = new Set(['127.0.0.1']);
-    if (!this.config.detectLanAddresses) {
-      return Array.from(ips);
-    }
-
-    const interfaces = os.networkInterfaces();
-    for (const entries of Object.values(interfaces)) {
-      for (const entry of entries || []) {
-        if (entry.family === 'IPv4' && !entry.internal) {
-          ips.add(entry.address);
-        }
-      }
-    }
-    return Array.from(ips);
-  }
-
-  async #resolvePublicIp() {
-    for (const service of this.config.publicIpServices) {
-      try {
-        const ip = await this.#fetchPublicIp(service);
-        if (ip) return ip;
-      } catch (error) {
-        console.warn(`[LocalGatewayServer] Public IP service failed (${service}):`, error.message);
-      }
-    }
-    return null;
-  }
-
-  #fetchPublicIp(url) {
-    return new Promise((resolve, reject) => {
-      const req = https.get(url, { timeout: 5000, headers: { 'User-Agent': 'HypertunaGateway/1.0' } }, (res) => {
-        if (res.statusCode !== 200) {
-          reject(new Error(`Status code ${res.statusCode}`));
-          res.resume();
-          return;
-        }
-        let data = '';
-        res.on('data', chunk => { data += chunk; });
-        res.on('end', () => {
-          const ip = data.trim();
-          if (/^\d{1,3}(?:\.\d{1,3}){3}$/.test(ip)) {
-            resolve(ip);
-          } else {
-            reject(new Error('Invalid IP format'));
-          }
-        });
-      });
-
-      req.on('error', reject);
-      req.on('timeout', () => {
-        req.destroy(new Error('timeout'));
-      });
-    });
+  #initializeIpAddresses() {
+    const listenHost = this.config.listenHost || '127.0.0.1';
+    const primary = this.config.ip || listenHost || '127.0.0.1';
+    this.config.ip = primary;
+    this.localIps = [primary];
   }
 
   startServer(connectionHandler, requestHandler, onListening) {
@@ -194,16 +98,12 @@ export class LocalGatewayServer {
         .filter(ip => /^\d{1,3}(?:\.\d{1,3}){3}$/.test(ip))
         .map(ip => `${wsProtocol}://${ip}:${this.config.port}`)
     };
-    if (this.publicIp && this.config.detectPublicIp) {
-      urls.public = `${wsProtocol}://${this.publicIp}:${this.config.port}`;
-    }
     return urls;
   }
 
   getIpAddresses() {
     return {
       local: [...this.localIps],
-      public: this.publicIp,
       primary: this.config.ip
     };
   }

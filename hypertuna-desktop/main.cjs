@@ -8,7 +8,6 @@ let workerProcess = null;
 let pendingWorkerMessages = [];
 let gatewayStatusCache = null;
 let gatewayLogsCache = [];
-let gatewayOptionsCache = { detectLanAddresses: false, detectPublicIp: false };
 let publicGatewayConfigCache = null;
 let publicGatewayStatusCache = null;
 
@@ -125,10 +124,6 @@ async function startWorkerProcess() {
           gatewayLogsCache = Array.isArray(message.logs) ? message.logs.slice(-500) : [];
         } else if (message.type === 'gateway-stopped') {
           gatewayStatusCache = message.status || { running: false };
-        } else if (message.type === 'gateway-options-set') {
-          if (message.options && typeof message.options === 'object') {
-            gatewayOptionsCache = { ...gatewayOptionsCache, ...message.options };
-          }
         } else if (message.type === 'public-gateway-status') {
           publicGatewayStatusCache = message.state || null;
         } else if (message.type === 'public-gateway-config') {
@@ -267,17 +262,6 @@ ipcMain.handle('gateway-get-logs', async () => {
     workerProcess.send({ type: 'get-gateway-logs' });
   }
   return { success: true, logs: gatewayLogsCache };
-});
-
-ipcMain.handle('gateway-get-options', async () => {
-  if (workerProcess) {
-    workerProcess.send({ type: 'get-gateway-options' });
-  }
-  return { success: true, options: gatewayOptionsCache };
-});
-
-ipcMain.handle('gateway-set-options', async (_event, options) => {
-  return sendGatewayCommand('set-gateway-options', { options });
 });
 
 ipcMain.handle('public-gateway-get-config', async () => {

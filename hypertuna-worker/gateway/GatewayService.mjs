@@ -810,9 +810,6 @@ export class GatewayService extends EventEmitter {
     const port = Number(config.port) || DEFAULT_PORT;
     const hostname = config.hostname || 'localhost';
     const listenHost = config.listenHost || '127.0.0.1';
-    const detectLan = !!config.detectLanAddresses;
-    const detectPublicIp = !!config.detectPublicIp;
-
     this.log('info', `Starting gateway on port ${port}`);
 
     global.joinSessions = global.joinSessions || new Map();
@@ -823,9 +820,7 @@ export class GatewayService extends EventEmitter {
     this.gatewayServer = new LocalGatewayServer({
       hostname,
       port,
-      listenHost,
-      detectLanAddresses: detectLan,
-      detectPublicIp
+      listenHost
     });
 
     await this.gatewayServer.init();
@@ -845,8 +840,6 @@ export class GatewayService extends EventEmitter {
       hostname,
       port,
       listenHost,
-      detectLanAddresses: detectLan,
-      detectPublicIp,
       urls: this.gatewayServer.getServerUrls()
     };
 

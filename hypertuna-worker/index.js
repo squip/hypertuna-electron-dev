@@ -90,15 +90,12 @@ function deriveGatewayHostFromStatus(status) {
 
 async function initializeGatewayOptionsFromSettings() {
   try {
-    const settings = await loadGatewaySettings()
-    if (settings) {
-      gatewayOptions.detectLanAddresses = !!settings.advertiseLan
-      gatewayOptions.detectPublicIp = !!settings.detectPublicIp
-      gatewayOptions.listenHost = gatewayOptions.detectLanAddresses ? '0.0.0.0' : '127.0.0.1'
-    }
+    await loadGatewaySettings()
   } catch (error) {
     console.warn('[Worker] Failed to load gateway option defaults:', error)
   }
+  gatewayOptions.listenHost = '127.0.0.1'
+  gatewayOptions.hostname = gatewayOptions.hostname || '127.0.0.1'
 }
 
 async function ensurePublicGatewaySettingsLoaded() {
@@ -136,9 +133,7 @@ async function startGatewayService(options = {}) {
             await updateGatewaySettings({
               gatewayUrl: httpUrl,
               proxyHost,
-              proxyWebsocketProtocol: wsProtocol,
-              advertiseLan: !!gatewayOptions.detectLanAddresses,
-              detectPublicIp: !!gatewayOptions.detectPublicIp
+              proxyWebsocketProtocol: wsProtocol
             })
             gatewaySettingsApplied = true
           } catch (error) {
@@ -158,16 +153,22 @@ async function startGatewayService(options = {}) {
   publicGatewayStatusCache = gatewayService.getPublicGatewayState()
   sendMessage({ type: 'public-gateway-status', state: publicGatewayStatusCache })
 
-  const mergedOptions = { ...gatewayOptions, ...options }
-  mergedOptions.listenHost = mergedOptions.detectLanAddresses ? '0.0.0.0' : '127.0.0.1'
-  mergedOptions.publicGateway = publicGatewaySettings
+  const incomingOptions = options && typeof options === 'object' ? options : {}
+  const sanitizedOptions = { ...incomingOptions }
+  delete sanitizedOptions.detectLanAddresses
+  delete sanitizedOptions.detectPublicIp
+  const mergedOptions = {
+    ...gatewayOptions,
+    ...sanitizedOptions,
+    publicGateway: publicGatewaySettings
+  }
+  mergedOptions.listenHost = '127.0.0.1'
+  mergedOptions.hostname = '127.0.0.1'
 
   const needsRestart = gatewayService?.isRunning && (
     mergedOptions.port !== gatewayOptions.port ||
     mergedOptions.hostname !== gatewayOptions.hostname ||
-    mergedOptions.listenHost !== gatewayOptions.listenHost ||
-    mergedOptions.detectLanAddresses !== gatewayOptions.detectLanAddresses ||
-    mergedOptions.detectPublicIp !== gatewayOptions.detectPublicIp
+    mergedOptions.listenHost !== gatewayOptions.listenHost
   )
 
   if (needsRestart) {
@@ -256,7 +257,7 @@ let storedParentConfig = null
 let gatewayService = null
 let gatewayStatusCache = null
 let gatewaySettingsApplied = false
-let gatewayOptions = { port: 8443, hostname: '127.0.0.1', listenHost: '127.0.0.1', detectLanAddresses: false, detectPublicIp: false }
+let gatewayOptions = { port: 8443, hostname: '127.0.0.1', listenHost: '127.0.0.1' }
 let publicGatewaySettings = null
 let publicGatewayStatusCache = null
 
@@ -972,33 +973,6 @@ async function handleMessageObject(message) {
 
     case 'get-gateway-logs': {
       sendMessage({ type: 'gateway-logs', logs: getGatewayLogs() })
-      break
-    }
-
-    case 'set-gateway-options': {
-      gatewayOptions = { ...gatewayOptions, ...(message.options || {}) }
-      try {
-        await updateGatewaySettings({
-          advertiseLan: !!gatewayOptions.detectLanAddresses,
-          detectPublicIp: !!gatewayOptions.detectPublicIp
-        })
-      } catch (err) {
-        console.warn('[Worker] Failed to persist gateway options:', err?.message || err)
-      }
-      if (gatewayService?.isRunning) {
-        try {
-          await startGatewayService(gatewayOptions)
-        } catch (err) {
-          sendMessage({ type: 'gateway-error', message: err.message })
-          break
-        }
-      }
-      sendMessage({ type: 'gateway-options-set', options: gatewayOptions })
-      break
-    }
-
-    case 'get-gateway-options': {
-      sendMessage({ type: 'gateway-options-set', options: gatewayOptions })
       break
     }
 

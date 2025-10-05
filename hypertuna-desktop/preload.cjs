@@ -44,8 +44,6 @@ contextBridge.exposeInMainWorld('electronAPI', {
   stopGateway: () => ipcRenderer.invoke('gateway-stop'),
   getGatewayStatus: () => ipcRenderer.invoke('gateway-get-status'),
   getGatewayLogs: () => ipcRenderer.invoke('gateway-get-logs'),
-  getGatewayOptions: () => ipcRenderer.invoke('gateway-get-options'),
-  setGatewayOptions: (options) => ipcRenderer.invoke('gateway-set-options', options),
   getPublicGatewayConfig: () => ipcRenderer.invoke('public-gateway-get-config'),
   setPublicGatewayConfig: (config) => ipcRenderer.invoke('public-gateway-set-config', config),
   getPublicGatewayStatus: () => ipcRenderer.invoke('public-gateway-get-status'),

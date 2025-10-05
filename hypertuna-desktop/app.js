@@ -27,7 +27,6 @@ let healthPollingInterval = null;
 let gatewayStatusInfo = { running: false };
 let gatewayLogs = [];
 let gatewayLogVisible = false;
-let gatewayOptionsState = { detectLanAddresses: false, detectPublicIp: false };
 let gatewayUptimeTimer = null;
 let gatewayPeerRelayMap = new Map();
 let gatewayPeerDetails = new Map();
@@ -74,8 +73,6 @@ let gatewayServiceStatusEl = null
 let gatewayLastCheckEl = null
 let gatewayLogsContainer = null
 let gatewayToggleLogsButton = null
-let gatewayLanToggle = null
-let gatewayPublicToggle = null
 let publicGatewayEnableToggle = null
 let publicGatewaySelectionSelect = null
 let publicGatewayUrlInput = null
@@ -139,18 +136,6 @@ function formatRelativeTime(value) {
   return new Date(timestamp).toLocaleString()
 }
 
-function applyGatewayOptionsToUI() {
-  if (gatewayLanToggle) gatewayLanToggle.checked = !!gatewayOptionsState.detectLanAddresses
-  if (gatewayPublicToggle) gatewayPublicToggle.checked = !!gatewayOptionsState.detectPublicIp
-}
-
-function persistGatewayOptions() {
-  if (typeof localStorage === 'undefined') return
-  try {
-    localStorage.setItem('hypertuna_gateway_options', JSON.stringify(gatewayOptionsState))
-  } catch (_) {}
-}
-
 function addLog(message, type = 'info') {
   const timestamp = new Date().toLocaleTimeString()
   const logEntry = {
@@ -173,39 +158,6 @@ function addLog(message, type = 'info') {
   }
 
   console.log(`[Log ${type}] ${message}`)
-}
-
-function loadGatewayOptionsFromStorage() {
-  if (typeof localStorage === 'undefined') return
-  try {
-    const stored = localStorage.getItem('hypertuna_gateway_options')
-    if (stored) {
-      const parsed = JSON.parse(stored)
-      if (parsed && typeof parsed === 'object') {
-        gatewayOptionsState = {
-          ...gatewayOptionsState,
-          detectLanAddresses: !!parsed.detectLanAddresses,
-          detectPublicIp: !!parsed.detectPublicIp
-        }
-      }
-    }
-  } catch (_) {}
-}
-
-async function syncGatewayOptions() {
-  if (!isElectron || !electronAPI?.setGatewayOptions) return
-  try {
-    const response = await electronAPI.setGatewayOptions(gatewayOptionsState)
-    if (response && response.success === false) {
-      if (response.error && response.error.includes('Worker not running')) {
-        return
-      }
-      throw new Error(response.error || 'Gateway options update failed')
-    }
-  } catch (error) {
-    console.error('[App] Failed to sync gateway options:', error)
-    addLog(`Gateway options error: ${error.message}`, 'error')
-  }
 }
 
 function updateGatewayUI(status) {
@@ -962,17 +914,13 @@ function handlePublicGatewayTokenError(message, relayKey) {
   setPublicGatewayTokenFeedback(text || 'Failed to generate token.', 'error')
 }
 
-async function refreshGatewayStatus({ fetchOptions = true } = {}) {
+async function refreshGatewayStatus() {
   if (!isElectron || !electronAPI?.getGatewayStatus) return
   try {
-    const requests = [electronAPI.getGatewayStatus(), electronAPI.getGatewayLogs()]
-    if (fetchOptions && electronAPI.getGatewayOptions) {
-      requests.push(electronAPI.getGatewayOptions())
-    }
-    const results = await Promise.all(requests)
-    const statusResult = results[0]
-    const logsResult = results[1]
-    const optionsResult = results[2]
+    const [statusResult, logsResult] = await Promise.all([
+      electronAPI.getGatewayStatus(),
+      electronAPI.getGatewayLogs()
+    ])
 
     if (statusResult && 'status' in statusResult) {
       const statusPayload = statusResult.status || { running: false }
@@ -986,16 +934,6 @@ async function refreshGatewayStatus({ fetchOptions = true } = {}) {
         renderGatewayLogs()
       }
     }
-
-    if (optionsResult?.options) {
-      gatewayOptionsState = {
-        ...gatewayOptionsState,
-        detectLanAddresses: !!optionsResult.options.detectLanAddresses,
-        detectPublicIp: !!optionsResult.options.detectPublicIp
-      }
-      applyGatewayOptionsToUI()
-      persistGatewayOptions()
-    }
   } catch (error) {
     console.error('[App] Failed to refresh gateway status:', error)
   }
@@ -1005,13 +943,12 @@ async function handleGatewayStart() {
   if (!isElectron || !electronAPI?.startGateway) return
   if (gatewayStartButton) gatewayStartButton.disabled = true
   try {
-    await syncGatewayOptions()
     addLog('Starting local gateway...', 'status')
-    const response = await electronAPI.startGateway(gatewayOptionsState)
+    const response = await electronAPI.startGateway()
     if (response && response.success === false) {
       throw new Error(response.error || 'Gateway start failed')
     }
-    await refreshGatewayStatus({ fetchOptions: false })
+    await refreshGatewayStatus()
   } catch (error) {
     console.error('[App] Failed to start gateway:', error)
     addLog(`Failed to start gateway: ${error.message}`, 'error')
@@ -1029,7 +966,7 @@ async function handleGatewayStop() {
     if (response && response.success === false) {
       throw new Error(response.error || 'Gateway stop failed')
     }
-    await refreshGatewayStatus({ fetchOptions: false })
+    await refreshGatewayStatus()
   } catch (error) {
     console.error('[App] Failed to stop gateway:', error)
     addLog(`Failed to stop gateway: ${error.message}`, 'error')
@@ -1039,31 +976,9 @@ async function handleGatewayStop() {
 }
 
 async function initializeGatewayControls() {
-  loadGatewayOptionsFromStorage()
-  applyGatewayOptionsToUI()
-  persistGatewayOptions()
-
   if (!isElectron) return
 
-  try {
-    if (electronAPI.getGatewayOptions) {
-      const optionsResult = await electronAPI.getGatewayOptions()
-      if (optionsResult?.options) {
-        gatewayOptionsState = {
-          ...gatewayOptionsState,
-          detectLanAddresses: !!optionsResult.options.detectLanAddresses,
-          detectPublicIp: !!optionsResult.options.detectPublicIp
-        }
-        applyGatewayOptionsToUI()
-        persistGatewayOptions()
-      }
-    }
-  } catch (error) {
-    console.error('[App] Failed to load gateway options:', error)
-  }
-
-  await syncGatewayOptions()
-  await refreshGatewayStatus({ fetchOptions: false })
+  await refreshGatewayStatus()
   await loadPublicGatewayConfig()
   await refreshPublicGatewayStatus({ requestLatest: true })
   populatePublicGatewayRelayOptions()
@@ -1637,18 +1552,6 @@ async function handleWorkerMessage(message) {
       }
       break
 
-    case 'gateway-options-set':
-      if (message.options) {
-        gatewayOptionsState = {
-          ...gatewayOptionsState,
-          detectLanAddresses: !!message.options.detectLanAddresses,
-          detectPublicIp: !!message.options.detectPublicIp
-        }
-        applyGatewayOptionsToUI()
-        persistGatewayOptions()
-      }
-      break
-
     case 'public-gateway-config':
       if (message.config) {
         publicGatewayConfig = normalizePublicGatewayConfig(message.config)
@@ -2195,22 +2098,6 @@ function setupEventListeners() {
     })
   }
 
-  if (gatewayLanToggle) {
-    gatewayLanToggle.addEventListener('change', () => {
-      gatewayOptionsState.detectLanAddresses = !!gatewayLanToggle.checked
-      persistGatewayOptions()
-      syncGatewayOptions()
-    })
-  }
-
-  if (gatewayPublicToggle) {
-    gatewayPublicToggle.addEventListener('change', () => {
-      gatewayOptionsState.detectPublicIp = !!gatewayPublicToggle.checked
-      persistGatewayOptions()
-      syncGatewayOptions()
-    })
-  }
-
   if (publicGatewayEnableToggle) {
     publicGatewayEnableToggle.addEventListener('change', () => {
       publicGatewayConfig.enabled = !!publicGatewayEnableToggle.checked
@@ -2329,8 +2216,6 @@ function initializeDOMElements() {
   gatewayLastCheckEl = document.getElementById('gateway-last-check')
   gatewayLogsContainer = document.getElementById('gateway-logs-container')
   gatewayToggleLogsButton = document.getElementById('gateway-toggle-logs')
-  gatewayLanToggle = document.getElementById('gateway-lan-toggle')
-  gatewayPublicToggle = document.getElementById('gateway-public-toggle')
   publicGatewayEnableToggle = document.getElementById('public-gateway-enable')
   publicGatewaySelectionSelect = document.getElementById('public-gateway-selection')
   publicGatewayUrlInput = document.getElementById('public-gateway-url')
@@ -2376,8 +2261,6 @@ function initializeDOMElements() {
     gatewayLastCheckEl,
     gatewayLogsContainer,
     gatewayToggleLogsButton,
-    gatewayLanToggle,
-    gatewayPublicToggle,
     publicGatewayEnableToggle,
     publicGatewaySelectionSelect,
     publicGatewayUrlInput,
