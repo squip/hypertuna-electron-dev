@@ -89,9 +89,29 @@ function canonicalizeAnnouncement(announcement) {
   return Buffer.from(json, 'utf8');
 }
 
+function ensureSecretKeyBuffer(secretKey) {
+  if (!secretKey) {
+    throw new Error('Gateway discovery secret key not provided');
+  }
+
+  if (Buffer.isBuffer(secretKey)) {
+    return secretKey;
+  }
+
+  if (secretKey instanceof Uint8Array) {
+    return Buffer.from(secretKey);
+  }
+
+  throw new Error('Gateway discovery secret key must be a Buffer or Uint8Array');
+}
+
 function signAnnouncement(announcement, secretKey) {
   const payload = canonicalizeAnnouncement(announcement);
-  const signature = hyperCrypto.sign(secretKey, payload);
+  const skBuffer = ensureSecretKeyBuffer(secretKey);
+  if (skBuffer.length !== 64) {
+    throw new Error(`Gateway discovery secret key must be 64 bytes, received ${skBuffer.length}`);
+  }
+  const signature = hyperCrypto.sign(payload, skBuffer);
   return Buffer.from(signature).toString('hex');
 }
 
@@ -103,7 +123,7 @@ function verifyAnnouncementSignature(announcement) {
     const payload = canonicalizeAnnouncement(announcement);
     const signature = Buffer.from(announcement.signature, 'hex');
     const publicKey = Buffer.from(announcement.signatureKey, 'hex');
-    return hyperCrypto.verify(publicKey, payload, signature);
+    return hyperCrypto.verify(payload, signature, publicKey);
   } catch (_) {
     return false;
   }

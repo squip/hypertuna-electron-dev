@@ -96,9 +96,9 @@ class GatewayAdvertiser {
         });
       }, this.refreshInterval).unref();
     } catch (error) {
-      this.logger?.error?.('[GatewayAdvertiser] Failed to start discovery advertiser', {
-        error: error?.message || error
-      });
+      if (this.logger?.error) {
+        this.logger.error({ err: error, stack: error?.stack }, '[GatewayAdvertiser] Failed to start discovery advertiser');
+      }
       await this.stop();
       throw error;
     }
@@ -214,4 +214,3 @@ class GatewayAdvertiser {
 }
 
 export default GatewayAdvertiser;
-

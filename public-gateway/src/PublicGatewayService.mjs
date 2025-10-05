@@ -88,9 +88,9 @@ class PublicGatewayService {
       try {
         await this.gatewayAdvertiser.start();
       } catch (error) {
-        this.logger.error?.('Failed to start gateway discovery advertiser', {
-          error: error?.message || error
-        });
+        if (this.logger?.error) {
+          this.logger.error({ err: error, stack: error?.stack }, 'Failed to start gateway discovery advertiser');
+        }
       }
     }
 

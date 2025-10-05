@@ -170,7 +170,8 @@ class PublicGatewayDiscoveryClient extends EventEmitter {
 
     if (!verifyAnnouncementSignature(announcement)) {
       this.logger?.warn?.('[PublicGatewayDiscovery] Invalid announcement signature', {
-        gatewayId: announcement.gatewayId
+        gatewayId: announcement.gatewayId,
+        signatureKey: announcement.signatureKey
       });
       return;
     }
@@ -219,6 +220,7 @@ class PublicGatewayDiscoveryClient extends EventEmitter {
       this.#ensureSecretFetched(entry).catch((error) => {
         this.logger?.warn?.('[PublicGatewayDiscovery] Secret fetch failed', {
           gatewayId: entry.gatewayId,
+          url: entry.secretUrl,
           error: error?.message || error
         });
       });
