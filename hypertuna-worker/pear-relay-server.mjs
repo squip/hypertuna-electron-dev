@@ -799,7 +799,7 @@ function setupProtocolHandlers(protocol) {
   protocol.handle('/relay/create', async (request) => {
     console.log('[RelayServer] Create relay requested');
     const body = JSON.parse(request.body.toString());
-    const { name, description, isPublic = false, isOpen = false, fileSharing = false } = body;
+    const { name, description, isPublic = false, isOpen = false, fileSharing = true } = body;
 
     console.log('[RelayServer] Creating relay:', { name, description, isPublic, isOpen, fileSharing });
     
@@ -877,7 +877,7 @@ function setupProtocolHandlers(protocol) {
   protocol.handle('/relay/join', async (request) => {
     console.log('[RelayServer] Join relay requested');
     const body = JSON.parse(request.body.toString());
-    const { relayKey, name, description, fileSharing = false } = body;
+    const { relayKey, name, description, fileSharing = true } = body;
 
     console.log('[RelayServer] Joining relay:', { relayKey, name, description, fileSharing });
     
@@ -2159,7 +2159,7 @@ async function registerWithGateway(relayProfileInfo = null, options = {}) {
 // Export relay management functions for worker access
 export async function createRelay(options) {
   // The subnetHash is no longer passed in, it's retrieved from the config
-  const { name, description, isPublic = false, isOpen = false, fileSharing = false } = options;
+  const { name, description, isPublic = false, isOpen = false, fileSharing = true } = options;
   console.log('[RelayServer] Creating relay via adapter:', { name, description, isPublic, isOpen, fileSharing });
 
   const result = await createRelayManager({
@@ -2233,7 +2233,7 @@ export async function createRelay(options) {
 }
 
 export async function joinRelay(options) {
-  const { fileSharing = false } = options;
+  const { fileSharing = true } = options;
   console.log('[RelayServer] Joining relay via adapter:', { ...options, fileSharing });
   const result = await joinRelayManager({
     ...options,
@@ -2281,7 +2281,7 @@ async function createGroupJoinRequest(publicIdentifier, privateKey) {
 }
 
 export async function startJoinAuthentication(options) {
-  const { publicIdentifier, fileSharing = false, hostPeers: hostPeerList = [] } = options;
+  const { publicIdentifier, fileSharing = true, hostPeers: hostPeerList = [] } = options;
   const userNsec = config.nostr_nsec_hex;
   const userPubkey = NostrUtils.getPublicKey(userNsec);
   if (config.nostr_pubkey_hex && userPubkey !== config.nostr_pubkey_hex) {

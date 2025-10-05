@@ -595,6 +595,112 @@ body {
 .group-header-info {
     flex: 1;
     min-width: 0;
+    display: flex;
+    align-items: flex-start;
+    gap: var(--space-sm);
+}
+
+.group-header-text {
+    display: flex;
+    flex-direction: column;
+    flex: 1;
+    min-width: 0;
+}
+
+.group-title-row {
+    display: flex;
+    align-items: center;
+    gap: var(--space-sm);
+    flex-wrap: nowrap;
+}
+
+.group-title-row h2 {
+    margin: 0;
+}
+
+.relay-copy-btn {
+    position: relative;
+    margin-bottom: 0;
+    margin-left: var(--space-sm);
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 2.25rem;
+    height: 2.25rem;
+    border-radius: var(--radius-md);
+    border: 1px solid transparent;
+    background: rgba(99, 102, 241, 0.12);
+    color: var(--primary-color);
+    cursor: pointer;
+    transition: transform var(--transition-fast), background var(--transition-fast), color var(--transition-fast);
+}
+
+.relay-copy-btn:hover {
+    background: rgba(99, 102, 241, 0.18);
+    border-color: rgba(99, 102, 241, 0.25);
+}
+
+.relay-copy-btn:active {
+    transform: scale(0.94);
+}
+
+.relay-copy-btn.copied {
+    background: rgba(16, 185, 129, 0.18);
+    border-color: rgba(16, 185, 129, 0.35);
+    color: var(--success-color);
+}
+
+.relay-copy-icon,
+.relay-copy-check {
+    width: 1.1rem;
+    height: 1.1rem;
+    fill: currentColor;
+}
+
+.relay-copy-check {
+    display: none;
+}
+
+.relay-copy-btn.copied .relay-copy-icon {
+    display: none;
+}
+
+.relay-copy-btn.copied .relay-copy-check {
+    display: block;
+    animation: relay-copy-checkmark 0.4s ease;
+}
+
+.relay-copy-tooltip {
+    position: absolute;
+    bottom: calc(100% + 0.5rem);
+    left: 50%;
+    transform: translateX(-50%);
+    background: var(--text-primary);
+    color: var(--surface);
+    padding: 0.25rem 0.5rem;
+    border-radius: var(--radius-sm);
+    font-size: 0.75rem;
+    white-space: nowrap;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity var(--transition-fast);
+}
+
+.relay-copy-btn:hover .relay-copy-tooltip,
+.relay-copy-btn.copied .relay-copy-tooltip {
+    opacity: 1;
+}
+
+@keyframes relay-copy-checkmark {
+    0% {
+        transform: scale(0.4) rotate(0deg);
+    }
+    60% {
+        transform: scale(1.15) rotate(0deg);
+    }
+    100% {
+        transform: scale(1) rotate(0deg);
+    }
 }
 
 .group-header-actions {
@@ -602,6 +708,94 @@ body {
     align-items: center;
     gap: var(--space-sm);
     margin-left: auto;
+}
+
+.relay-gateway-card {
+    margin-top: var(--space-xl);
+    padding: var(--space-lg);
+    background: var(--surface);
+    border-radius: var(--radius-lg);
+    box-shadow: var(--shadow-md);
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-lg);
+}
+
+.relay-gateway-card-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: var(--space-md);
+}
+
+.relay-gateway-card-title {
+    display: flex;
+    align-items: center;
+    gap: var(--space-md);
+}
+
+.relay-gateway-card h4 {
+    margin: 0;
+    font-size: 1.05rem;
+}
+
+.relay-gateway-status-dot {
+    width: 0.75rem;
+    height: 0.75rem;
+    border-radius: var(--radius-full);
+    background: var(--border-color);
+    box-shadow: 0 0 0 rgba(16, 185, 129, 0);
+    transition: background var(--transition-fast), box-shadow var(--transition-fast);
+}
+
+.relay-gateway-card.online .relay-gateway-status-dot {
+    background: var(--success-color);
+    box-shadow: 0 0 10px rgba(16, 185, 129, 0.4);
+}
+
+.relay-gateway-card.error .relay-gateway-status-dot {
+    background: var(--danger-color);
+    box-shadow: 0 0 10px rgba(239, 68, 68, 0.35);
+}
+
+.relay-gateway-card.warning .relay-gateway-status-dot {
+    background: var(--warning-color);
+    box-shadow: 0 0 10px rgba(245, 158, 11, 0.35);
+}
+
+.relay-gateway-card.pending .relay-gateway-status-dot {
+    background: var(--info-color);
+    box-shadow: 0 0 10px rgba(59, 130, 246, 0.3);
+}
+
+.relay-gateway-card.disabled .relay-gateway-status-dot {
+    background: var(--border-color);
+    box-shadow: none;
+}
+
+.relay-gateway-meta {
+    margin: 0;
+    font-size: 0.85rem;
+}
+
+.relay-gateway-stats {
+    display: flex;
+    flex-wrap: wrap;
+    row-gap: var(--space-xs);
+    column-gap: var(--space-lg);
+    font-size: 0.875rem;
+}
+
+.relay-gateway-token .form-group-inline {
+    align-items: flex-end;
+}
+
+.relay-gateway-token .copy-field {
+    margin-top: var(--space-sm);
+}
+
+.relay-gateway-card .status-message {
+    margin-top: var(--space-sm);
 }
 
 .group-peer-count {

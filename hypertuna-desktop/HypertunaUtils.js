@@ -29,6 +29,7 @@ export class HypertunaUtils {
     static DEFAULT_CONTEXT = 'hypertuna-relay-peer';
 
     static publicGatewayState = null;
+    static publicGatewayConfig = null;
 
     static async getGatewaySettings() {
         return loadGatewaySettings();
@@ -61,9 +62,12 @@ export class HypertunaUtils {
         return configured || 'http://127.0.0.1:8443';
     }
 
-    static updatePublicGatewayState(state) {
+    static updatePublicGatewayState(state, config = null) {
         if (!state || typeof state !== 'object') {
             this.publicGatewayState = null;
+            if (config != null) {
+                this.updatePublicGatewayConfig(config);
+            }
             return;
         }
 
@@ -82,10 +86,26 @@ export class HypertunaUtils {
             wsBase: state.wsBase || null,
             lastUpdatedAt: state.lastUpdatedAt || null
         };
+
+        if (config != null) {
+            this.updatePublicGatewayConfig(config);
+        }
     }
 
     static getPublicGatewayState() {
         return this.publicGatewayState;
+    }
+
+    static updatePublicGatewayConfig(config) {
+        if (config && typeof config === 'object') {
+            this.publicGatewayConfig = { ...config };
+        } else {
+            this.publicGatewayConfig = null;
+        }
+    }
+
+    static getPublicGatewayConfig() {
+        return this.publicGatewayConfig;
     }
 
     static isRelayRegisteredWithPublic(identifier) {

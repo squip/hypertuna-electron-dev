@@ -243,6 +243,7 @@ class NostrEvents {
      * @returns {Promise<Object>} - Collection of events for group creation
      */
     static async createGroupCreationEvent(name, about, isPublic, isOpen, fileSharing, privateKey, relayKey = null, proxyServer = '', npub, proxyProtocol = 'wss', options = {}) {
+        const fileSharingEnabled = fileSharing !== false;
         // Import the utility
         const { PublicIdentifierUtils } = await import('./PublicIdentifierUtils.js');
         
@@ -279,7 +280,7 @@ class NostrEvents {
             groupTags.push(['closed']);
         }
 
-        if (fileSharing) {
+        if (fileSharingEnabled) {
             groupTags.push(['file-sharing-on']);
         } else {
             groupTags.push(['file-sharing-off']);
@@ -318,7 +319,7 @@ class NostrEvents {
             metadataTags.push(['closed']);
         }
 
-        if (fileSharing) {
+        if (fileSharingEnabled) {
             metadataTags.push(['file-sharing-on']);
         } else {
             metadataTags.push(['file-sharing-off']);
@@ -554,11 +555,8 @@ class NostrEvents {
             tags.push(['about', metadata.about]);
         }
 
-        if (metadata.fileSharing) {
-            tags.push(['file-sharing-on']);
-        } else {
-            tags.push(['file-sharing-off']);
-        }
+        const inviteFileSharing = metadata.fileSharing !== false;
+        tags.push([inviteFileSharing ? 'file-sharing-on' : 'file-sharing-off']);
 
         return this.createEvent(
             this.KIND_GROUP_INVITE_CREATE,
@@ -700,11 +698,11 @@ class NostrEvents {
         }
 
         // Determine file sharing status from tags
-        let fileSharing = false;
-        if (this._hasTag(event, 'file-sharing-on')) {
-            fileSharing = true;
-        } else if (this._hasTag(event, 'file-sharing-off')) {
+        let fileSharing = true;
+        if (this._hasTag(event, 'file-sharing-off')) {
             fileSharing = false;
+        } else if (this._hasTag(event, 'file-sharing-on')) {
+            fileSharing = true;
         }
 
         console.log(`Parsing group metadata: id=${groupId}, hypertunaId=${hypertunaId}, hasIdentifierTag=${hasIdentifierTag}`);

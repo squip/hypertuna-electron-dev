@@ -144,10 +144,24 @@
                             </svg>
                         </button>
                         <div class="group-header-info">
-                            <h2 id="group-detail-name">Relay Name</h2>
-                            <div class="group-meta-inline">
-                                <span id="group-detail-visibility" class="meta-badge">Public</span>
-                                <span id="group-detail-join-type" class="meta-badge">Open</span>
+                            <div class="group-header-text">
+                                <div class="group-title-row">
+                                    <h2 id="group-detail-name">Relay Name</h2>
+                                    <button id="relay-copy-link" class="relay-copy-btn" type="button" aria-label="Copy relay link">
+                                        <span class="relay-copy-tooltip" role="status">Copy relay link</span>
+                                        <svg class="relay-copy-icon" viewBox="0 0 16 16" aria-hidden="true">
+                                            <path d="M5 1.75C5 .784 5.784 0 6.75 0h7.5C15.216 0 16 .784 16 1.75v7.5A1.75 1.75 0 0 1 14.25 11h-7.5A1.75 1.75 0 0 1 5 9.25Zm1.75-.25a.25.25 0 0 0-.25.25v7.5c0 .138.112.25.25.25h7.5a.25.25 0 0 0 .25-.25v-7.5a.25.25 0 0 0-.25-.25Z"></path>
+                                            <path d="M0 6.75C0 5.784.784 5 1.75 5h1.5a.75.75 0 0 1 0 1.5h-1.5a.25.25 0 0 0-.25.25v7.5c0 .138.112.25.25.25h7.5a.25.25 0 0 0 .25-.25v-1.5a.75.75 0 0 1 1.5 0v1.5A1.75 1.75 0 0 1 9.25 16h-7.5A1.75 1.75 0 0 1 0 14.25Z"></path>
+                                        </svg>
+                                        <svg class="relay-copy-check" viewBox="0 0 24 24" aria-hidden="true">
+                                            <path d="M9 16.17 4.83 12l-1.42 1.41L9 19l12-12-1.41-1.41z"></path>
+                                        </svg>
+                                    </button>
+                                </div>
+                                <div class="group-meta-inline">
+                                    <span id="group-detail-visibility" class="meta-badge">Public</span>
+                                    <span id="group-detail-join-type" class="meta-badge">Open</span>
+                                </div>
                             </div>
                         </div>
                         <div class="group-header-actions">
@@ -261,13 +275,6 @@
                                                 <span class="toggle-text">Open to Join</span>
                                             </label>
                                         </div>
-                                        <div class="toggle-item">
-                                            <label class="toggle-label">
-                                                <input type="checkbox" id="edit-group-file-sharing" class="toggle-checkbox" disabled>
-                                                <span class="toggle-switch"></span>
-                                                <span class="toggle-text">Enable File Sharing</span>
-                                            </label>
-                                        </div>
                                     </div>
                                     <div class="settings-actions">
                                         <button id="btn-save-group-settings" class="btn btn-primary">Save Changes</button>
@@ -276,6 +283,33 @@
                                 </div>
                                 <div id="group-settings-no-permission" class="no-permission-message hidden">
                                     <p>You don't have permission to edit this relay's settings.</p>
+                                </div>
+                                <div id="relay-gateway-card" class="relay-gateway-card hidden" aria-live="polite">
+                                    <div class="relay-gateway-card-header">
+                                        <div class="relay-gateway-card-title">
+                                            <span class="relay-gateway-status-dot" aria-hidden="true"></span>
+                                            <div>
+                                                <h4>Gateway Bridge</h4>
+                                                <p id="relay-gateway-meta" class="relay-gateway-meta muted"></p>
+                                            </div>
+                                        </div>
+                                        <button id="relay-gateway-resync" class="btn btn-tertiary btn-small" type="button">Resync</button>
+                                    </div>
+                                    <div id="relay-gateway-stats" class="relay-gateway-stats muted"></div>
+                                    <div class="relay-gateway-token">
+                                        <div class="form-group-inline">
+                                            <div class="form-group small">
+                                                <label for="relay-gateway-ttl">Token TTL (minutes)</label>
+                                                <input type="number" id="relay-gateway-ttl" class="form-input" min="1" placeholder="Default">
+                                            </div>
+                                            <button id="relay-gateway-generate" class="btn btn-primary" type="button">Generate Link</button>
+                                        </div>
+                                        <div class="copy-field">
+                                            <input type="text" id="relay-gateway-token-output" class="form-input" readonly placeholder="Generated link appears here" aria-label="Relay share link">
+                                            <button id="relay-gateway-token-copy" class="btn btn-secondary btn-small" type="button">Copy</button>
+                                        </div>
+                                        <div id="relay-gateway-feedback" class="status-message hidden"></div>
+                                    </div>
                                 </div>
                             </div>
                         </div>
@@ -321,11 +355,11 @@
                                 <div class="toggle-item">
                                     <label class="toggle-label">
                                         <input type="checkbox" id="new-group-public" class="toggle-checkbox" checked>
-                                    <span class="toggle-switch"></span>
-                                    <span class="toggle-text">Public Relay</span>
-                                </label>
-                                <p class="toggle-description">Anyone can discover this relay</p>
-                            </div>
+                                        <span class="toggle-switch"></span>
+                                        <span class="toggle-text">Public Relay</span>
+                                    </label>
+                                    <p class="toggle-description">Anyone can discover this relay</p>
+                                </div>
                                 <div class="toggle-item">
                                     <label class="toggle-label">
                                         <input type="checkbox" id="new-group-open" class="toggle-checkbox" checked>
@@ -333,13 +367,6 @@
                                         <span class="toggle-text">Open to Join</span>
                                     </label>
                                     <p class="toggle-description">No invite code required</p>
-                                </div>
-                                <div class="toggle-item">
-                                    <label class="toggle-label">
-                                        <input type="checkbox" id="new-group-file-sharing" class="toggle-checkbox">
-                                        <span class="toggle-switch"></span>
-                                        <span class="toggle-text">Enable File Sharing</span>
-                                    </label>
                                 </div>
                             </div>
                         <button id="btn-create-group" type="button" class="btn btn-primary btn-block">Create Relay</button>
@@ -561,30 +588,6 @@
                                         </div>
                                         <button id="public-gateway-save" class="btn btn-secondary">Save</button>
                                     </div>
-                                </div>
-                                <div id="public-gateway-status" class="public-gateway-status-card">
-                                    <div id="public-gateway-meta" class="public-gateway-meta muted"></div>
-                                    <div id="public-gateway-relay-status" class="public-gateway-relay-list"></div>
-                                </div>
-                                <div class="public-gateway-token-card">
-                                    <h5>Generate Share Link</h5>
-                                    <p class="muted">Create a temporary WebSocket URL that routes through the public gateway.</p>
-                                    <div class="form-group">
-                                        <label for="public-gateway-relay-select">Relay</label>
-                                        <select id="public-gateway-relay-select" class="form-input"></select>
-                                    </div>
-                                    <div class="form-group-inline">
-                                        <div class="form-group small">
-                                            <label for="public-gateway-token-custom-ttl">Token TTL (minutes)</label>
-                                            <input type="number" id="public-gateway-token-custom-ttl" class="form-input" min="1" placeholder="Optional">
-                                        </div>
-                                        <button id="public-gateway-generate" class="btn btn-primary">Generate Link</button>
-                                    </div>
-                                    <div class="copy-field">
-                                        <input type="text" id="public-gateway-token-output" class="form-input" readonly placeholder="wss://hypertuna.com/relay/token">
-                                        <button id="public-gateway-copy" class="btn btn-secondary btn-small">Copy</button>
-                                    </div>
-                                    <div id="public-gateway-token-feedback" class="status-message hidden"></div>
                                 </div>
                             </div>
                         </div>

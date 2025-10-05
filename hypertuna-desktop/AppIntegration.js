@@ -51,6 +51,22 @@ function integrateNostrRelays(App) {
     App.gatewayPeerRelayMap = new Map();
     App.gatewayPeerDetails = new Map();
     App.publicGatewayState = null;
+    App.relayGatewayCardInitialized = false;
+    App.relayGatewayElements = {
+        card: null,
+        meta: null,
+        stats: null,
+        resyncBtn: null,
+        ttlInput: null,
+        generateBtn: null,
+        tokenOutput: null,
+        copyBtn: null,
+        feedback: null,
+        statusDot: null,
+        headerCopyBtn: null
+    };
+    App.relayGatewayLastToken = null;
+    App.currentGroupIsMember = false;
 
     // Track discovery relay connections displayed in profile UI
     App.discoveryRelays = new Map();
@@ -223,6 +239,10 @@ function integrateNostrRelays(App) {
 
         this.updateVisibleGroupPeerSummaries();
 
+        if (typeof this.refreshRelayGatewayCard === 'function') {
+            this.refreshRelayGatewayCard();
+        }
+
         if (this.currentListView === 'discover' && typeof this.loadDiscoverRelays === 'function') {
             this.loadDiscoverRelays(true).catch((err) => console.error('Failed to refresh discover relays:', err));
         }
@@ -230,6 +250,9 @@ function integrateNostrRelays(App) {
 
     App.updatePublicGatewayState = function(state) {
         this.publicGatewayState = state || null;
+        if (typeof this.refreshRelayGatewayCard === 'function') {
+            this.refreshRelayGatewayCard();
+        }
     };
 
     App.getRelayPeerEntry = function(identifier = null) {
@@ -299,6 +322,313 @@ function integrateNostrRelays(App) {
 
         updateContainer(document.getElementById('groups-list'));
         updateContainer(document.getElementById('discover-list'));
+    };
+
+    App.initRelayGatewayCard = function() {
+        if (this.relayGatewayCardInitialized) return;
+        this.relayGatewayCardInitialized = true;
+
+        const elements = this.relayGatewayElements;
+        elements.card = document.getElementById('relay-gateway-card');
+        elements.meta = document.getElementById('relay-gateway-meta');
+        elements.stats = document.getElementById('relay-gateway-stats');
+        elements.resyncBtn = document.getElementById('relay-gateway-resync');
+        elements.ttlInput = document.getElementById('relay-gateway-ttl');
+        elements.generateBtn = document.getElementById('relay-gateway-generate');
+        elements.tokenOutput = document.getElementById('relay-gateway-token-output');
+        elements.copyBtn = document.getElementById('relay-gateway-token-copy');
+        elements.feedback = document.getElementById('relay-gateway-feedback');
+        elements.statusDot = elements.card?.querySelector('.relay-gateway-status-dot') || null;
+        elements.headerCopyBtn = document.getElementById('relay-copy-link');
+
+        if (elements.resyncBtn) {
+            elements.resyncBtn.addEventListener('click', () => this.handleRelayGatewayResync());
+        }
+        if (elements.generateBtn) {
+            elements.generateBtn.addEventListener('click', () => this.handleRelayGatewayGenerate());
+        }
+        if (elements.copyBtn) {
+            elements.copyBtn.addEventListener('click', () => this.handleRelayGatewayCopy());
+        }
+        if (elements.headerCopyBtn) {
+            elements.headerCopyBtn.addEventListener('click', (event) => this.handleRelayCopyLink(event));
+        }
+
+        window.addEventListener('public-gateway-status', () => {
+            this.refreshRelayGatewayCard();
+        });
+
+        window.addEventListener('public-gateway-message', (event) => {
+            if (!event?.detail?.message) return;
+            if (!this.currentGroupIsMember) return;
+            const { type, message } = event.detail;
+            if (type === 'error') {
+                this.setRelayGatewayFeedback('error', message);
+            }
+        });
+
+        window.addEventListener('public-gateway-token', (event) => {
+            const result = event?.detail;
+            if (!result || result.relayKey !== this.currentHypertunaId) return;
+            this.relayGatewayLastToken = result;
+            this.updateRelayGatewayTokenOutput(result.connectionUrl, result.expiresAt);
+        });
+    };
+
+    App.setRelayGatewayFeedback = function(variant, message) {
+        const { feedback } = this.relayGatewayElements;
+        if (!feedback) return;
+        if (!message) {
+            feedback.classList.add('hidden');
+            feedback.textContent = '';
+            feedback.classList.remove('success', 'error', 'info', 'warning');
+            return;
+        }
+        feedback.textContent = message;
+        feedback.classList.remove('hidden', 'success', 'error', 'info', 'warning');
+        if (variant === 'success') {
+            feedback.classList.add('success');
+        } else if (variant === 'error') {
+            feedback.classList.add('error');
+        } else if (variant === 'warning') {
+            feedback.classList.add('warning');
+        } else {
+            feedback.classList.add('info');
+        }
+    };
+
+    App.updateRelayGatewayTokenOutput = function(value, expiresAt = null) {
+        const { tokenOutput, copyBtn } = this.relayGatewayElements;
+        if (tokenOutput) {
+            tokenOutput.value = value || '';
+        }
+        if (copyBtn) {
+            copyBtn.disabled = !value;
+        }
+        if (value) {
+            const expiryText = expiresAt ? new Date(expiresAt).toLocaleString() : 'soon';
+            this.setRelayGatewayFeedback('success', `Share link ready. Expires ${expiryText}.`);
+        }
+    };
+
+    App.refreshRelayGatewayCard = function() {
+        this.initRelayGatewayCard();
+        const elements = this.relayGatewayElements;
+        const { card, meta, stats, statusDot, ttlInput, resyncBtn, generateBtn } = elements;
+        if (!card) return;
+
+        const identifier = this.currentHypertunaId || null;
+        const onDetailPage = this.currentPage === 'group-detail';
+        const hasAccess = onDetailPage && this.currentGroupIsMember && !!identifier;
+        card.classList.toggle('hidden', !hasAccess);
+        if (!hasAccess) {
+            this.setRelayGatewayFeedback(null, '');
+            return;
+        }
+
+        const summary = typeof window.getPublicGatewaySummary === 'function'
+            ? window.getPublicGatewaySummary()
+            : { text: 'Public gateway bridge unavailable', status: 'disabled', bridgeEnabled: false, remoteActive: false };
+
+        if (meta) {
+            meta.textContent = summary.text || '';
+        }
+
+        card.classList.remove('online', 'error', 'warning', 'disabled', 'pending');
+        if (summary.status) {
+            card.classList.add(summary.status);
+        }
+
+        if (statusDot) {
+            statusDot.classList.remove('online', 'error', 'warning');
+        }
+
+        const gatewayState = HypertunaUtils.getPublicGatewayState() || {};
+        const relayState = gatewayState.relays?.[identifier] || null;
+        const peerEntry = this.gatewayPeerRelayMap.get(identifier) || relayState || null;
+        const statParts = [];
+        if (relayState && typeof window.formatRelayGatewayStats === 'function') {
+            statParts.push(...window.formatRelayGatewayStats(relayState));
+        } else if (peerEntry && typeof window.formatRelayGatewayStats === 'function') {
+            statParts.push(...window.formatRelayGatewayStats(peerEntry));
+        }
+        if (!statParts.length) {
+            statParts.push('No gateway telemetry available');
+        }
+        if (stats) {
+            stats.textContent = statParts.join(' • ');
+        }
+
+        const defaultConfig = HypertunaUtils.getPublicGatewayConfig() || {};
+        if (ttlInput) {
+            const minutes = Math.max(1, Math.round((defaultConfig.defaultTokenTtl || 3600) / 60));
+            ttlInput.placeholder = `${minutes}`;
+        }
+
+        const bridgeReady = !!summary.bridgeEnabled && !!summary.remoteActive;
+        const isRegistered = HypertunaUtils.isRelayRegisteredWithPublic(identifier);
+
+        if (resyncBtn) {
+            resyncBtn.disabled = !bridgeReady || !identifier;
+        }
+        if (generateBtn) {
+            generateBtn.disabled = !bridgeReady || !isRegistered;
+        }
+        if (elements.copyBtn) {
+            elements.copyBtn.disabled = !elements.tokenOutput?.value;
+        }
+
+        // Preserve last generated token if it matches current relay
+        if (this.relayGatewayLastToken?.relayKey === identifier) {
+            this.updateRelayGatewayTokenOutput(this.relayGatewayLastToken.connectionUrl, this.relayGatewayLastToken.expiresAt);
+        } else {
+            this.updateRelayGatewayTokenOutput('', null);
+            this.setRelayGatewayFeedback(null, '');
+        }
+    };
+
+    App.handleRelayGatewayResync = async function() {
+        const elements = this.relayGatewayElements;
+        const { resyncBtn } = elements;
+        const identifier = this.currentHypertunaId || null;
+        if (!identifier || typeof window.refreshPublicGatewayRelay !== 'function') return;
+
+        try {
+            if (resyncBtn) resyncBtn.disabled = true;
+            this.setRelayGatewayFeedback('info', 'Requesting gateway resync…');
+            await window.refreshPublicGatewayRelay(identifier);
+            this.setRelayGatewayFeedback('success', 'Resync requested successfully.');
+        } catch (error) {
+            console.error('Failed to resync public gateway relay:', error);
+            this.setRelayGatewayFeedback('error', error.message || 'Resync request failed.');
+        } finally {
+            if (resyncBtn) {
+                setTimeout(() => {
+                    resyncBtn.disabled = false;
+                }, 600);
+            }
+        }
+    };
+
+    App.handleRelayGatewayGenerate = async function() {
+        const elements = this.relayGatewayElements;
+        const { generateBtn, ttlInput } = elements;
+        const identifier = this.currentHypertunaId || null;
+        if (!identifier || typeof window.requestPublicGatewayToken !== 'function') {
+            this.setRelayGatewayFeedback('error', 'Public gateway bridge is unavailable.');
+            return;
+        }
+
+        let ttlSeconds;
+        if (ttlInput && ttlInput.value) {
+            const minutes = Number(ttlInput.value);
+            if (Number.isFinite(minutes) && minutes > 0) {
+                ttlSeconds = Math.round(minutes * 60);
+            } else {
+                this.setRelayGatewayFeedback('error', 'Enter a valid TTL in minutes.');
+                ttlInput.focus();
+                return;
+            }
+        }
+
+        try {
+            if (generateBtn) generateBtn.disabled = true;
+            this.setRelayGatewayFeedback('info', 'Generating public gateway link…');
+            const result = await window.requestPublicGatewayToken({ relayKey: identifier, ttlSeconds });
+            this.relayGatewayLastToken = result;
+            this.updateRelayGatewayTokenOutput(result.connectionUrl, result.expiresAt);
+        } catch (error) {
+            console.error('Failed to generate public gateway token:', error);
+            this.setRelayGatewayFeedback('error', error.message || 'Failed to generate link.');
+        } finally {
+            if (generateBtn) generateBtn.disabled = false;
+        }
+    };
+
+    App.handleRelayGatewayCopy = async function() {
+        const elements = this.relayGatewayElements;
+        const { tokenOutput } = elements;
+        const value = tokenOutput?.value?.trim();
+        if (!value) {
+            this.setRelayGatewayFeedback('warning', 'Generate a link before copying.');
+            return;
+        }
+
+        try {
+            await window.copyTextToClipboard(value);
+            this.setRelayGatewayFeedback('success', 'Link copied to clipboard.');
+        } catch (error) {
+            console.error('Failed to copy relay link:', error);
+            this.setRelayGatewayFeedback('error', 'Unable to copy link automatically.');
+        }
+    };
+
+    App.handleRelayCopyLink = async function(event) {
+        if (event) {
+            event.preventDefault();
+            event.stopPropagation();
+        }
+        this.initRelayGatewayCard();
+        const { headerCopyBtn } = this.relayGatewayElements;
+        if (!headerCopyBtn) return;
+
+        const identifier = this.currentHypertunaId || null;
+        if (!identifier) {
+            return;
+        }
+
+        const resetTooltip = () => {
+            const tooltip = headerCopyBtn.querySelector('.relay-copy-tooltip');
+            if (tooltip) tooltip.textContent = 'Copy relay link';
+            headerCopyBtn.classList.remove('copied');
+        };
+
+        const flashTooltip = (text, copied) => {
+            const tooltip = headerCopyBtn.querySelector('.relay-copy-tooltip');
+            if (tooltip) tooltip.textContent = text;
+            headerCopyBtn.classList.toggle('copied', !!copied);
+            setTimeout(() => {
+                resetTooltip();
+            }, 2000);
+        };
+
+        try {
+            let targetUrl = '';
+            const summary = typeof window.getPublicGatewaySummary === 'function'
+                ? window.getPublicGatewaySummary()
+                : null;
+            const bridgeReady = !!summary?.bridgeEnabled && !!summary?.remoteActive;
+            const registered = HypertunaUtils.isRelayRegisteredWithPublic(identifier);
+
+            if (bridgeReady && registered) {
+                this.setRelayGatewayFeedback('info', 'Generating public link for clipboard…');
+                const result = await window.requestPublicGatewayToken({ relayKey: identifier });
+                targetUrl = result.connectionUrl || '';
+                this.relayGatewayLastToken = result;
+                this.updateRelayGatewayTokenOutput(result.connectionUrl, result.expiresAt);
+            }
+
+            if (!targetUrl) {
+                const base = await this.resolveLocalGatewayBase();
+                const peerEntry = this.gatewayPeerRelayMap.get(identifier) || null;
+                const gatewayPath = this.normalizeGatewayPath(identifier, peerEntry?.metadata) || identifier;
+                targetUrl = `${base.replace(/\/$/, '')}/${gatewayPath}`;
+            }
+
+            await window.copyTextToClipboard(targetUrl);
+            if (this.currentGroupIsMember && this.currentPage === 'group-detail') {
+                if (this.relayGatewayLastToken?.relayKey === identifier) {
+                    this.setRelayGatewayFeedback('success', 'Link copied to clipboard.');
+                } else {
+                    this.setRelayGatewayFeedback('info', 'Local relay URL copied to clipboard.');
+                }
+            }
+            flashTooltip('Copied!', true);
+        } catch (error) {
+            console.error('Failed to copy relay link:', error);
+            flashTooltip('Copy failed', false);
+            this.setRelayGatewayFeedback('error', error.message || 'Copy failed.');
+        }
     };
 
     const uint8ArrayToBase64 = (bytes) => {
@@ -437,6 +767,11 @@ function integrateNostrRelays(App) {
         // Disconnect from relays
         if (this.relay && this.relay.isConnected()) {
             this.relay.disconnect();
+        }
+
+        this.currentGroupIsMember = false;
+        if (typeof this.refreshRelayGatewayCard === 'function') {
+            this.refreshRelayGatewayCard();
         }
         
         if (this.nostr && this.nostr.client) {
@@ -1483,6 +1818,9 @@ App.syncHypertunaConfigToFile = async function() {
             
             this.currentGroup = group;
             this.currentHypertunaId = group.hypertunaId;
+            if (!this.relayGatewayLastToken || this.relayGatewayLastToken.relayKey !== this.currentHypertunaId) {
+                this.relayGatewayLastToken = null;
+            }
 
             // Rest of the method remains the same...
             // Update group header with null checks
@@ -1539,9 +1877,12 @@ App.syncHypertunaConfigToFile = async function() {
             // Re-check member and admin status
             const isMember = this.nostr.isGroupMember(this.currentGroupId, this.currentUser.pubkey);
             const isAdmin = this.nostr.isGroupAdmin(this.currentGroupId, this.currentUser.pubkey);
-            
+
             console.log(`Final status checks - isMember: ${isMember}, isAdmin: ${isAdmin}`);
-            
+
+            this.currentGroupIsMember = isMember;
+            this.refreshRelayGatewayCard();
+
             // Update join/leave buttons
             const joinButton = document.getElementById('btn-join-group');
             const leaveButton = document.getElementById('btn-leave-group');
@@ -1592,12 +1933,6 @@ App.syncHypertunaConfigToFile = async function() {
 
             const memberInviteBtn = document.getElementById('btn-member-invite');
             if (memberInviteBtn) memberInviteBtn.disabled = !(isMember && group.isOpen);
-
-            const editFileSharingCheckbox = document.getElementById('edit-group-file-sharing');
-            if (editFileSharingCheckbox) {
-                editFileSharingCheckbox.checked = !!group.fileSharing;
-                editFileSharingCheckbox.disabled = true;
-            }
 
             // Update settings form
             const settingsForm = document.getElementById('group-settings-form');
@@ -2128,8 +2463,7 @@ App.syncHypertunaConfigToFile = async function() {
         const about = document.getElementById('new-group-description').value.trim();
         const isPublic = document.getElementById('new-group-public').checked;
         const isOpen = document.getElementById('new-group-open').checked;
-        const fileSharingEl = document.getElementById('new-group-file-sharing');
-        const fileSharing = fileSharingEl ? fileSharingEl.checked : false;
+        const fileSharing = true;
         
         if (!name) {
             alert('Please enter a group name.');
@@ -2140,7 +2474,7 @@ App.syncHypertunaConfigToFile = async function() {
             // Get the user's npub
             const npub = NostrUtils.hexToNpub(this.currentUser.pubkey); 
             
-            console.log("Creating group with parameters:", { name, about, isPublic, isOpen, npub });
+            console.log("Creating group with parameters:", { name, about, isPublic, isOpen, npub, fileSharing });
 
             let relayKey = null;
 
@@ -2252,7 +2586,7 @@ App.syncHypertunaConfigToFile = async function() {
 
         try {
             const group = this.nostr.getGroupById(this.currentGroupId) || {};
-            const fileSharing = !!group.fileSharing;
+            const fileSharing = true;
             // The new global function will handle communication with the worker
             // and return a promise that resolves with the auth result.
             // The UI will be updated by messages from the worker.
@@ -2440,7 +2774,7 @@ App.syncHypertunaConfigToFile = async function() {
 
         try {
             const group = this.nostr.getGroupById(this.currentGroupId) || {};
-            const fileSharing = !!group.fileSharing;
+            const fileSharing = true;
             // Build the join request event without publishing
             const event = await this.nostr.joinGroup(
                 this.currentGroupId,
