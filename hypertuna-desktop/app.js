@@ -32,6 +32,7 @@ let gatewayUptimeTimer = null;
 let gatewayPeerRelayMap = new Map();
 let gatewayPeerDetails = new Map();
 const DEFAULT_API_URL = 'http://localhost:1945';
+const DEFAULT_PUBLIC_GATEWAY_URL = 'https://hypertuna.com';
 
 // Store worker messages that may arrive before AppIntegration sets up handlers
 let pendingRelayMessages = {
@@ -76,6 +77,7 @@ let gatewayToggleLogsButton = null
 let gatewayLanToggle = null
 let gatewayPublicToggle = null
 let publicGatewayEnableToggle = null
+let publicGatewaySelectionSelect = null
 let publicGatewayUrlInput = null
 let publicGatewaySecretInput = null
 let publicGatewaySaveButton = null
@@ -89,14 +91,29 @@ let publicGatewayStatusContainer = null
 let publicGatewayStatusList = null
 let publicGatewayTokenFeedback = null
 let publicGatewayMeta = null
+let publicGatewayManualFields = null
+let publicGatewaySelectionHelp = null
+let publicGatewaySelectionMeta = null
 
 let publicGatewayConfig = {
   enabled: false,
-  baseUrl: '',
+  selectionMode: 'default',
+  selectedGatewayId: null,
+  preferredBaseUrl: DEFAULT_PUBLIC_GATEWAY_URL,
+  baseUrl: DEFAULT_PUBLIC_GATEWAY_URL,
   sharedSecret: '',
-  defaultTokenTtl: 3600
+  defaultTokenTtl: 3600,
+  resolvedGatewayId: null,
+  resolvedDisplayName: null,
+  resolvedRegion: null,
+  resolvedSecretVersion: null,
+  resolvedFallback: false,
+  resolvedFromDiscovery: false,
+  resolvedAt: null,
+  disabledReason: null
 }
 let publicGatewayState = null
+let publicGatewayDiscovered = []
 
 // Log functions
 function formatDuration(ms) {
@@ -324,27 +341,69 @@ function renderGatewayLogs() {
 
 function normalizePublicGatewayConfig(config = {}) {
   const enabled = !!config.enabled
-  const baseUrl = typeof config.baseUrl === 'string' ? config.baseUrl.trim() : ''
-  const sharedSecret = typeof config.sharedSecret === 'string' ? config.sharedSecret.trim() : ''
+  const selectionRaw = typeof config.selectionMode === 'string' ? config.selectionMode.trim().toLowerCase() : ''
+  const selectionMode = ['default', 'discovered', 'manual'].includes(selectionRaw) ? selectionRaw : 'default'
+  const selectedGatewayId = typeof config.selectedGatewayId === 'string'
+    ? config.selectedGatewayId.trim() || null
+    : null
+  const preferredBaseUrl = typeof config.preferredBaseUrl === 'string'
+    ? config.preferredBaseUrl.trim() || DEFAULT_PUBLIC_GATEWAY_URL
+    : DEFAULT_PUBLIC_GATEWAY_URL
+  const baseUrlRaw = typeof config.baseUrl === 'string' ? config.baseUrl.trim() : ''
+  const sharedSecretRaw = typeof config.sharedSecret === 'string' ? config.sharedSecret.trim() : ''
   const ttlRaw = Number(config.defaultTokenTtl)
   const defaultTokenTtl = Number.isFinite(ttlRaw) && ttlRaw > 0 ? Math.max(60, Math.round(ttlRaw)) : 3600
-  return { enabled, baseUrl, sharedSecret, defaultTokenTtl }
+
+  const normalized = {
+    enabled,
+    selectionMode,
+    selectedGatewayId,
+    preferredBaseUrl: preferredBaseUrl || DEFAULT_PUBLIC_GATEWAY_URL,
+    baseUrl: baseUrlRaw || DEFAULT_PUBLIC_GATEWAY_URL,
+    sharedSecret: sharedSecretRaw,
+    defaultTokenTtl,
+    resolvedGatewayId: config.resolvedGatewayId || null,
+    resolvedDisplayName: config.resolvedDisplayName || null,
+    resolvedRegion: config.resolvedRegion || null,
+    resolvedSecretVersion: config.resolvedSecretVersion || null,
+    resolvedFallback: !!config.resolvedFallback,
+    resolvedFromDiscovery: !!config.resolvedFromDiscovery,
+    resolvedAt: config.resolvedAt || null,
+    disabledReason: config.disabledReason || null
+  }
+
+  if (normalized.selectionMode === 'default') {
+    normalized.selectedGatewayId = null
+    normalized.baseUrl = normalized.preferredBaseUrl || DEFAULT_PUBLIC_GATEWAY_URL
+    normalized.sharedSecret = ''
+  } else if (normalized.selectionMode === 'manual') {
+    if (!normalized.baseUrl) normalized.baseUrl = normalized.preferredBaseUrl || DEFAULT_PUBLIC_GATEWAY_URL
+  } else if (normalized.selectionMode === 'discovered') {
+    normalized.sharedSecret = ''
+  }
+
+  return normalized
 }
 
 function applyPublicGatewayConfigToUI() {
   if (publicGatewayEnableToggle) {
     publicGatewayEnableToggle.checked = !!publicGatewayConfig.enabled
   }
-  if (publicGatewayUrlInput) {
+  if (publicGatewayUrlInput && publicGatewayConfig.selectionMode === 'manual') {
     publicGatewayUrlInput.value = publicGatewayConfig.baseUrl || ''
+  } else if (publicGatewayUrlInput && !publicGatewayUrlInput.value) {
+    publicGatewayUrlInput.value = ''
   }
-  if (publicGatewaySecretInput) {
+  if (publicGatewaySecretInput && publicGatewayConfig.selectionMode === 'manual') {
     publicGatewaySecretInput.value = publicGatewayConfig.sharedSecret || ''
+  } else if (publicGatewaySecretInput && publicGatewaySecretInput.value) {
+    publicGatewaySecretInput.value = ''
   }
   if (publicGatewayDefaultTtlInput) {
     const minutes = Math.max(1, Math.round((publicGatewayConfig.defaultTokenTtl || 3600) / 60))
     publicGatewayDefaultTtlInput.value = String(minutes)
   }
+  populatePublicGatewaySelectionOptions()
   updatePublicGatewayFormState()
 }
 
@@ -352,6 +411,91 @@ function updatePublicGatewayFormState() {
   const bridgeEnabled = !!publicGatewayConfig.enabled
   const remoteActive = !!publicGatewayState?.enabled
   const relayCount = gatewayPeerRelayMap.size
+  const selectionMode = publicGatewayConfig.selectionMode || 'default'
+  const selectedGatewayId = publicGatewayConfig.selectedGatewayId || null
+  const selectedGateway = selectedGatewayId
+    ? publicGatewayDiscovered.find((entry) => entry.gatewayId === selectedGatewayId)
+    : null
+
+  if (publicGatewaySelectionSelect) {
+    publicGatewaySelectionSelect.disabled = false
+  }
+
+  if (publicGatewayManualFields) {
+    publicGatewayManualFields.classList.toggle('hidden', selectionMode !== 'manual')
+  }
+
+  if (publicGatewayUrlInput) {
+    if (selectionMode === 'manual') {
+      publicGatewayUrlInput.readOnly = false
+      publicGatewayUrlInput.disabled = !bridgeEnabled
+    } else {
+      publicGatewayUrlInput.readOnly = true
+      publicGatewayUrlInput.disabled = true
+      if (selectionMode === 'default') {
+        publicGatewayUrlInput.value = publicGatewayConfig.preferredBaseUrl || DEFAULT_PUBLIC_GATEWAY_URL
+      } else if (selectionMode === 'discovered') {
+        const resolvedUrl = selectedGateway?.publicUrl
+          || publicGatewayState?.baseUrl
+          || publicGatewayConfig.baseUrl
+          || ''
+        publicGatewayUrlInput.value = resolvedUrl
+      }
+    }
+  }
+
+  if (publicGatewaySecretInput) {
+    if (selectionMode === 'manual') {
+      publicGatewaySecretInput.readOnly = false
+      publicGatewaySecretInput.disabled = !bridgeEnabled
+    } else {
+      publicGatewaySecretInput.readOnly = true
+      publicGatewaySecretInput.disabled = true
+      publicGatewaySecretInput.value = ''
+    }
+  }
+
+  if (publicGatewaySelectionHelp) {
+    if (selectionMode === 'manual') {
+      publicGatewaySelectionHelp.textContent = 'Provide the gateway details and shared secret supplied by the administrator.'
+    } else if (selectionMode === 'discovered') {
+      publicGatewaySelectionHelp.textContent = 'Open public gateways share their connection secret automatically when selected.'
+    } else {
+      publicGatewaySelectionHelp.textContent = 'Hypertuna.com will be used by default unless it is unavailable.'
+    }
+  }
+
+  if (publicGatewaySelectionMeta) {
+    let metaText = ''
+    if (!bridgeEnabled) {
+      metaText = 'Enable the bridge to connect through a public gateway.'
+    } else if (selectionMode === 'discovered' && selectedGateway?.isExpired) {
+      const label = selectedGateway.displayName || selectedGateway.publicUrl || 'Selected gateway'
+      metaText = `${label} is currently offline.`
+    } else if (selectionMode === 'discovered' && selectedGateway?.secretFetchError) {
+      const label = selectedGateway.displayName || selectedGateway.publicUrl || 'Selected gateway'
+      metaText = `${label} secret unavailable: ${selectedGateway.secretFetchError}`
+    } else if (bridgeEnabled && publicGatewayState?.disabledReason) {
+      metaText = `Bridge unavailable: ${publicGatewayState.disabledReason}`
+    } else if (bridgeEnabled && publicGatewayState?.discoveryUnavailableReason) {
+      metaText = `Discovery error: ${publicGatewayState.discoveryUnavailableReason}`
+    } else if (bridgeEnabled && publicGatewayState?.enabled) {
+      const label = publicGatewayState.resolvedDisplayName
+        || publicGatewayState.baseUrl
+        || selectedGateway?.publicUrl
+        || publicGatewayConfig.baseUrl
+        || DEFAULT_PUBLIC_GATEWAY_URL
+      const parts = [`Connected to ${label}`]
+      if (publicGatewayState.resolvedRegion) parts.push(publicGatewayState.resolvedRegion)
+      if (publicGatewayState.resolvedSecretVersion) parts.push(`secret v${publicGatewayState.resolvedSecretVersion}`)
+      if (publicGatewayState.resolvedFallback) parts.push('fallback in use')
+      if (publicGatewayState.resolvedAt) parts.push(`updated ${formatRelativeTime(publicGatewayState.resolvedAt)}`)
+      metaText = parts.join(' • ')
+    } else {
+      metaText = 'Waiting for connection to a public gateway.'
+    }
+    publicGatewaySelectionMeta.textContent = metaText
+  }
 
   if (publicGatewayGenerateButton) {
     publicGatewayGenerateButton.disabled = !remoteActive || relayCount === 0
@@ -406,26 +550,113 @@ function populatePublicGatewayRelayOptions() {
   updatePublicGatewayFormState()
 }
 
+function handlePublicGatewaySelectionChange() {
+  if (!publicGatewaySelectionSelect) return
+  const value = publicGatewaySelectionSelect.value || 'default'
+  if (value === 'manual') {
+    publicGatewayConfig.selectionMode = 'manual'
+    publicGatewayConfig.selectedGatewayId = null
+    publicGatewayConfig.preferredBaseUrl = publicGatewayConfig.baseUrl || publicGatewayConfig.preferredBaseUrl || DEFAULT_PUBLIC_GATEWAY_URL
+  } else if (value.startsWith('gateway:')) {
+    const gatewayId = value.slice(8)
+    publicGatewayConfig.selectionMode = 'discovered'
+    publicGatewayConfig.selectedGatewayId = gatewayId || null
+    const selected = publicGatewayDiscovered.find((entry) => entry.gatewayId === gatewayId)
+    if (selected?.publicUrl) {
+      publicGatewayConfig.baseUrl = selected.publicUrl
+    }
+  } else {
+    publicGatewayConfig.selectionMode = 'default'
+    publicGatewayConfig.selectedGatewayId = null
+    publicGatewayConfig.preferredBaseUrl = DEFAULT_PUBLIC_GATEWAY_URL
+    publicGatewayConfig.baseUrl = DEFAULT_PUBLIC_GATEWAY_URL
+  }
+  clearPublicGatewayTokenFeedback()
+  updatePublicGatewayFormState()
+}
+
+function populatePublicGatewaySelectionOptions() {
+  if (!publicGatewaySelectionSelect) return
+
+  const previousValue = publicGatewaySelectionSelect.value
+  publicGatewaySelectionSelect.innerHTML = ''
+
+  const defaultOption = document.createElement('option')
+  defaultOption.value = 'default'
+  defaultOption.textContent = 'Default (hypertuna.com)'
+  publicGatewaySelectionSelect.appendChild(defaultOption)
+
+  const gateways = Array.isArray(publicGatewayDiscovered) ? [...publicGatewayDiscovered] : []
+  gateways.sort((a, b) => {
+    if (!!a.isExpired !== !!b.isExpired) return a.isExpired ? 1 : -1
+    return (b.lastSeenAt || 0) - (a.lastSeenAt || 0)
+  })
+
+  for (const gateway of gateways) {
+    const option = document.createElement('option')
+    option.value = `gateway:${gateway.gatewayId}`
+    const name = gateway.displayName || gateway.publicUrl || gateway.gatewayId
+    const descriptors = []
+    if (gateway.region) descriptors.push(gateway.region)
+    if (gateway.isExpired) descriptors.push('offline')
+    else if (gateway.secretFetchError) descriptors.push('error')
+    else descriptors.push('online')
+    option.textContent = descriptors.length ? `${name} (${descriptors.join(' • ')})` : name
+    option.dataset.url = gateway.publicUrl || ''
+    if (gateway.isExpired || !gateway.sharedSecret) {
+      option.disabled = true
+    }
+    publicGatewaySelectionSelect.appendChild(option)
+  }
+
+  const manualOption = document.createElement('option')
+  manualOption.value = 'manual'
+  manualOption.textContent = 'Manual entry'
+  publicGatewaySelectionSelect.appendChild(manualOption)
+
+  let targetValue = 'default'
+  if (publicGatewayConfig.selectionMode === 'manual') {
+    targetValue = 'manual'
+  } else if (publicGatewayConfig.selectionMode === 'discovered' && publicGatewayConfig.selectedGatewayId) {
+    targetValue = `gateway:${publicGatewayConfig.selectedGatewayId}`
+    const option = Array.from(publicGatewaySelectionSelect.options).find((opt) => opt.value === targetValue && !opt.disabled)
+    if (!option) {
+      targetValue = previousValue && previousValue.startsWith('gateway:') ? previousValue : 'default'
+    }
+  }
+
+  if (!Array.from(publicGatewaySelectionSelect.options).some((opt) => opt.value === targetValue && !opt.disabled)) {
+    targetValue = 'default'
+  }
+
+  publicGatewaySelectionSelect.value = targetValue
+}
+
 function renderPublicGatewayStatus(state) {
   publicGatewayState = state || null
+  publicGatewayDiscovered = Array.isArray(state?.discoveredGateways) ? state.discoveredGateways : []
   HypertunaUtils.updatePublicGatewayState(publicGatewayState)
   if (window.App?.updatePublicGatewayState) {
     window.App.updatePublicGatewayState(publicGatewayState)
   }
+  populatePublicGatewaySelectionOptions()
+  updatePublicGatewayFormState()
   if (!publicGatewayStatusContainer) return
 
   const relays = state?.relays ? Object.entries(state.relays) : []
   relays.sort((a, b) => a[0].localeCompare(b[0]))
 
   if (publicGatewayMeta) {
-    if (state?.enabled && state?.baseUrl) {
-      const ttlMinutes = Math.max(1, Math.round((state.defaultTokenTtl || 3600) / 60))
-      publicGatewayMeta.textContent = `Bridge host: ${state.baseUrl} • Default token TTL: ${ttlMinutes}m`
-    } else if (publicGatewayConfig.enabled && publicGatewayConfig.baseUrl) {
-      const minutes = Math.max(1, Math.round((publicGatewayConfig.defaultTokenTtl || 3600) / 60))
-      publicGatewayMeta.textContent = `Configured host: ${publicGatewayConfig.baseUrl} • Default token TTL: ${minutes}m`
+    const totalGateways = publicGatewayDiscovered.length
+    const onlineGateways = publicGatewayDiscovered.reduce((count, gateway) => {
+      if (gateway && !gateway.isExpired && gateway.sharedSecret) return count + 1
+      return count
+    }, 0)
+    const ttlMinutes = Math.max(1, Math.round(((state?.defaultTokenTtl || publicGatewayConfig.defaultTokenTtl || 3600) / 60)))
+    if (state?.discoveryUnavailableReason) {
+      publicGatewayMeta.textContent = `Discovery unavailable: ${state.discoveryUnavailableReason}`
     } else {
-      publicGatewayMeta.textContent = 'Bridge disabled'
+      publicGatewayMeta.textContent = `Available gateways: ${onlineGateways}/${totalGateways} • Default token TTL: ${ttlMinutes}m`
     }
   }
 
@@ -578,18 +809,52 @@ async function handlePublicGatewaySave(event) {
   if (!isElectron || !electronAPI?.setPublicGatewayConfig) return
 
   const enabled = !!publicGatewayEnableToggle?.checked
-  const baseUrl = publicGatewayUrlInput?.value?.trim() || ''
-  const sharedSecret = publicGatewaySecretInput?.value?.trim() || ''
+  const selectionValue = publicGatewaySelectionSelect?.value || 'default'
+  let selectionMode = 'default'
+  let selectedGatewayId = null
+  let preferredBaseUrl = publicGatewayConfig.preferredBaseUrl || DEFAULT_PUBLIC_GATEWAY_URL
+  let baseUrl = ''
+  let sharedSecret = ''
+
+  if (selectionValue === 'manual') {
+    selectionMode = 'manual'
+    baseUrl = publicGatewayUrlInput?.value?.trim() || ''
+    sharedSecret = publicGatewaySecretInput?.value?.trim() || ''
+    preferredBaseUrl = baseUrl || preferredBaseUrl || DEFAULT_PUBLIC_GATEWAY_URL
+    if (enabled && (!baseUrl || !sharedSecret)) {
+      setPublicGatewayTokenFeedback('Base URL and shared secret are required for manual configuration.', 'error')
+      return
+    }
+  } else if (selectionValue.startsWith('gateway:')) {
+    selectionMode = 'discovered'
+    selectedGatewayId = selectionValue.slice(8)
+    const selectedGateway = publicGatewayDiscovered.find((entry) => entry.gatewayId === selectedGatewayId)
+    baseUrl = selectedGateway?.publicUrl || publicGatewayConfig.baseUrl || ''
+    sharedSecret = ''
+    if (enabled && (!selectedGatewayId || !baseUrl)) {
+      setPublicGatewayTokenFeedback('Select an available public gateway before saving.', 'error')
+      return
+    }
+  } else {
+    selectionMode = 'default'
+    preferredBaseUrl = publicGatewayConfig.preferredBaseUrl || DEFAULT_PUBLIC_GATEWAY_URL
+    baseUrl = preferredBaseUrl
+    sharedSecret = ''
+  }
+
   const ttlMinutes = Number(publicGatewayDefaultTtlInput?.value)
   const ttlSecondsRaw = Number.isFinite(ttlMinutes) && ttlMinutes > 0 ? Math.round(ttlMinutes * 60) : publicGatewayConfig.defaultTokenTtl
   const ttlSeconds = Math.max(60, ttlSecondsRaw)
 
-  if (enabled && (!baseUrl || !sharedSecret)) {
-    setPublicGatewayTokenFeedback('Base URL and shared secret are required when enabling the public gateway.', 'error')
-    return
-  }
-
-  const nextConfig = normalizePublicGatewayConfig({ enabled, baseUrl, sharedSecret, defaultTokenTtl: ttlSeconds })
+  const nextConfig = normalizePublicGatewayConfig({
+    enabled,
+    selectionMode,
+    selectedGatewayId,
+    preferredBaseUrl,
+    baseUrl,
+    sharedSecret,
+    defaultTokenTtl: ttlSeconds
+  })
 
   try {
     const response = await electronAPI.setPublicGatewayConfig(nextConfig)
@@ -1953,6 +2218,10 @@ function setupEventListeners() {
     })
   }
 
+  if (publicGatewaySelectionSelect) {
+    publicGatewaySelectionSelect.addEventListener('change', handlePublicGatewaySelectionChange)
+  }
+
   if (publicGatewaySaveButton) {
     publicGatewaySaveButton.addEventListener('click', handlePublicGatewaySave)
   }
@@ -2063,6 +2332,7 @@ function initializeDOMElements() {
   gatewayLanToggle = document.getElementById('gateway-lan-toggle')
   gatewayPublicToggle = document.getElementById('gateway-public-toggle')
   publicGatewayEnableToggle = document.getElementById('public-gateway-enable')
+  publicGatewaySelectionSelect = document.getElementById('public-gateway-selection')
   publicGatewayUrlInput = document.getElementById('public-gateway-url')
   publicGatewaySecretInput = document.getElementById('public-gateway-secret')
   publicGatewaySaveButton = document.getElementById('public-gateway-save')
@@ -2076,6 +2346,9 @@ function initializeDOMElements() {
   publicGatewayStatusList = document.getElementById('public-gateway-relay-status')
   publicGatewayTokenFeedback = document.getElementById('public-gateway-token-feedback')
   publicGatewayMeta = document.getElementById('public-gateway-meta')
+  publicGatewayManualFields = document.getElementById('public-gateway-manual-fields')
+  publicGatewaySelectionHelp = document.getElementById('public-gateway-selection-help')
+  publicGatewaySelectionMeta = document.getElementById('public-gateway-selection-meta')
   
   // Log element status
   const elements = {
@@ -2106,6 +2379,7 @@ function initializeDOMElements() {
     gatewayLanToggle,
     gatewayPublicToggle,
     publicGatewayEnableToggle,
+    publicGatewaySelectionSelect,
     publicGatewayUrlInput,
     publicGatewaySecretInput,
     publicGatewaySaveButton,
@@ -2118,7 +2392,10 @@ function initializeDOMElements() {
     publicGatewayStatusContainer,
     publicGatewayStatusList,
     publicGatewayTokenFeedback,
-    publicGatewayMeta
+    publicGatewayMeta,
+    publicGatewayManualFields,
+    publicGatewaySelectionHelp,
+    publicGatewaySelectionMeta
   }
   
   console.log('[App] Element initialization results:');

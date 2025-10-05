@@ -25,6 +25,18 @@ const DEFAULT_CONFIG = {
     enabled: process.env.GATEWAY_RATELIMIT_ENABLED === 'true',
     windowSeconds: Number(process.env.GATEWAY_RATELIMIT_WINDOW || 60),
     maxRequests: Number(process.env.GATEWAY_RATELIMIT_MAX || 120)
+  },
+  discovery: {
+    enabled: process.env.GATEWAY_DISCOVERY_ENABLED === 'true',
+    openAccess: process.env.GATEWAY_DISCOVERY_OPEN_ACCESS !== 'false',
+    displayName: process.env.GATEWAY_DISCOVERY_DISPLAY_NAME || '',
+    region: process.env.GATEWAY_DISCOVERY_REGION || '',
+    keySeed: process.env.GATEWAY_DISCOVERY_KEY_SEED || null,
+    ttlSeconds: Number(process.env.GATEWAY_DISCOVERY_TTL || 60),
+    refreshIntervalMs: Number(process.env.GATEWAY_DISCOVERY_REFRESH_MS || 30000),
+    secretPath: process.env.GATEWAY_DISCOVERY_SECRET_PATH || '/.well-known/hypertuna-gateway-secret',
+    sharedSecretVersion: process.env.GATEWAY_DISCOVERY_SECRET_VERSION || '',
+    protocolVersion: Number(process.env.GATEWAY_DISCOVERY_PROTOCOL_VERSION || 1)
   }
 };
 
@@ -61,11 +73,19 @@ function loadConfig(overrides = {}) {
     rateLimit: {
       ...DEFAULT_CONFIG.rateLimit,
       ...(overrides.rateLimit || {})
+    },
+    discovery: {
+      ...DEFAULT_CONFIG.discovery,
+      ...(overrides.discovery || {})
     }
   };
 
   if (!merged.publicBaseUrl) {
     throw new Error('Gateway requires a publicBaseUrl configuration value');
+  }
+
+  if (!merged.registration?.sharedSecret) {
+    merged.discovery.openAccess = false;
   }
 
   return merged;

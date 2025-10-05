@@ -17,6 +17,7 @@ import {
   requestPfpFromPeer
 } from './HyperswarmClient.mjs';
 import PublicGatewayRegistrar from './PublicGatewayRegistrar.mjs';
+import PublicGatewayDiscoveryClient from './PublicGatewayDiscoveryClient.mjs';
 import { getRelayAuthStore } from '../relay-auth-store.mjs';
 
 const MAX_LOG_ENTRIES = 500;
@@ -210,6 +211,10 @@ export class GatewayService extends EventEmitter {
     this.publicGatewayRelayState = new Map();
     this.publicGatewayWsBase = null;
     this.publicGatewayStatusUpdatedAt = null;
+    this.discoveredGateways = [];
+    this.discoveryDisabledReason = null;
+    this.discoveryClient = null;
+    this.discoveryClientReady = null;
     this.getCurrentPubkey = typeof options.getCurrentPubkey === 'function'
       ? options.getCurrentPubkey
       : () => options.currentPubkey || null;
@@ -219,26 +224,77 @@ export class GatewayService extends EventEmitter {
 
   #normalizePublicGatewayConfig(rawConfig = {}) {
     const envEnabled = process.env.PUBLIC_GATEWAY_ENABLED === 'true';
-    const enabled = rawConfig?.enabled ?? envEnabled;
-    const baseUrl = (rawConfig?.baseUrl ?? process.env.PUBLIC_GATEWAY_URL ?? '').trim();
-    const sharedSecret = (rawConfig?.sharedSecret ?? process.env.PUBLIC_GATEWAY_SECRET ?? '').trim();
-    const defaultTokenTtl = (() => {
-      const envValue = process.env.PUBLIC_GATEWAY_DEFAULT_TOKEN_TTL;
-      const rawTtl = rawConfig?.defaultTokenTtl ?? (envValue ? Number(envValue) : undefined);
-      const ttlNumber = Number(rawTtl);
-      return Number.isFinite(ttlNumber) && ttlNumber > 0 ? Math.round(ttlNumber) : 3600;
-    })();
+    const envBaseUrl = (process.env.PUBLIC_GATEWAY_URL || '').trim();
+    const envSecret = (process.env.PUBLIC_GATEWAY_SECRET || '').trim();
+    const envTtl = Number(process.env.PUBLIC_GATEWAY_DEFAULT_TOKEN_TTL);
 
-    if (!enabled) {
-      return { enabled: false, baseUrl: '', sharedSecret: '', defaultTokenTtl };
+    const ttlCandidate = rawConfig?.defaultTokenTtl ?? (Number.isFinite(envTtl) ? envTtl : undefined);
+    const ttlNumber = Number(ttlCandidate);
+    const defaultTokenTtl = Number.isFinite(ttlNumber) && ttlNumber > 0 ? Math.round(ttlNumber) : 3600;
+
+    const selectionRaw = typeof rawConfig?.selectionMode === 'string'
+      ? rawConfig.selectionMode.trim().toLowerCase()
+      : '';
+    const selectionMode = ['default', 'discovered', 'manual'].includes(selectionRaw)
+      ? selectionRaw
+      : '';
+
+    const config = {
+      enabled: rawConfig?.enabled ?? envEnabled,
+      selectionMode,
+      selectedGatewayId: typeof rawConfig?.selectedGatewayId === 'string'
+        ? rawConfig.selectedGatewayId.trim() || null
+        : null,
+      baseUrl: typeof rawConfig?.baseUrl === 'string' ? rawConfig.baseUrl.trim() : '',
+      sharedSecret: typeof rawConfig?.sharedSecret === 'string' ? rawConfig.sharedSecret.trim() : '',
+      preferredBaseUrl: typeof rawConfig?.preferredBaseUrl === 'string'
+        ? rawConfig.preferredBaseUrl.trim()
+        : '',
+      defaultTokenTtl,
+      resolvedGatewayId: rawConfig?.resolvedGatewayId || null,
+      resolvedSecretVersion: rawConfig?.resolvedSecretVersion || null,
+      resolvedSharedSecretHash: rawConfig?.resolvedSharedSecretHash || null,
+      resolvedDisplayName: rawConfig?.resolvedDisplayName || null,
+      resolvedRegion: rawConfig?.resolvedRegion || null,
+      resolvedWsUrl: rawConfig?.resolvedWsUrl || null,
+      resolvedAt: Number(rawConfig?.resolvedAt) || null,
+      resolvedFallback: !!rawConfig?.resolvedFallback,
+      resolvedFromDiscovery: !!rawConfig?.resolvedFromDiscovery,
+      disabledReason: rawConfig?.disabledReason || null
+    };
+
+    if (!config.selectionMode) {
+      config.selectionMode = envSecret ? 'manual' : 'default';
     }
 
-    if (!baseUrl || !sharedSecret) {
-      this.log('warn', '[PublicGateway] Enabled but missing baseUrl or sharedSecret');
-      return { enabled: false, baseUrl: '', sharedSecret: '', defaultTokenTtl };
+    if (!config.preferredBaseUrl) {
+      config.preferredBaseUrl = config.baseUrl || envBaseUrl || 'https://hypertuna.com';
     }
 
-    return { enabled: true, baseUrl, sharedSecret, defaultTokenTtl };
+    if (config.selectionMode === 'default') {
+      config.baseUrl = config.preferredBaseUrl || envBaseUrl || 'https://hypertuna.com';
+      config.sharedSecret = '';
+      config.selectedGatewayId = null;
+    } else if (config.selectionMode === 'manual' && !config.baseUrl) {
+      config.baseUrl = envBaseUrl || config.preferredBaseUrl || 'https://hypertuna.com';
+    }
+
+    if (envBaseUrl && envSecret) {
+      config.enabled = true;
+      config.selectionMode = 'manual';
+      config.baseUrl = envBaseUrl;
+      config.preferredBaseUrl = envBaseUrl;
+      config.sharedSecret = envSecret;
+    } else if (envSecret && config.selectionMode === 'manual' && !config.sharedSecret) {
+      config.sharedSecret = envSecret;
+    }
+
+    if (!config.baseUrl && config.selectionMode !== 'default') {
+      config.baseUrl = config.preferredBaseUrl || envBaseUrl || 'https://hypertuna.com';
+    }
+
+    config.enabled = !!config.enabled;
+    return config;
   }
 
   #configurePublicGateway() {
@@ -258,10 +314,170 @@ export class GatewayService extends EventEmitter {
     } else {
       this.publicGatewayRegistrar = null;
       this.publicGatewayWsBase = null;
-      this.publicGatewayRelayState.clear();
+    }
+    this.discoveryDisabledReason = config.disabledReason || null;
+  }
+
+  async #ensureDiscoveryClient() {
+    if (!this.discoveryClient) {
+      if (!this.loggerBridge) {
+        this.loggerBridge = this.#createExternalLogger();
+      }
+      this.discoveryClient = new PublicGatewayDiscoveryClient({ logger: this.loggerBridge });
+      this.discoveryClient.on('updated', (catalog) => {
+        this.discoveredGateways = catalog;
+        this.#emitPublicGatewayStatus();
+      });
     }
 
-    this.#emitPublicGatewayStatus();
+    if (!this.discoveryClientReady) {
+      this.discoveryClientReady = this.discoveryClient.start().catch((error) => {
+        this.discoveryClientReady = null;
+        this.discoveryDisabledReason = error?.message || 'Failed to start gateway discovery';
+        throw error;
+      });
+    }
+
+    try {
+      await this.discoveryClientReady;
+      this.discoveryDisabledReason = null;
+      this.discoveredGateways = this.discoveryClient.getGateways({ includeExpired: true });
+    } catch (error) {
+      throw error;
+    }
+  }
+
+  async #resolvePublicGatewayConfig(rawConfig = {}) {
+    const config = this.#normalizePublicGatewayConfig(rawConfig);
+    config.resolvedFromDiscovery = false;
+    config.resolvedFallback = false;
+    config.disabledReason = null;
+    config.resolvedGatewayId = null;
+    config.resolvedSecretVersion = null;
+    config.resolvedSharedSecretHash = null;
+    config.resolvedDisplayName = null;
+    config.resolvedRegion = null;
+    config.resolvedWsUrl = null;
+    config.resolvedAt = null;
+
+    if (!config.enabled) {
+      config.baseUrl = '';
+      config.sharedSecret = '';
+      return config;
+    }
+
+    if (config.selectionMode === 'manual') {
+      if (!config.baseUrl || !config.sharedSecret) {
+        config.enabled = false;
+        config.disabledReason = 'Manual configuration requires base URL and shared secret';
+        config.baseUrl = '';
+        config.sharedSecret = '';
+      }
+      return config;
+    }
+
+    try {
+      await this.#ensureDiscoveryClient();
+    } catch (error) {
+      config.enabled = false;
+      config.disabledReason = error?.message || 'Gateway discovery unavailable';
+      config.baseUrl = '';
+      config.sharedSecret = '';
+      return config;
+    }
+
+    const refreshCatalog = () => {
+      if (this.discoveryClient) {
+        this.discoveredGateways = this.discoveryClient.getGateways({ includeExpired: true });
+      }
+    };
+
+    refreshCatalog();
+
+    const ensureEntrySecret = async (entry) => {
+      if (!entry) return null;
+      try {
+        await this.discoveryClient.ensureSecret(entry.gatewayId);
+        refreshCatalog();
+        return this.discoveryClient.getGatewayById(entry.gatewayId);
+      } catch (error) {
+        this.log('warn', `[PublicGateway] Failed to retrieve shared secret for gateway ${entry.gatewayId}: ${error.message}`);
+        return null;
+      }
+    };
+
+    let resolvedEntry = null;
+
+    if (config.selectionMode === 'discovered') {
+      if (!config.selectedGatewayId) {
+        config.enabled = false;
+        config.disabledReason = 'No public gateway selected';
+        config.baseUrl = '';
+        config.sharedSecret = '';
+        return config;
+      }
+
+      const entry = this.discoveryClient.getGatewayById(config.selectedGatewayId);
+      if (!entry) {
+        config.enabled = false;
+        config.disabledReason = 'Selected public gateway is offline';
+        config.baseUrl = '';
+        config.sharedSecret = '';
+        return config;
+      }
+
+      resolvedEntry = await ensureEntrySecret(entry);
+      if (!resolvedEntry || !resolvedEntry.sharedSecret) {
+        config.enabled = false;
+        config.disabledReason = entry.isExpired
+          ? 'Selected public gateway advertisement expired'
+          : 'Unable to retrieve shared secret for selected gateway';
+        config.baseUrl = '';
+        config.sharedSecret = '';
+        return config;
+      }
+    } else {
+      const preferredUrl = config.preferredBaseUrl || config.baseUrl || 'https://hypertuna.com';
+      let entry = this.discoveryClient.findGatewayByUrl(preferredUrl);
+      if (entry && entry.isExpired) {
+        entry = null;
+      }
+
+      resolvedEntry = await ensureEntrySecret(entry);
+
+      if (!resolvedEntry || !resolvedEntry.sharedSecret) {
+        const candidates = (this.discoveryClient.getGateways() || [])
+          .filter((candidate) => candidate.sharedSecret && !candidate.isExpired);
+        if (candidates.length) {
+          resolvedEntry = await ensureEntrySecret(candidates[0]);
+          if (resolvedEntry && resolvedEntry.sharedSecret) {
+            config.resolvedFallback = true;
+          }
+        }
+      }
+
+      if (!resolvedEntry || !resolvedEntry.sharedSecret) {
+        config.enabled = false;
+        config.disabledReason = 'No open public gateways available';
+        config.baseUrl = '';
+        config.sharedSecret = '';
+        return config;
+      }
+    }
+
+    config.baseUrl = resolvedEntry.publicUrl || config.baseUrl || config.preferredBaseUrl;
+    config.sharedSecret = resolvedEntry.sharedSecret || '';
+    config.resolvedGatewayId = resolvedEntry.gatewayId;
+    config.resolvedSecretVersion = resolvedEntry.sharedSecretVersion || null;
+    config.resolvedSharedSecretHash = resolvedEntry.secretHash || null;
+    config.resolvedDisplayName = resolvedEntry.displayName || null;
+    config.resolvedRegion = resolvedEntry.region || null;
+    config.resolvedWsUrl = resolvedEntry.wsUrl || null;
+    config.resolvedAt = Date.now();
+    config.resolvedFromDiscovery = config.selectionMode !== 'manual';
+    config.disabledReason = null;
+
+    return config;
   }
 
   #createExternalLogger() {
@@ -695,15 +911,29 @@ export class GatewayService extends EventEmitter {
       relays[key] = { ...value };
     }
 
-    const enabled = !!(this.publicGatewaySettings?.enabled && this.publicGatewayRegistrar?.isEnabled?.());
+    const config = this.publicGatewaySettings || {};
+    const enabled = !!(config.enabled && this.publicGatewayRegistrar?.isEnabled?.());
 
     return {
       enabled,
-      baseUrl: enabled ? this.publicGatewaySettings?.baseUrl || null : null,
-      defaultTokenTtl: this.publicGatewaySettings?.defaultTokenTtl || 3600,
-      wsBase: enabled ? this.publicGatewayWsBase : null,
+      selectionMode: config.selectionMode || 'default',
+      selectedGatewayId: config.selectedGatewayId || null,
+      preferredBaseUrl: config.preferredBaseUrl || null,
+      baseUrl: enabled ? config.baseUrl || null : null,
+      resolvedGatewayId: config.resolvedGatewayId || null,
+      resolvedDisplayName: config.resolvedDisplayName || null,
+      resolvedRegion: config.resolvedRegion || null,
+      resolvedSecretVersion: config.resolvedSecretVersion || null,
+      resolvedFallback: !!config.resolvedFallback,
+      resolvedFromDiscovery: !!config.resolvedFromDiscovery,
+      resolvedAt: config.resolvedAt || null,
+      defaultTokenTtl: config.defaultTokenTtl || 3600,
+      wsBase: enabled ? (config.resolvedWsUrl || this.publicGatewayWsBase) : null,
       lastUpdatedAt: this.publicGatewayStatusUpdatedAt,
-      relays
+      relays,
+      discoveredGateways: this.discoveredGateways || [],
+      discoveryUnavailableReason: this.discoveryDisabledReason,
+      disabledReason: enabled ? null : (config.disabledReason || this.discoveryDisabledReason || null)
     };
   }
 
@@ -726,14 +956,23 @@ export class GatewayService extends EventEmitter {
     }
   }
 
-  updatePublicGatewayConfig(rawConfig = {}) {
-    this.publicGatewaySettings = this.#normalizePublicGatewayConfig(rawConfig);
+  async updatePublicGatewayConfig(rawConfig = {}) {
+    this.publicGatewaySettings = await this.#resolvePublicGatewayConfig(rawConfig);
     this.#configurePublicGateway();
-    if (this.publicGatewayRegistrar?.isEnabled?.()) {
-      this.resyncPublicGateway().catch((error) => {
+
+    const isEnabled = this.publicGatewaySettings?.enabled && this.publicGatewayRegistrar?.isEnabled?.();
+
+    if (isEnabled) {
+      try {
+        await this.resyncPublicGateway();
+      } catch (error) {
         this.log('warn', `[PublicGateway] Resync failed: ${error.message}`);
-      });
+      }
+    } else {
+      this.publicGatewayRelayState.clear();
     }
+
+    this.#emitPublicGatewayStatus();
   }
 
   issuePublicGatewayToken(relayKey, options = {}) {

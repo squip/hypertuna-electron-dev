@@ -553,13 +553,21 @@
                                 </label>
                                 <div class="gateway-remote-form">
                                     <div class="form-group">
-                                        <label for="public-gateway-url">Public Gateway URL</label>
-                                        <input type="text" id="public-gateway-url" class="form-input" placeholder="https://hypertuna.com">
+                                        <label for="public-gateway-selection">Public Gateway</label>
+                                        <select id="public-gateway-selection" class="form-input"></select>
+                                        <p id="public-gateway-selection-help" class="muted"></p>
                                     </div>
-                                    <div class="form-group">
-                                        <label for="public-gateway-secret">Shared Secret</label>
-                                        <input type="password" id="public-gateway-secret" class="form-input" placeholder="Gateway shared secret" autocomplete="off">
+                                    <div id="public-gateway-manual-fields" class="public-gateway-manual-fields">
+                                        <div class="form-group">
+                                            <label for="public-gateway-url">Public Gateway URL</label>
+                                            <input type="text" id="public-gateway-url" class="form-input" placeholder="https://hypertuna.com">
+                                        </div>
+                                        <div class="form-group">
+                                            <label for="public-gateway-secret">Shared Secret</label>
+                                            <input type="password" id="public-gateway-secret" class="form-input" placeholder="Gateway shared secret" autocomplete="off">
+                                        </div>
                                     </div>
+                                    <div id="public-gateway-selection-meta" class="muted small-text"></div>
                                     <div class="form-group-inline">
                                         <div class="form-group small">
                                             <label for="public-gateway-token-ttl">Default Token TTL (minutes)</label>

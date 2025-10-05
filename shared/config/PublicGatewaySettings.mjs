@@ -1,8 +1,20 @@
+const VALID_SELECTION_MODES = new Set(['default', 'discovered', 'manual']);
+
 const DEFAULT_SETTINGS = Object.freeze({
   enabled: false,
-  baseUrl: '',
+  selectionMode: 'default',
+  selectedGatewayId: null,
+  preferredBaseUrl: 'https://hypertuna.com',
+  baseUrl: 'https://hypertuna.com',
   sharedSecret: '',
-  defaultTokenTtl: 3600
+  defaultTokenTtl: 3600,
+  resolvedGatewayId: null,
+  resolvedSecretVersion: null,
+  resolvedAt: null,
+  resolvedSharedSecretHash: null,
+  resolvedDisplayName: null,
+  resolvedRegion: null,
+  resolvedWsUrl: null
 });
 
 const LOCAL_STORAGE_KEY = 'hypertuna_public_gateway_settings';
@@ -28,8 +40,25 @@ function normalizeSettings(raw = {}) {
     normalized.enabled = raw.enabled;
   }
 
+  if (typeof raw.selectionMode === 'string') {
+    const mode = raw.selectionMode.trim().toLowerCase();
+    if (VALID_SELECTION_MODES.has(mode)) {
+      normalized.selectionMode = mode;
+    }
+  }
+
+  if (typeof raw.selectedGatewayId === 'string') {
+    const value = raw.selectedGatewayId.trim();
+    normalized.selectedGatewayId = value || null;
+  }
+
   if (typeof raw.baseUrl === 'string') {
     normalized.baseUrl = raw.baseUrl.trim();
+  }
+
+  if (typeof raw.preferredBaseUrl === 'string') {
+    const value = raw.preferredBaseUrl.trim();
+    normalized.preferredBaseUrl = value || null;
   }
 
   if (typeof raw.sharedSecret === 'string') {
@@ -43,13 +72,92 @@ function normalizeSettings(raw = {}) {
     }
   }
 
+  if (typeof raw.resolvedGatewayId === 'string') {
+    const value = raw.resolvedGatewayId.trim();
+    normalized.resolvedGatewayId = value || null;
+  }
+
+  if (typeof raw.resolvedSecretVersion === 'string') {
+    const value = raw.resolvedSecretVersion.trim();
+    normalized.resolvedSecretVersion = value || null;
+  }
+
+  if (raw.resolvedAt != null) {
+    const timestamp = Number(raw.resolvedAt);
+    if (Number.isFinite(timestamp) && timestamp > 0) {
+      normalized.resolvedAt = timestamp;
+    }
+  }
+
+  if (typeof raw.resolvedSharedSecretHash === 'string') {
+    const value = raw.resolvedSharedSecretHash.trim();
+    normalized.resolvedSharedSecretHash = value || null;
+  }
+
+  if (typeof raw.resolvedDisplayName === 'string') {
+    const value = raw.resolvedDisplayName.trim();
+    normalized.resolvedDisplayName = value || null;
+  }
+
+  if (typeof raw.resolvedRegion === 'string') {
+    const value = raw.resolvedRegion.trim();
+    normalized.resolvedRegion = value || null;
+  }
+
+  if (typeof raw.resolvedWsUrl === 'string') {
+    const value = raw.resolvedWsUrl.trim();
+    normalized.resolvedWsUrl = value || null;
+  }
+
+  if (!normalized.selectedGatewayId && typeof raw.gatewayId === 'string') {
+    const value = raw.gatewayId.trim();
+    normalized.selectedGatewayId = value || null;
+  }
+
   return normalized;
 }
 
 function withDefaults(raw = {}) {
   const normalized = normalizeSettings(raw);
   const merged = { ...DEFAULT_SETTINGS, ...normalized };
-  if (!merged.baseUrl) merged.baseUrl = '';
+
+  if (!merged.preferredBaseUrl) {
+    merged.preferredBaseUrl = DEFAULT_SETTINGS.preferredBaseUrl;
+  }
+
+  const hasLegacySecret = typeof normalized.sharedSecret === 'string' && normalized.sharedSecret.trim().length > 0;
+
+  if (!merged.selectionMode || !VALID_SELECTION_MODES.has(merged.selectionMode)) {
+    if ((merged.baseUrl && merged.baseUrl !== DEFAULT_SETTINGS.baseUrl) || hasLegacySecret) {
+      merged.selectionMode = 'manual';
+    } else {
+      merged.selectionMode = 'default';
+    }
+  }
+
+  if (merged.selectionMode === 'default') {
+    merged.selectedGatewayId = null;
+    merged.preferredBaseUrl = merged.preferredBaseUrl || DEFAULT_SETTINGS.preferredBaseUrl;
+    merged.baseUrl = merged.preferredBaseUrl || DEFAULT_SETTINGS.baseUrl;
+    merged.sharedSecret = '';
+  }
+
+  if (merged.selectionMode === 'manual') {
+    merged.baseUrl = merged.baseUrl || merged.preferredBaseUrl || DEFAULT_SETTINGS.baseUrl;
+    merged.preferredBaseUrl = merged.baseUrl || merged.preferredBaseUrl || DEFAULT_SETTINGS.preferredBaseUrl;
+  }
+
+  if (merged.selectionMode !== 'discovered') {
+    merged.resolvedGatewayId = null;
+    merged.resolvedSecretVersion = null;
+    merged.resolvedSharedSecretHash = null;
+    merged.resolvedDisplayName = null;
+    merged.resolvedRegion = null;
+    merged.resolvedWsUrl = null;
+    merged.resolvedAt = null;
+  }
+
+  if (!merged.baseUrl) merged.baseUrl = DEFAULT_SETTINGS.baseUrl;
   if (!merged.sharedSecret) merged.sharedSecret = '';
   if (!Number.isFinite(merged.defaultTokenTtl) || merged.defaultTokenTtl <= 0) {
     merged.defaultTokenTtl = DEFAULT_SETTINGS.defaultTokenTtl;

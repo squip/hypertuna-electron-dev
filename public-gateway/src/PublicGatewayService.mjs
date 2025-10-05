@@ -12,6 +12,7 @@ import {
   getEventsFromPeerHyperswarm,
   requestFileFromPeer
 } from '../../shared/public-gateway/HyperswarmClient.mjs';
+import { computeSecretHash } from '../../shared/public-gateway/GatewayDiscovery.mjs';
 import {
   verifySignature,
   verifyClientToken
@@ -19,6 +20,7 @@ import {
 import { metricsMiddleware, sessionGauge, peerGauge, requestCounter } from './metrics.mjs';
 import MemoryRegistrationStore from './stores/MemoryRegistrationStore.mjs';
 import MessageQueue from './utils/MessageQueue.mjs';
+import GatewayAdvertiser from './discovery/GatewayAdvertiser.mjs';
 
 class PublicGatewayService {
   constructor({ config, logger, tlsOptions = null, registrationStore }) {
@@ -27,6 +29,24 @@ class PublicGatewayService {
     this.tlsOptions = tlsOptions;
     this.registrationStore = registrationStore || new MemoryRegistrationStore(config.registration?.cacheTtlSeconds);
     this.sharedSecret = config.registration?.sharedSecret || null;
+    this.discoveryConfig = config.discovery || {};
+    this.explicitSharedSecretVersion = this.discoveryConfig?.sharedSecretVersion || null;
+    this.sharedSecretVersion = this.explicitSharedSecretVersion;
+    this.secretEndpointPath = this.#normalizeSecretPath(this.discoveryConfig?.secretPath);
+    this.wsBaseUrl = this.#computeWsBase(this.config.publicBaseUrl);
+    this.gatewayAdvertiser = null;
+    if (this.discoveryConfig?.enabled && this.discoveryConfig.openAccess && this.sharedSecret) {
+      this.gatewayAdvertiser = new GatewayAdvertiser({
+        logger: this.logger,
+        discoveryConfig: this.discoveryConfig,
+        getSharedSecret: async () => this.sharedSecret,
+        getSharedSecretVersion: async () => this.#getSharedSecretVersion(),
+        publicUrl: this.config.publicBaseUrl,
+        wsUrl: this.wsBaseUrl
+      });
+    } else if (this.discoveryConfig?.enabled && this.discoveryConfig.openAccess && !this.sharedSecret) {
+      this.logger?.warn?.('Gateway discovery enabled but shared secret missing; advertisement disabled');
+    }
 
     this.app = express();
     this.server = null;
@@ -64,6 +84,16 @@ class PublicGatewayService {
       });
     });
 
+    if (this.gatewayAdvertiser) {
+      try {
+        await this.gatewayAdvertiser.start();
+      } catch (error) {
+        this.logger.error?.('Failed to start gateway discovery advertiser', {
+          error: error?.message || error
+        });
+      }
+    }
+
     this.healthInterval = setInterval(() => this.#collectMetrics(), 10000).unref();
     this.pruneInterval = setInterval(() => this.registrationStore.pruneExpired?.(), 60000).unref();
   }
@@ -97,6 +127,10 @@ class PublicGatewayService {
       this.server = null;
     }
 
+    if (this.gatewayAdvertiser) {
+      await this.gatewayAdvertiser.stop();
+    }
+
     await this.connectionPool.destroy();
     await this.registrationStore?.disconnect?.();
   }
@@ -123,6 +157,10 @@ class PublicGatewayService {
     app.get('/health', (_req, res) => {
       res.json({ status: 'ok' });
     });
+
+    if (this.#shouldExposeSecretEndpoint()) {
+      app.get(this.secretEndpointPath, (req, res) => this.#handleSecretRequest(req, res));
+    }
 
     app.get('/drive/:identifier/:file', async (req, res) => {
       const { identifier, file } = req.params;
@@ -194,6 +232,86 @@ class PublicGatewayService {
 
     this.wss = new WebSocketServer({ server: this.server });
     this.wss.on('connection', (ws, req) => this.#handleWebSocket(ws, req));
+  }
+
+  #computeWsBase(baseUrl) {
+    if (!baseUrl) return '';
+    try {
+      const parsed = new URL(baseUrl);
+      if (parsed.protocol === 'http:') parsed.protocol = 'ws:';
+      else if (parsed.protocol === 'https:') parsed.protocol = 'wss:';
+      else if (parsed.protocol !== 'ws:' && parsed.protocol !== 'wss:') {
+        this.logger?.warn?.('Unsupported protocol for public gateway base URL', {
+          protocol: parsed.protocol,
+          baseUrl
+        });
+        return '';
+      }
+      return parsed.toString().replace(/\/$/, '');
+    } catch (error) {
+      this.logger?.warn?.('Failed to compute websocket base from public URL', {
+        baseUrl,
+        error: error?.message || error
+      });
+      return '';
+    }
+  }
+
+  #normalizeSecretPath(secretPath) {
+    if (!secretPath) return '/.well-known/hypertuna-gateway-secret';
+    if (typeof secretPath !== 'string') return '/.well-known/hypertuna-gateway-secret';
+    const trimmed = secretPath.trim();
+    if (!trimmed) return '/.well-known/hypertuna-gateway-secret';
+    try {
+      if (trimmed.startsWith('http://') || trimmed.startsWith('https://')) {
+        const parsed = new URL(trimmed);
+        return parsed.pathname || '/.well-known/hypertuna-gateway-secret';
+      }
+    } catch (error) {
+      this.logger?.warn?.('Failed to parse discovery secret path as URL', {
+        secretPath,
+        error: error?.message || error
+      });
+    }
+    return trimmed.startsWith('/') ? trimmed : `/${trimmed}`;
+  }
+
+  #deriveSharedSecretVersion(secret) {
+    if (!secret) return '';
+    return computeSecretHash(secret).slice(0, 24);
+  }
+
+  #getSharedSecretVersion() {
+    if (this.explicitSharedSecretVersion) return this.explicitSharedSecretVersion;
+    if (!this.sharedSecretVersion) {
+      this.sharedSecretVersion = this.#deriveSharedSecretVersion(this.sharedSecret);
+    }
+    return this.sharedSecretVersion || '';
+  }
+
+  #shouldExposeSecretEndpoint() {
+    return Boolean(this.sharedSecret && this.discoveryConfig?.enabled && this.discoveryConfig.openAccess);
+  }
+
+  #handleSecretRequest(_req, res) {
+    if (!this.#shouldExposeSecretEndpoint()) {
+      return res.status(404).json({ error: 'Gateway secret not available' });
+    }
+    if (!this.sharedSecret) {
+      return res.status(503).json({ error: 'Gateway shared secret not configured' });
+    }
+
+    const payload = {
+      gatewayId: this.gatewayAdvertiser?.gatewayId || null,
+      sharedSecret: this.sharedSecret,
+      version: this.#getSharedSecretVersion(),
+      hash: computeSecretHash(this.sharedSecret),
+      wsUrl: this.wsBaseUrl,
+      publicUrl: this.config.publicBaseUrl,
+      timestamp: Date.now()
+    };
+
+    res.json(payload);
   }
 
   #handleWebSocket(ws, req) {

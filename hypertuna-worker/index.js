@@ -153,7 +153,7 @@ async function startGatewayService(options = {}) {
     })
   }
 
-  gatewayService.updatePublicGatewayConfig(publicGatewaySettings)
+  await gatewayService.updatePublicGatewayConfig(publicGatewaySettings)
   sendMessage({ type: 'public-gateway-config', config: publicGatewaySettings })
   publicGatewayStatusCache = gatewayService.getPublicGatewayState()
   sendMessage({ type: 'public-gateway-status', state: publicGatewayStatusCache })
@@ -1014,7 +1014,7 @@ async function handleMessageObject(message) {
         const next = await updatePublicGatewaySettings(message.config || {})
         publicGatewaySettings = next
         if (gatewayService) {
-          gatewayService.updatePublicGatewayConfig(next)
+          await gatewayService.updatePublicGatewayConfig(next)
           publicGatewayStatusCache = gatewayService.getPublicGatewayState()
           sendMessage({ type: 'public-gateway-status', state: publicGatewayStatusCache })
         }
