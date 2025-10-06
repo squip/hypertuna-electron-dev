@@ -1,0 +1,532 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Hypertuna</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            overflow-x: hidden;
+            background: linear-gradient(135deg, #10162d 0%, #1b3193 100%);
+            min-height: 100vh;
+        }
+
+        /* Shared Background Particles */
+        .particles-container {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            pointer-events: none;
+            z-index: 0;
+        }
+
+        .particle {
+            position: absolute;
+            width: 6px;
+            height: 6px;
+            background: white;
+            border-radius: 50%;
+            opacity: 0.6;
+            animation: particleFloat 4s infinite;
+        }
+
+        @keyframes particleFloat {
+            0% {
+                transform: translateY(100vh) translateX(0) scale(0);
+                opacity: 0;
+            }
+            10% {
+                opacity: 0.6;
+            }
+            90% {
+                opacity: 0.6;
+            }
+            100% {
+                transform: translateY(-100px) translateX(50px) scale(1);
+                opacity: 0;
+            }
+        }
+
+        /* Page Container */
+        .page {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+            opacity: 0;
+            pointer-events: none;
+            transition: opacity 0.5s ease-out;
+            z-index: 1;
+        }
+
+        .page.active {
+            opacity: 1;
+            pointer-events: all;
+        }
+
+        /* Splash Screen */
+        .splash-container {
+            text-align: center;
+            padding: 20px;
+        }
+
+        .logo-container {
+            margin-bottom: 40px;
+            animation: floatAnimation 3s ease-in-out infinite;
+        }
+
+        .logo {
+            width: 400px;
+            height: auto;
+            max-width: 80vw;
+            filter: drop-shadow(0 10px 30px rgba(0, 0, 0, 0.3));
+            animation: scaleIn 0.6s cubic-bezier(0.68, -0.55, 0.265, 1.55) forwards;
+        }
+
+        @keyframes scaleIn {
+            from {
+                transform: scale(0.5);
+                opacity: 0;
+            }
+            to {
+                transform: scale(1);
+                opacity: 1;
+            }
+        }
+
+        @keyframes floatAnimation {
+            0%, 100% {
+                transform: translateY(0px);
+            }
+            50% {
+                transform: translateY(-20px);
+            }
+        }
+
+        /* Welcome/Login Page */
+        .welcome-container {
+            max-width: 500px;
+            width: 100%;
+            text-align: center;
+        }
+
+        .welcome-logo {
+            width: 200px;
+            height: auto;
+            max-width: 60vw;
+            margin-bottom: 30px;
+            filter: drop-shadow(0 10px 30px rgba(0, 0, 0, 0.3));
+        }
+
+        .welcome-header {
+            font-size: clamp(1.8rem, 5vw, 2.5rem);
+            font-weight: 700;
+            color: white;
+            margin-bottom: 10px;
+            letter-spacing: 1px;
+        }
+
+        .welcome-subheader {
+            font-size: clamp(1rem, 3vw, 1.2rem);
+            color: rgba(255, 255, 255, 0.85);
+            margin-bottom: 50px;
+        }
+
+        .welcome-prompt {
+            font-size: 0.95rem;
+            color: rgba(255, 255, 255, 0.9);
+            margin-bottom: 20px;
+            font-weight: 500;
+        }
+
+        .button {
+            width: 100%;
+            max-width: 350px;
+            padding: 16px 24px;
+            margin: 10px auto;
+            display: block;
+            background: white;
+            color: #10162d;
+            border: none;
+            border-radius: 12px;
+            font-size: 1rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            box-shadow: 0 4px 15px rgba(0, 0, 0, 0.2);
+        }
+
+        .button:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 6px 20px rgba(0, 0, 0, 0.3);
+        }
+
+        .button:active {
+            transform: translateY(0);
+        }
+
+        .button.secondary {
+            background: rgba(255, 255, 255, 0.15);
+            color: white;
+            backdrop-filter: blur(10px);
+            border: 2px solid rgba(255, 255, 255, 0.3);
+        }
+
+        .button.secondary:hover {
+            background: rgba(255, 255, 255, 0.25);
+        }
+
+        /* Form Pages */
+        .form-container {
+            max-width: 500px;
+            width: 100%;
+            padding: 30px;
+            background: rgba(255, 255, 255, 0.08);
+            backdrop-filter: blur(20px);
+            border-radius: 20px;
+            border: 1px solid rgba(255, 255, 255, 0.15);
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
+        }
+
+        .back-button {
+            background: none;
+            border: none;
+            color: white;
+            font-size: 1.5rem;
+            cursor: pointer;
+            padding: 8px;
+            margin-bottom: 20px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            transition: transform 0.2s ease;
+        }
+
+        .back-button:hover {
+            transform: translateX(-4px);
+        }
+
+        .form-header {
+            font-size: clamp(1.5rem, 4vw, 2rem);
+            font-weight: 700;
+            color: white;
+            margin-bottom: 30px;
+            text-align: center;
+        }
+
+        .input-group {
+            margin-bottom: 20px;
+        }
+
+        .input-label {
+            display: block;
+            color: rgba(255, 255, 255, 0.9);
+            font-size: 0.9rem;
+            margin-bottom: 8px;
+            font-weight: 500;
+        }
+
+        .input-field {
+            width: 100%;
+            padding: 14px 16px;
+            background: rgba(255, 255, 255, 0.1);
+            border: 2px solid rgba(255, 255, 255, 0.2);
+            border-radius: 10px;
+            color: white;
+            font-size: 1rem;
+            transition: all 0.3s ease;
+        }
+
+        .input-field:focus {
+            outline: none;
+            border-color: rgba(255, 255, 255, 0.5);
+            background: rgba(255, 255, 255, 0.15);
+        }
+
+        .input-field::placeholder {
+            color: rgba(255, 255, 255, 0.5);
+        }
+
+        textarea.input-field {
+            resize: vertical;
+            min-height: 80px;
+            font-family: inherit;
+        }
+
+        /* Image Upload */
+        .image-upload-container {
+            text-align: center;
+            margin-bottom: 20px;
+        }
+
+        .image-preview {
+            width: 120px;
+            height: 120px;
+            margin: 0 auto 15px;
+            border-radius: 50%;
+            background: rgba(255, 255, 255, 0.1);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            overflow: hidden;
+            border: 3px solid rgba(255, 255, 255, 0.2);
+        }
+
+        .image-preview img {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+        }
+
+        .image-placeholder {
+            font-size: 3rem;
+            color: rgba(255, 255, 255, 0.4);
+        }
+
+        .file-input {
+            display: none;
+        }
+
+        .upload-button {
+            display: inline-block;
+            padding: 10px 20px;
+            background: rgba(255, 255, 255, 0.15);
+            color: white;
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 0.9rem;
+            transition: all 0.3s ease;
+            border: 2px solid rgba(255, 255, 255, 0.2);
+        }
+
+        .upload-button:hover {
+            background: rgba(255, 255, 255, 0.25);
+        }
+
+        .optional-label {
+            color: rgba(255, 255, 255, 0.6);
+            font-size: 0.85rem;
+            font-style: italic;
+        }
+
+        /* Animations */
+        @keyframes fadeIn {
+            from {
+                opacity: 0;
+                transform: translateY(20px);
+            }
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+
+        .fade-in {
+            animation: fadeIn 0.6s ease-out forwards;
+        }
+
+        /* Responsive */
+        @media (max-width: 480px) {
+            .form-container {
+                padding: 20px;
+            }
+
+            .welcome-subheader {
+                margin-bottom: 40px;
+            }
+
+            .button {
+                padding: 14px 20px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="particles-container" id="particles"></div>
+
+    <!-- Splash Screen -->
+    <div class="page active" id="splashPage">
+        <div class="splash-container">
+            <div class="logo-container">
+                <img src="hypertuna-logo.png" alt="Hypertuna Logo" class="logo" id="logo">
+            </div>
+        </div>
+    </div>
+
+    <!-- Welcome/Login Page -->
+    <div class="page" id="welcomePage">
+        <div class="welcome-container fade-in">            
+            <h1 class="welcome-header">Welcome to Hypertuna</h1>
+            <p class="welcome-subheader">Join the p2p nostr relay network</p>
+            
+            <p class="welcome-prompt">Sign-in with nostr</p>
+            
+            <button class="button" onclick="navigateTo('createAccountPage')">Create new account</button>
+            <button class="button secondary" onclick="navigateTo('loginPage')">Use existing account</button>
+        </div>
+    </div>
+
+    <!-- Create Account Page -->
+    <div class="page" id="createAccountPage">
+        <div class="form-container fade-in">
+            <button class="back-button" onclick="navigateTo('welcomePage')">
+                ← Back
+            </button>
+            
+            <h2 class="form-header">Create new account</h2>
+            
+            <div class="image-upload-container">
+                <div class="image-preview" id="imagePreview">
+                    <span class="image-placeholder">👤</span>
+                </div>
+                <label for="pfpUpload" class="upload-button">
+                    Upload profile picture
+                </label>
+                <input type="file" id="pfpUpload" class="file-input" accept="image/*" onchange="handleImageUpload(event)">
+                <div class="optional-label">Optional</div>
+            </div>
+
+            <div class="input-group">
+                <label class="input-label" for="username">Pick a user name</label>
+                <input type="text" id="username" class="input-field" placeholder="Enter your username">
+            </div>
+
+            <div class="input-group">
+                <label class="input-label" for="bio">Something about yourself (bio)</label>
+                <textarea id="bio" class="input-field" placeholder="Tell us about yourself..."></textarea>
+            </div>
+
+            <button class="button" onclick="handleCreateAccount()">Create</button>
+        </div>
+    </div>
+
+    <!-- Login Page -->
+    <div class="page" id="loginPage">
+        <div class="form-container fade-in">
+            <button class="back-button" onclick="navigateTo('welcomePage')">
+                ← Back
+            </button>
+            
+            <h2 class="form-header">Nostr login</h2>
+            
+            <div class="input-group">
+                <label class="input-label" for="privateKey">Enter existing nostr private key (nsec or hex)</label>
+                <input type="password" id="privateKey" class="input-field" placeholder="nsec... or hex key">
+            </div>
+
+            <button class="button" onclick="handleLogin()">Continue</button>
+        </div>
+    </div>
+
+    <script>
+        // Create floating particles
+        const particlesContainer = document.getElementById('particles');
+        const particleCount = 15;
+
+        for (let i = 0; i < particleCount; i++) {
+            const particle = document.createElement('div');
+            particle.className = 'particle';
+            particle.style.left = Math.random() * 100 + '%';
+            particle.style.animationDelay = Math.random() * 4 + 's';
+            particle.style.animationDuration = (Math.random() * 3 + 3) + 's';
+            particlesContainer.appendChild(particle);
+        }
+
+        // Navigation function
+        function navigateTo(pageId) {
+            // Hide all pages
+            document.querySelectorAll('.page').forEach(page => {
+                page.classList.remove('active');
+            });
+
+            // Show target page
+            setTimeout(() => {
+                document.getElementById(pageId).classList.add('active');
+            }, 100);
+        }
+
+        // Splash screen transition
+        setTimeout(() => {
+            navigateTo('welcomePage');
+        }, 3000);
+
+        // Handle image upload
+        function handleImageUpload(event) {
+            const file = event.target.files[0];
+            if (file) {
+                const reader = new FileReader();
+                reader.onload = function(e) {
+                    const imagePreview = document.getElementById('imagePreview');
+                    imagePreview.innerHTML = `<img src="${e.target.result}" alt="Profile Picture">`;
+                    
+                    // Simulate storing to hyperdrive
+                    console.log('Storing profile picture to hyperdrive instance...');
+                };
+                reader.readAsDataURL(file);
+            }
+        }
+
+        // Handle account creation
+        function handleCreateAccount() {
+            const username = document.getElementById('username').value;
+            const bio = document.getElementById('bio').value;
+            const pfp = document.getElementById('imagePreview').querySelector('img');
+
+            if (!username) {
+                alert('Please enter a username');
+                return;
+            }
+
+            // Simulate account creation with dummy data
+            const newAccount = {
+                username: username,
+                bio: bio,
+                pfp: pfp ? pfp.src : null,
+                nostrKey: 'nsec1' + Math.random().toString(36).substring(2, 15), // Dummy key
+                created: new Date().toISOString()
+            };
+
+            console.log('Creating new account:', newAccount);
+            alert(`Account created successfully!\nUsername: ${username}\nDummy Nostr Key: ${newAccount.nostrKey}`);
+            
+            // Transition to main app (simulated)
+            console.log('Transitioning to main app...');
+        }
+
+        // Handle login
+        function handleLogin() {
+            const privateKey = document.getElementById('privateKey').value;
+
+            if (!privateKey) {
+                alert('Please enter your private key');
+                return;
+            }
+
+            // Simulate authentication with dummy validation
+            if (privateKey.startsWith('nsec') || privateKey.length >= 32) {
+                console.log('Authenticating with key:', privateKey.substring(0, 10) + '...');
+                alert('Login successful! Redirecting to app...');
+                
+                // Transition to main app (simulated)
+                console.log('Transitioning to main app...');
+            } else {
+                alert('Invalid key format. Please enter a valid nsec or hex key.');
+            }
+        }
+    </script>
+</body>
+</html>

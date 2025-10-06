@@ -2995,3 +2995,275 @@ members-list,.member-list {
         min-height: auto;
     }
 }
+
+/* Onboarding overlay system */
+.onboarding-overlay {
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100vh;
+    background: linear-gradient(135deg, #10162d 0%, #1b3193 100%);
+    z-index: 10000;
+    display: none;
+}
+
+.onboarding-overlay.active {
+    display: block;
+}
+
+.onboarding-particles {
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    pointer-events: none;
+    z-index: 0;
+}
+
+.onboarding-particle {
+    position: absolute;
+    width: 6px;
+    height: 6px;
+    background: white;
+    border-radius: 50%;
+    opacity: 0.6;
+    animation: onboardingParticleFloat 4s infinite;
+}
+
+@keyframes onboardingParticleFloat {
+    0% {
+        transform: translateY(100vh) translateX(0) scale(0);
+        opacity: 0;
+    }
+    10% { opacity: 0.6; }
+    90% { opacity: 0.6; }
+    100% {
+        transform: translateY(-100px) translateX(50px) scale(1);
+        opacity: 0;
+    }
+}
+
+.onboarding-page {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100vh;
+    display: none;
+    align-items: center;
+    justify-content: center;
+    padding: 20px;
+    z-index: 1;
+    opacity: 0;
+    transition: opacity 0.5s ease-out;
+}
+
+.onboarding-page.active {
+    display: flex;
+    opacity: 1;
+}
+
+/* Splash screen styles */
+.onboarding-splash {
+    text-align: center;
+}
+
+.onboarding-logo-container {
+    margin-bottom: 40px;
+    animation: onboardingFloat 3s ease-in-out infinite;
+}
+
+.onboarding-logo {
+    width: 400px;
+    height: auto;
+    max-width: 80vw;
+    filter: drop-shadow(0 10px 30px rgba(0, 0, 0, 0.3));
+    animation: onboardingScaleIn 0.6s cubic-bezier(0.68, -0.55, 0.265, 1.55) forwards;
+}
+
+@keyframes onboardingScaleIn {
+    from {
+        transform: scale(0.5);
+        opacity: 0;
+    }
+    to {
+        transform: scale(1);
+        opacity: 1;
+    }
+}
+
+@keyframes onboardingFloat {
+    0%, 100% { transform: translateY(0px); }
+    50% { transform: translateY(-20px); }
+}
+
+/* Welcome page styles - using existing button styles */
+.onboarding-welcome {
+    max-width: 500px;
+    width: 100%;
+    text-align: center;
+}
+
+.onboarding-welcome-header {
+    font-size: clamp(1.8rem, 5vw, 2.5rem);
+    font-weight: 700;
+    color: white;
+    margin-bottom: var(--space-sm);
+    letter-spacing: 1px;
+}
+
+.onboarding-welcome-subheader {
+    font-size: clamp(1rem, 3vw, 1.2rem);
+    color: rgba(255, 255, 255, 0.85);
+    margin-bottom: var(--space-2xl);
+}
+
+.onboarding-welcome-prompt {
+    font-size: 0.95rem;
+    color: rgba(255, 255, 255, 0.9);
+    margin-bottom: var(--space-lg);
+    font-weight: 500;
+}
+
+/* Form container - similar to your existing modal styling */
+.onboarding-form-container {
+    max-width: 500px;
+    width: 100%;
+    padding: var(--space-xl);
+    background: rgba(255, 255, 255, 0.08);
+    backdrop-filter: blur(20px);
+    border-radius: var(--radius-xl);
+    border: 1px solid rgba(255, 255, 255, 0.15);
+    box-shadow: var(--shadow-lg);
+}
+
+.onboarding-back-button {
+    background: none;
+    border: none;
+    color: white;
+    font-size: 1.5rem;
+    cursor: pointer;
+    padding: var(--space-sm);
+    margin-bottom: var(--space-lg);
+    display: flex;
+    align-items: center;
+    gap: var(--space-sm);
+    transition: transform 0.2s ease;
+}
+
+.onboarding-back-button:hover {
+    transform: translateX(-4px);
+}
+
+.onboarding-form-header {
+    font-size: clamp(1.5rem, 4vw, 2rem);
+    font-weight: 700;
+    color: white;
+    margin-bottom: var(--space-xl);
+    text-align: center;
+}
+
+/* Use existing form input styles */
+.onboarding-input-group {
+    margin-bottom: var(--space-lg);
+}
+
+.onboarding-input-label {
+    display: block;
+    color: rgba(255, 255, 255, 0.9);
+    font-size: 0.9rem;
+    margin-bottom: var(--space-sm);
+    font-weight: 500;
+}
+
+.onboarding-input-field {
+    width: 100%;
+    padding: var(--space-sm) var(--space-md);
+    background: rgba(255, 255, 255, 0.1);
+    border: 2px solid rgba(255, 255, 255, 0.2);
+    border-radius: var(--radius-md);
+    color: white;
+    font-size: 1rem;
+    transition: all var(--transition-fast);
+    font-family: inherit;
+}
+
+.onboarding-input-field:focus {
+    outline: none;
+    border-color: rgba(255, 255, 255, 0.5);
+    background: rgba(255, 255, 255, 0.15);
+}
+
+.onboarding-input-field::placeholder {
+    color: rgba(255, 255, 255, 0.5);
+}
+
+textarea.onboarding-input-field {
+    resize: vertical;
+    min-height: 80px;
+}
+
+/* Image upload styling */
+.onboarding-image-upload {
+    text-align: center;
+    margin-bottom: var(--space-lg);
+}
+
+.onboarding-image-preview {
+    width: 120px;
+    height: 120px;
+    margin: 0 auto var(--space-md);
+    border-radius: var(--radius-full);
+    background: rgba(255, 255, 255, 0.1);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    overflow: hidden;
+    border: 3px solid rgba(255, 255, 255, 0.2);
+}
+
+.onboarding-image-preview img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+}
+
+.onboarding-image-placeholder {
+    font-size: 3rem;
+    color: rgba(255, 255, 255, 0.4);
+}
+
+.onboarding-file-input {
+    display: none;
+}
+
+.onboarding-upload-button {
+    display: inline-block;
+    padding: var(--space-sm) var(--space-lg);
+    background: rgba(255, 255, 255, 0.15);
+    color: white;
+    border-radius: var(--radius-md);
+    cursor: pointer;
+    font-size: 0.9rem;
+    transition: all var(--transition-fast);
+    border: 2px solid rgba(255, 255, 255, 0.2);
+}
+
+.onboarding-upload-button:hover {
+    background: rgba(255, 255, 255, 0.25);
+}
+
+.onboarding-optional-label {
+    color: rgba(255, 255, 255, 0.6);
+    font-size: 0.85rem;
+    font-style: italic;
+    margin-top: var(--space-xs);
+}
+
+@media (max-width: 480px) {
+    .onboarding-form-container {
+        padding: var(--space-lg);
+    }
+}

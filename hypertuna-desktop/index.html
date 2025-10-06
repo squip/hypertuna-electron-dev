@@ -16,6 +16,84 @@
     <link rel="stylesheet" href="styles.css">
 </head>
 <body>
+    <!-- Onboarding Overlay -->
+<div id="onboarding-overlay" class="onboarding-overlay">
+    <div class="onboarding-particles" id="onboarding-particles"></div>
+
+    <!-- Splash Screen -->
+    <div id="onboarding-splash" class="onboarding-page active">
+        <div class="onboarding-splash">
+            <div class="onboarding-logo-container">
+                <img src="hypertuna-logo.png" alt="Hypertuna Logo" class="onboarding-logo">
+            </div>
+        </div>
+    </div>
+
+    <!-- Welcome/Login Page -->
+    <div id="onboarding-welcome" class="onboarding-page">
+        <div class="onboarding-welcome">
+            <h1 class="onboarding-welcome-header">Welcome to Hypertuna</h1>
+            <p class="onboarding-welcome-subheader">Join the p2p nostr relay network</p>
+            
+            <p class="onboarding-welcome-prompt">Sign-in with nostr</p>
+            
+            <button class="btn btn-primary" id="onboarding-btn-create" style="width: 100%; max-width: 350px; margin: var(--space-sm) auto; display: block;">Create new account</button>
+            <button class="btn btn-secondary" id="onboarding-btn-existing" style="width: 100%; max-width: 350px; margin: var(--space-sm) auto; display: block; background: rgba(255, 255, 255, 0.15); color: white; backdrop-filter: blur(10px); border: 2px solid rgba(255, 255, 255, 0.3);">Use existing account</button>
+        </div>
+    </div>
+
+    <!-- Create Account Page -->
+    <div id="onboarding-create" class="onboarding-page">
+        <div class="onboarding-form-container">
+            <button class="onboarding-back-button" id="onboarding-back-from-create">
+                ← Back
+            </button>
+            
+            <h2 class="onboarding-form-header">Create new account</h2>
+            
+            <div class="onboarding-image-upload">
+                <div class="onboarding-image-preview" id="onboarding-image-preview">
+                    <span class="onboarding-image-placeholder">👤</span>
+                </div>
+                <label for="onboarding-pfp-upload" class="onboarding-upload-button">
+                    Upload profile picture
+                </label>
+                <input type="file" id="onboarding-pfp-upload" class="onboarding-file-input" accept="image/*">
+                <div class="onboarding-optional-label">Optional</div>
+            </div>
+
+            <div class="onboarding-input-group">
+                <label class="onboarding-input-label" for="onboarding-username">Pick a user name</label>
+                <input type="text" id="onboarding-username" class="onboarding-input-field" placeholder="Enter your username">
+            </div>
+
+            <div class="onboarding-input-group">
+                <label class="onboarding-input-label" for="onboarding-bio">Something about yourself (bio)</label>
+                <textarea id="onboarding-bio" class="onboarding-input-field" placeholder="Tell us about yourself..."></textarea>
+            </div>
+
+            <button class="btn btn-primary" id="onboarding-btn-create-submit" style="width: 100%;">Create</button>
+        </div>
+    </div>
+
+    <!-- Login Page -->
+    <div id="onboarding-login" class="onboarding-page">
+        <div class="onboarding-form-container">
+            <button class="onboarding-back-button" id="onboarding-back-from-login">
+                ← Back
+            </button>
+            
+            <h2 class="onboarding-form-header">Nostr login</h2>
+            
+            <div class="onboarding-input-group">
+                <label class="onboarding-input-label" for="onboarding-privkey">Enter existing nostr private key (nsec or hex)</label>
+                <input type="password" id="onboarding-privkey" class="onboarding-input-field" placeholder="nsec... or hex key">
+            </div>
+
+            <button class="btn btn-primary" id="onboarding-btn-login-submit" style="width: 100%;">Continue</button>
+        </div>
+    </div>
+</div>
     <!-- Main App Container -->
     <div class="app-container">
         <!-- Header -->
@@ -889,18 +967,18 @@
 
             // Preselect the groups view for returning users so relay events
             // that fire during loadUserFromLocalStorage can rebuild the list.
-            const explicitLogout = localStorage.getItem('explicit_logout') === 'true';
-            const hasSavedUser = !!localStorage.getItem('nostr_user');
-            if (hasSavedUser && !explicitLogout) {
-                this.currentPage = 'groups';
-            }
+            // const explicitLogout = localStorage.getItem('explicit_logout') === 'true';
+            // const hasSavedUser = !!localStorage.getItem('nostr_user');
+            // if (hasSavedUser && !explicitLogout) {
+            //     this.currentPage = 'groups';
+            // }
 
-            await this.loadUserFromLocalStorage();
+            // await this.loadUserFromLocalStorage();
             
-            // If user is already logged in, navigate to groups page
-            if (this.currentUser) {
-                this.currentPage = 'groups';
-            }
+            // // If user is already logged in, navigate to groups page
+            // if (this.currentUser) {
+            //     this.currentPage = 'groups';
+            // }
             
             this.updateUIState();
         },
@@ -1842,6 +1920,431 @@
             }
         }, 3000);
     });
+
+    // Onboarding Flow Management
+const OnboardingFlow = {
+    currentPage: 'splash',
+    overlay: null,
+    particles: null,
+    
+    init() {
+        console.log('[Onboarding] Initializing onboarding flow');
+        this.overlay = document.getElementById('onboarding-overlay');
+        this.particles = document.getElementById('onboarding-particles');
+        
+        if (!this.overlay || !this.particles) {
+            console.error('[Onboarding] Required elements not found');
+            return;
+        }
+        
+        // Create particles
+        this.createParticles();
+        
+        // Setup event listeners
+        this.setupEventListeners();
+        
+        // Check if user should see onboarding
+        this.checkOnboardingState();
+    },
+    
+    createParticles() {
+        const particleCount = 15;
+        for (let i = 0; i < particleCount; i++) {
+            const particle = document.createElement('div');
+            particle.className = 'onboarding-particle';
+            particle.style.left = Math.random() * 100 + '%';
+            particle.style.animationDelay = Math.random() * 4 + 's';
+            particle.style.animationDuration = (Math.random() * 3 + 3) + 's';
+            this.particles.appendChild(particle);
+        }
+    },
+    
+    setupEventListeners() {
+        // Welcome page buttons
+        const btnCreate = document.getElementById('onboarding-btn-create');
+        const btnExisting = document.getElementById('onboarding-btn-existing');
+        
+        if (btnCreate) {
+            btnCreate.addEventListener('click', () => this.navigateTo('create'));
+        }
+        if (btnExisting) {
+            btnExisting.addEventListener('click', () => this.navigateTo('login'));
+        }
+        
+        // Back buttons
+        const backFromCreate = document.getElementById('onboarding-back-from-create');
+        const backFromLogin = document.getElementById('onboarding-back-from-login');
+        
+        if (backFromCreate) {
+            backFromCreate.addEventListener('click', () => this.navigateTo('welcome'));
+        }
+        if (backFromLogin) {
+            backFromLogin.addEventListener('click', () => this.navigateTo('welcome'));
+        }
+        
+        // Submit buttons
+        const btnCreateSubmit = document.getElementById('onboarding-btn-create-submit');
+        const btnLoginSubmit = document.getElementById('onboarding-btn-login-submit');
+        
+        if (btnCreateSubmit) {
+            btnCreateSubmit.addEventListener('click', () => this.handleCreateAccount());
+        }
+        if (btnLoginSubmit) {
+            btnLoginSubmit.addEventListener('click', () => this.handleLogin());
+        }
+        
+        // Image upload
+        const pfpUpload = document.getElementById('onboarding-pfp-upload');
+        if (pfpUpload) {
+            pfpUpload.addEventListener('change', (e) => this.handleImageUpload(e));
+        }
+    },
+    
+    async checkOnboardingState() {
+        console.log('[Onboarding] Checking onboarding state');
+        
+        // Check if user was authenticated in last session
+        const explicitLogout = localStorage.getItem('explicit_logout') === 'true';
+        const savedUser = localStorage.getItem('nostr_user');
+        
+        if (savedUser && !explicitLogout) {
+            // User was authenticated - show splash then auto-login
+            console.log('[Onboarding] User was authenticated, showing splash for auto-login');
+            this.overlay.classList.add('active');
+            this.navigateTo('splash');
+            
+            // Auto-authenticate in background
+            setTimeout(async () => {
+                await this.autoAuthenticate();
+            }, 2000);
+        } else {
+            // First time or logged out - show splash then welcome
+            console.log('[Onboarding] First time or logged out, showing welcome screen');
+            this.overlay.classList.add('active');
+            this.navigateTo('splash');
+            
+            setTimeout(() => {
+                this.navigateTo('welcome');
+            }, 3000);
+        }
+    },
+    
+    navigateTo(page) {
+        console.log('[Onboarding] Navigating to:', page);
+        
+        // Hide all pages
+        document.querySelectorAll('.onboarding-page').forEach(p => {
+            p.classList.remove('active');
+        });
+        
+        // Show target page
+        const targetPage = document.getElementById(`onboarding-${page}`);
+        if (targetPage) {
+            setTimeout(() => {
+                targetPage.classList.add('active');
+            }, 100);
+        }
+        
+        this.currentPage = page;
+    },
+    
+    handleImageUpload(event) {
+        const file = event.target.files[0];
+        if (file) {
+            const reader = new FileReader();
+            reader.onload = (e) => {
+                const preview = document.getElementById('onboarding-image-preview');
+                if (preview) {
+                    preview.innerHTML = `<img src="${e.target.result}" alt="Profile">`;
+                }
+            };
+            reader.readAsDataURL(file);
+        }
+    },
+    
+    async handleCreateAccount() {
+        console.log('[Onboarding] Handling create account');
+        
+        const username = document.getElementById('onboarding-username').value.trim();
+        const bio = document.getElementById('onboarding-bio').value.trim();
+        const pfpInput = document.getElementById('onboarding-pfp-upload');
+        
+        if (!username) {
+            alert('Please enter a username');
+            return;
+        }
+        
+        try {
+            // Generate new keypair using existing NostrUtils
+            const privateKey = NostrUtils.generatePrivateKey();
+            const pubkey = NostrUtils.getPublicKey(privateKey);
+            
+            console.log('[Onboarding] Generated new keypair');
+            
+            // Create user object
+            const user = {
+                privateKey,
+                pubkey,
+                name: username,
+                about: bio
+            };
+            
+            // Store pfp file for later processing via AvatarModal workflow
+            if (pfpInput.files[0]) {
+                user.pendingPfpFile = pfpInput.files[0];
+            }
+            
+            // Set as current user in App
+            App.currentUser = user;
+            
+            // Setup Hypertuna config using existing logic
+            console.log('[Onboarding] Setting up Hypertuna config');
+            const hypertunaConfig = await HypertunaUtils.setupUserConfig(user);
+            user.hypertunaConfig = hypertunaConfig;
+            
+            // Save user to localStorage
+            App.saveUserToLocalStorage();
+            
+            // Sync config to file
+            await App.syncHypertunaConfigToFile();
+            
+            // Initialize nostr integration with existing logic
+            console.log('[Onboarding] Initializing Nostr integration');
+            if (!App.nostr) {
+                App.nostr = new NostrIntegration(App);
+            }
+            await App.nostr.init(user);
+            
+            // Configure discovery relays
+            if (App.configureRelays) {
+                await App.configureRelays(App.nostr.relayUrls || [], { skipNetwork: true, includePersisted: true });
+            }
+            
+            // Publish kind 0 profile event using existing logic
+            console.log('[Onboarding] Publishing profile');
+            await App.nostr.updateProfile({
+                name: username,
+                about: bio
+            });
+            
+            // Start worker using existing logic
+            if (window.startWorker) {
+                console.log('[Onboarding] Starting worker');
+                const key = await window.startWorker();
+                if (key && user.hypertunaConfig) {
+                    user.hypertunaConfig.swarmPublicKey = key;
+                    await HypertunaUtils.saveConfig(user.hypertunaConfig);
+                    App.saveUserToLocalStorage();
+                }
+            }
+            
+            // Complete onboarding
+            this.completeOnboarding();
+            
+        } catch (error) {
+            console.error('[Onboarding] Error creating account:', error);
+            alert('Failed to create account: ' + error.message);
+        }
+    },
+    
+    async handleLogin() {
+        console.log('[Onboarding] Handling login');
+        
+        const privateKeyInput = document.getElementById('onboarding-privkey').value.trim();
+        
+        if (!privateKeyInput) {
+            alert('Please enter your private key');
+            return;
+        }
+        
+        try {
+            // Normalize key using existing NostrUtils
+            const privateKey = NostrUtils.normalizePrivateKey(privateKeyInput);
+            if (!privateKey) {
+                alert('Invalid private key format. Please enter a hex key or nsec format.');
+                return;
+            }
+            
+            const pubkey = NostrUtils.getPublicKey(privateKey);
+            console.log('[Onboarding] Key validated, pubkey:', pubkey.substring(0, 8) + '...');
+            
+            // Check if user config exists in localStorage
+            const savedUser = localStorage.getItem('nostr_user');
+            let user;
+            
+            if (savedUser) {
+                const parsed = JSON.parse(savedUser);
+                if (parsed.pubkey === pubkey) {
+                    // Load existing config
+                    console.log('[Onboarding] Loading existing user config');
+                    user = parsed;
+                    user.privateKey = privateKey; // Update with entered key
+                }
+            }
+            
+            if (!user) {
+                // Create new config for this key
+                console.log('[Onboarding] Creating new config for existing key');
+                user = {
+                    privateKey,
+                    pubkey,
+                    name: 'User_' + NostrUtils.truncatePubkey(pubkey),
+                    about: ''
+                };
+                
+                // Setup Hypertuna config using existing logic
+                const hypertunaConfig = await HypertunaUtils.setupUserConfig(user);
+                user.hypertunaConfig = hypertunaConfig;
+            }
+            
+            // Clear logout flag
+            localStorage.removeItem('explicit_logout');
+            
+            // Set as current user
+            App.currentUser = user;
+            App.saveUserToLocalStorage();
+            
+            // Sync config
+            await App.syncHypertunaConfigToFile();
+            
+            // Initialize nostr using existing logic
+            console.log('[Onboarding] Initializing Nostr integration');
+            if (!App.nostr) {
+                App.nostr = new NostrIntegration(App);
+            }
+            await App.nostr.init(user);
+            
+            // Configure discovery relays
+            if (App.configureRelays) {
+                await App.configureRelays(App.nostr.relayUrls || [], { skipNetwork: true, includePersisted: true });
+            }
+            
+            // Fetch user profile from network
+            try {
+                const profile = await App.nostr.client.fetchUserProfile(user.pubkey);
+                Object.assign(user, profile);
+                App.saveUserToLocalStorage();
+            } catch (err) {
+                console.warn('[Onboarding] Could not fetch user profile:', err);
+            }
+            
+            // Start worker using existing logic
+            if (window.startWorker) {
+                console.log('[Onboarding] Starting worker');
+                const key = await window.startWorker();
+                if (key && user.hypertunaConfig) {
+                    user.hypertunaConfig.swarmPublicKey = key;
+                    await HypertunaUtils.saveConfig(user.hypertunaConfig);
+                    App.saveUserToLocalStorage();
+                }
+            }
+            
+            // Complete onboarding
+            this.completeOnboarding();
+            
+        } catch (error) {
+            console.error('[Onboarding] Error logging in:', error);
+            alert('Login failed: ' + error.message);
+        }
+    },
+    
+    async autoAuthenticate() {
+        console.log('[Onboarding] Auto-authenticating user');
+        
+        try {
+            const savedUser = localStorage.getItem('nostr_user');
+            if (!savedUser) {
+                console.log('[Onboarding] No saved user, showing welcome');
+                this.navigateTo('welcome');
+                return;
+            }
+            
+            const user = JSON.parse(savedUser);
+            App.currentUser = user;
+            
+            // Initialize nostr using existing logic
+            console.log('[Onboarding] Initializing Nostr for auto-login');
+            if (!App.nostr) {
+                App.nostr = new NostrIntegration(App);
+            }
+            await App.nostr.init(user);
+            
+            // Configure discovery relays
+            if (App.configureRelays) {
+                await App.configureRelays(App.nostr.relayUrls || [], { skipNetwork: true, includePersisted: true });
+            }
+            
+            // Fetch latest profile
+            try {
+                const profile = await App.nostr.client.fetchUserProfile(user.pubkey);
+                Object.assign(user, profile);
+                App.saveUserToLocalStorage();
+                App.updateProfileDisplay();
+            } catch (err) {
+                console.warn('[Onboarding] Could not fetch profile during auto-auth:', err);
+            }
+            
+            // Start worker using existing logic
+            if (window.startWorker) {
+                console.log('[Onboarding] Starting worker');
+                const key = await window.startWorker();
+                if (key && user.hypertunaConfig) {
+                    user.hypertunaConfig.swarmPublicKey = key;
+                    await HypertunaUtils.saveConfig(user.hypertunaConfig);
+                    App.saveUserToLocalStorage();
+                }
+                if (window.refreshGatewayStatus) {
+                    await window.refreshGatewayStatus({ fetchOptions: false });
+                }
+            }
+            
+            // Complete onboarding
+            this.completeOnboarding();
+            
+        } catch (error) {
+            console.error('[Onboarding] Auto-authentication failed:', error);
+            this.navigateTo('welcome');
+        }
+    },
+    
+    completeOnboarding() {
+        console.log('[Onboarding] Completing onboarding flow');
+        
+        // Hide overlay with fade
+        this.overlay.style.transition = 'opacity 0.5s ease-out';
+        this.overlay.style.opacity = '0';
+        
+        setTimeout(() => {
+            this.overlay.classList.remove('active');
+            this.overlay.style.opacity = '1';
+            
+            // Navigate to groups page in main app
+            App.currentPage = 'groups';
+            App.updateUIState();
+            
+            // Load groups using existing logic
+            if (App.nostr && typeof App.loadGroups === 'function') {
+                App.loadGroups();
+            }
+            
+            console.log('[Onboarding] Onboarding complete, user in app');
+        }, 500);
+    }
+};
+
+// Initialize onboarding after App.init() completes
+const originalAppInit = App.init;
+App.init = async function() {
+    await originalAppInit.call(this);
+    
+    // Don't auto-load user during App.init - let OnboardingFlow handle it
+    // This prevents double initialization
+    
+    // Initialize onboarding flow
+    setTimeout(() => {
+        OnboardingFlow.init();
+    }, 100);
+};
   </script>
 </body>
 </html>
