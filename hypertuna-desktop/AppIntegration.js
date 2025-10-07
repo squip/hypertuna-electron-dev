@@ -798,8 +798,13 @@ function integrateNostrRelays(App) {
         window.stopWorker();
         this.currentUser = null;
         this.saveUserToLocalStorage();
-        this.navigateTo('auth');
-        this.updateUIState();
+
+        if (window.OnboardingFlow && typeof window.OnboardingFlow.startFreshSession === 'function') {
+            window.OnboardingFlow.startFreshSession();
+        } else {
+            this.currentPage = 'auth';
+            this.updateUIState();
+        }
     };
     
     /**

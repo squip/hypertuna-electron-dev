@@ -17,7 +17,7 @@
 </head>
 <body>
     <!-- Onboarding Overlay -->
-    <div id="onboarding-overlay" class="onboarding-overlay">
+    <div id="onboarding-overlay" class="onboarding-overlay active">
         <!-- Gradient layers -->
         <div class="gradient-base"></div>
         <div class="gradient-animated-1"></div>
@@ -1932,7 +1932,10 @@ const OnboardingFlow = {
     currentPage: 'splash',
     overlay: null,
     particles: null,
-    
+    splashTimeoutId: null,
+    autoAuthTimeoutId: null,
+    overlayFadeTimeoutId: null,
+
     init() {
         console.log('[Onboarding] Initializing onboarding flow');
         this.overlay = document.getElementById('onboarding-overlay');
@@ -2019,10 +2022,48 @@ const OnboardingFlow = {
             pfpUpload.addEventListener('change', (e) => this.handleImageUpload(e));
         }
     },
-    
+
+    ensureOverlayVisible() {
+        if (!this.overlay) return;
+        this.overlay.classList.add('active');
+        this.overlay.style.transition = '';
+        this.overlay.style.opacity = '1';
+    },
+
+    clearPendingTimers() {
+        if (this.splashTimeoutId) {
+            clearTimeout(this.splashTimeoutId);
+            this.splashTimeoutId = null;
+        }
+        if (this.autoAuthTimeoutId) {
+            clearTimeout(this.autoAuthTimeoutId);
+            this.autoAuthTimeoutId = null;
+        }
+        if (this.overlayFadeTimeoutId) {
+            clearTimeout(this.overlayFadeTimeoutId);
+            this.overlayFadeTimeoutId = null;
+        }
+    },
+
+    startFreshSession() {
+        console.log('[Onboarding] Starting fresh session after logout');
+        this.clearPendingTimers();
+        this.ensureOverlayVisible();
+        this.navigateTo('splash');
+
+        // Reset underlying app state while overlay is opaque
+        App.currentPage = 'auth';
+        App.updateUIState();
+
+        this.splashTimeoutId = setTimeout(() => {
+            this.navigateTo('welcome');
+        }, 800);
+    },
+
     async checkOnboardingState() {
         console.log('[Onboarding] Checking onboarding state');
-        
+        this.clearPendingTimers();
+
         // Check if user was authenticated in last session
         const explicitLogout = localStorage.getItem('explicit_logout') === 'true';
         const savedUser = localStorage.getItem('nostr_user');
@@ -2030,25 +2071,25 @@ const OnboardingFlow = {
         if (savedUser && !explicitLogout) {
             // User was authenticated - show splash then auto-login
             console.log('[Onboarding] User was authenticated, showing splash for auto-login');
-            this.overlay.classList.add('active');
+            this.ensureOverlayVisible();
             this.navigateTo('splash');
             
             // Auto-authenticate in background
-            setTimeout(async () => {
+            this.autoAuthTimeoutId = setTimeout(async () => {
                 await this.autoAuthenticate();
             }, 2000);
         } else {
             // First time or logged out - show splash then welcome
             console.log('[Onboarding] First time or logged out, showing welcome screen');
-            this.overlay.classList.add('active');
+            this.ensureOverlayVisible();
             this.navigateTo('splash');
             
-            setTimeout(() => {
+            this.splashTimeoutId = setTimeout(() => {
                 this.navigateTo('welcome');
             }, 3000);
         }
     },
-    
+
     navigateTo(page) {
         console.log('[Onboarding] Navigating to:', page);
         
@@ -2329,24 +2370,29 @@ const OnboardingFlow = {
     
     completeOnboarding() {
         console.log('[Onboarding] Completing onboarding flow');
-        
-        // Hide overlay with fade
-        this.overlay.style.transition = 'opacity 0.5s ease-out';
-        this.overlay.style.opacity = '0';
-        
-        setTimeout(() => {
+
+        this.clearPendingTimers();
+        this.ensureOverlayVisible();
+
+        // Prepare main app view before the overlay fades away
+        App.currentPage = 'groups';
+        App.updateUIState();
+
+        if (App.nostr && typeof App.loadGroups === 'function') {
+            App.loadGroups();
+        }
+
+        requestAnimationFrame(() => {
+            if (!this.overlay) return;
+            this.overlay.style.transition = 'opacity 0.5s ease-out';
+            this.overlay.style.opacity = '0';
+        });
+
+        this.overlayFadeTimeoutId = setTimeout(() => {
+            if (!this.overlay) return;
             this.overlay.classList.remove('active');
+            this.overlay.style.transition = '';
             this.overlay.style.opacity = '1';
-            
-            // Navigate to groups page in main app
-            App.currentPage = 'groups';
-            App.updateUIState();
-            
-            // Load groups using existing logic
-            if (App.nostr && typeof App.loadGroups === 'function') {
-                App.loadGroups();
-            }
-            
             console.log('[Onboarding] Onboarding complete, user in app');
         }, 500);
     }
@@ -2365,6 +2411,8 @@ App.init = async function() {
         OnboardingFlow.init();
     }, 100);
 };
+
+window.OnboardingFlow = OnboardingFlow;
   </script>
 </body>
 </html>
