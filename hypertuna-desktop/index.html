@@ -1935,6 +1935,8 @@ const OnboardingFlow = {
     splashTimeoutId: null,
     autoAuthTimeoutId: null,
     overlayFadeTimeoutId: null,
+    lastSessionWasLogout: false,
+    suppressAutoAuth: false,
 
     init() {
         console.log('[Onboarding] Initializing onboarding flow');
@@ -2045,24 +2047,86 @@ const OnboardingFlow = {
         }
     },
 
-    startFreshSession() {
+    clearPersistedUserData() {
+        try {
+            localStorage.removeItem('nostr_user');
+        } catch (error) {
+            console.error('[Onboarding] Failed to clear stored user:', error);
+        }
+
+        try {
+            localStorage.removeItem('hypertuna_config');
+        } catch (error) {
+            console.error('[Onboarding] Failed to clear Hypertuna config:', error);
+        }
+
+        if (typeof App !== 'undefined' && App) {
+            try {
+                App.currentUser = null;
+                if (typeof App.saveUserToLocalStorage === 'function') {
+                    App.saveUserToLocalStorage();
+                }
+            } catch (error) {
+                console.error('[Onboarding] Failed to persist cleared user state:', error);
+            }
+        }
+    },
+
+    markAuthenticated() {
+        try {
+            localStorage.removeItem('explicit_logout');
+        } catch (error) {
+            console.error('[Onboarding] Failed to clear logout flag:', error);
+        }
+
+        this.lastSessionWasLogout = false;
+        this.suppressAutoAuth = false;
+    },
+
+    startFreshSession({ skipSplash = true, clearPersistedUser = true } = {}) {
         console.log('[Onboarding] Starting fresh session after logout');
+        this.lastSessionWasLogout = true;
+        this.suppressAutoAuth = true;
         this.clearPendingTimers();
         this.ensureOverlayVisible();
-        this.navigateTo('splash');
 
-        // Reset underlying app state while overlay is opaque
-        App.currentPage = 'auth';
-        App.updateUIState();
+        if (clearPersistedUser) {
+            this.clearPersistedUserData();
+        }
 
-        this.splashTimeoutId = setTimeout(() => {
-            this.navigateTo('welcome');
-        }, 800);
+        try {
+            localStorage.setItem('explicit_logout', 'true');
+        } catch (error) {
+            console.error('[Onboarding] Failed to persist logout flag:', error);
+        }
+
+        if (typeof App !== 'undefined' && App) {
+            App.currentPage = 'auth';
+            if (typeof App.updateUIState === 'function') {
+                App.updateUIState();
+            }
+        }
+
+        if (skipSplash) {
+            this.navigateTo('welcome', { immediate: true });
+        } else {
+            this.navigateTo('splash', { immediate: true });
+            this.splashTimeoutId = setTimeout(() => {
+                this.navigateTo('welcome');
+            }, 800);
+        }
     },
 
     async checkOnboardingState() {
         console.log('[Onboarding] Checking onboarding state');
         this.clearPendingTimers();
+
+        if (this.suppressAutoAuth || this.lastSessionWasLogout) {
+            console.log('[Onboarding] Auto-authentication suppressed, showing welcome screen');
+            this.ensureOverlayVisible();
+            this.navigateTo('welcome', { immediate: true });
+            return;
+        }
 
         // Check if user was authenticated in last session
         const explicitLogout = localStorage.getItem('explicit_logout') === 'true';
@@ -2090,7 +2154,7 @@ const OnboardingFlow = {
         }
     },
 
-    navigateTo(page) {
+    navigateTo(page, { immediate = false } = {}) {
         console.log('[Onboarding] Navigating to:', page);
         
         // Hide all pages
@@ -2101,9 +2165,15 @@ const OnboardingFlow = {
         // Show target page
         const targetPage = document.getElementById(`onboarding-${page}`);
         if (targetPage) {
-            setTimeout(() => {
+            const activate = () => {
                 targetPage.classList.add('active');
-            }, 100);
+            };
+
+            if (immediate) {
+                activate();
+            } else {
+                setTimeout(activate, 100);
+            }
         }
         
         this.currentPage = page;
@@ -2165,7 +2235,7 @@ const OnboardingFlow = {
             
             // Save user to localStorage
             App.saveUserToLocalStorage();
-            
+
             // Sync config to file
             await App.syncHypertunaConfigToFile();
             
@@ -2258,13 +2328,10 @@ const OnboardingFlow = {
                 user.hypertunaConfig = hypertunaConfig;
             }
             
-            // Clear logout flag
-            localStorage.removeItem('explicit_logout');
-            
             // Set as current user
             App.currentUser = user;
             App.saveUserToLocalStorage();
-            
+
             // Sync config
             await App.syncHypertunaConfigToFile();
             
@@ -2313,6 +2380,12 @@ const OnboardingFlow = {
         console.log('[Onboarding] Auto-authenticating user');
         
         try {
+            if (this.suppressAutoAuth) {
+                console.log('[Onboarding] Auto-authentication skipped due to logout');
+                this.navigateTo('welcome', { immediate: true });
+                return;
+            }
+
             const savedUser = localStorage.getItem('nostr_user');
             if (!savedUser) {
                 console.log('[Onboarding] No saved user, showing welcome');
@@ -2373,6 +2446,7 @@ const OnboardingFlow = {
 
         this.clearPendingTimers();
         this.ensureOverlayVisible();
+        this.markAuthenticated();
 
         // Prepare main app view before the overlay fades away
         App.currentPage = 'groups';

@@ -761,46 +761,84 @@ function integrateNostrRelays(App) {
 
 
     App.logout = function() {
-        // Set a flag to indicate explicit logout
-        localStorage.setItem('explicit_logout', 'true');
-        
-        // Disconnect from relays
-        if (this.relay && this.relay.isConnected()) {
-            this.relay.disconnect();
+        try {
+            localStorage.setItem('explicit_logout', 'true');
+        } catch (error) {
+            console.error('Failed to set explicit logout flag:', error);
         }
 
-        this.currentGroupIsMember = false;
-        if (typeof this.refreshRelayGatewayCard === 'function') {
-            this.refreshRelayGatewayCard();
-        }
-        
-        if (this.nostr && this.nostr.client) {
-            // Properly cleanup NostrIntegration
-            this.nostr.client.activeSubscriptions.forEach(subId => {
-                this.nostr.client.relayManager.unsubscribe(subId);
-            });
-            this.nostr.client.activeSubscriptions.clear();
-            
-            // Disconnect from all relays with prevention flag
-            this.nostr.client.relayManager.getRelays().forEach(url => {
-                const relay = this.nostr.client.relayManager.relays.get(url);
-                if (relay && relay.conn) {
-                    relay.preventReconnect = true;
-                    relay.conn.close();
+        const clearUserData = () => {
+            this.currentUser = null;
+            try {
+                this.saveUserToLocalStorage();
+            } catch (error) {
+                console.error('Failed to persist cleared user state during logout:', error);
+            }
+
+            try {
+                localStorage.removeItem('hypertuna_config');
+            } catch (error) {
+                console.error('Failed to remove Hypertuna config during logout:', error);
+            }
+        };
+
+        try {
+            this.currentGroupIsMember = false;
+            if (typeof this.refreshRelayGatewayCard === 'function') {
+                try {
+                    this.refreshRelayGatewayCard();
+                } catch (error) {
+                    console.error('Failed to refresh relay gateway card during logout:', error);
                 }
-                this.nostr.client.relayManager.relays.delete(url);
-            });
-            
-            // Clear the nostr integration
-            this.nostr = null;
+            }
+
+            if (this.relay && this.relay.isConnected()) {
+                try {
+                    this.relay.disconnect();
+                } catch (error) {
+                    console.error('Failed to disconnect relay during logout:', error);
+                }
+            }
+
+            if (this.nostr && this.nostr.client) {
+                try {
+                    this.nostr.client.activeSubscriptions.forEach(subId => {
+                        this.nostr.client.relayManager.unsubscribe(subId);
+                    });
+                    this.nostr.client.activeSubscriptions.clear();
+
+                    this.nostr.client.relayManager.getRelays().forEach(url => {
+                        const relay = this.nostr.client.relayManager.relays.get(url);
+                        if (relay && relay.conn) {
+                            relay.preventReconnect = true;
+                            try {
+                                relay.conn.close();
+                            } catch (error) {
+                                console.error('Failed to close relay connection during logout:', error);
+                            }
+                        }
+                        this.nostr.client.relayManager.relays.delete(url);
+                    });
+                } catch (error) {
+                    console.error('Failed to clean up Nostr integration during logout:', error);
+                }
+
+                this.nostr = null;
+            }
+
+            if (typeof window.stopWorker === 'function') {
+                try {
+                    window.stopWorker();
+                } catch (error) {
+                    console.error('Failed to stop worker during logout:', error);
+                }
+            }
+        } finally {
+            clearUserData();
         }
-        
-        window.stopWorker();
-        this.currentUser = null;
-        this.saveUserToLocalStorage();
 
         if (window.OnboardingFlow && typeof window.OnboardingFlow.startFreshSession === 'function') {
-            window.OnboardingFlow.startFreshSession();
+            window.OnboardingFlow.startFreshSession({ skipSplash: true });
         } else {
             this.currentPage = 'auth';
             this.updateUIState();
@@ -914,6 +952,14 @@ function integrateNostrRelays(App) {
                 key: 'nostr_user'
             });
             localStorage.removeItem('nostr_user');
+
+            ConfigLogger.log('DELETE', {
+                module: 'AppIntegration',
+                method: 'saveUserToLocalStorage',
+                filepath: 'localStorage',
+                key: 'hypertuna_config'
+            });
+            localStorage.removeItem('hypertuna_config');
         }
     };
     
