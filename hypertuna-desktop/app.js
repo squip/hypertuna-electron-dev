@@ -268,33 +268,39 @@ function waitForPfpAck(owner, fileHash, { timeoutMs = 45000 } = {}) {
 
   let timeoutId = null
   let settled = false
+  const entry = {
+    resolve: null,
+    reject: null,
+    promise: null
+  }
 
   const promise = new Promise((resolve, reject) => {
+    entry.resolve = (payload) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timeoutId)
+      pendingPfpUploads.delete(key)
+      resolve(payload)
+    }
+    entry.reject = (error) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timeoutId)
+      pendingPfpUploads.delete(key)
+      reject(error)
+    }
+
     timeoutId = setTimeout(() => {
       if (settled) return
       settled = true
       pendingPfpUploads.delete(key)
       reject(new Error('PFP upload acknowledgment timed out'))
     }, Math.max(1000, timeoutMs))
-
-    pendingPfpUploads.set(key, {
-      resolve: (payload) => {
-        if (settled) return
-        settled = true
-        clearTimeout(timeoutId)
-        pendingPfpUploads.delete(key)
-        resolve(payload)
-      },
-      reject: (error) => {
-        if (settled) return
-        settled = true
-        clearTimeout(timeoutId)
-        pendingPfpUploads.delete(key)
-        reject(error)
-      },
-      promise
-    })
   })
+
+  entry.promise = promise
+  pendingPfpUploads.set(key, entry)
+  console.log('[PFPQueue] waiting for ACK', { owner, fileHash, timeoutMs })
 
   return promise
 }

@@ -1381,7 +1381,7 @@ function integrateNostrRelays(App) {
             this.currentUser.expectedPfpFileHash = fileHash;
             this.saveUserToLocalStorage();
             this.updateProfileDisplay();
-            console.log('[Avatar] queued selection', { owner, fileHash, mime: result.mimeType });
+            console.log('[Avatar] queued selection', { owner, fileHash, mime: result.mimeType, pictureUrl });
 
             await this.updateProfile({ silent: true, omitPendingAvatar: true });
 
@@ -1407,7 +1407,7 @@ function integrateNostrRelays(App) {
                         window.prunePfpQueueForOwner(owner, fileHash);
                     }
                     window.enqueuePfpUpload(queueTask);
-                    console.log('[Avatar] enqueued durable upload task', { owner, fileHash });
+                    console.log('[Avatar] enqueued durable upload task', { owner, fileHash, pictureUrl });
                 } else {
                     console.warn('[App] enqueuePfpUpload unavailable; aborting avatar upload');
                     await this.handlePendingAvatarUploadFailure(pendingAvatar, new Error('PFP upload queue unavailable'));
@@ -1537,7 +1537,7 @@ function integrateNostrRelays(App) {
             this.currentUser.expectedPfpFileHash = fileHash;
             this.saveUserToLocalStorage();
             this.updateProfileDisplay();
-            console.log('[Avatar] prepared onboarding avatar', { owner, fileHash, mimeType });
+            console.log('[Avatar] prepared onboarding avatar', { owner, fileHash, mimeType, pictureUrl });
 
             await this.updateProfile({ silent: true, omitPendingAvatar: true });
 
@@ -1561,7 +1561,7 @@ function integrateNostrRelays(App) {
                     window.prunePfpQueueForOwner(owner, fileHash);
                 }
                 window.enqueuePfpUpload(queueTask);
-                console.log('[Avatar] enqueued onboarding PFP upload', { owner, fileHash });
+                console.log('[Avatar] enqueued onboarding PFP upload', { owner, fileHash, pictureUrl });
             } else {
                 console.warn('[Avatar] enqueuePfpUpload unavailable during onboarding');
                 await this.handlePendingAvatarUploadFailure(pendingAvatar, new Error('PFP upload queue unavailable'));
@@ -4424,7 +4424,7 @@ App.setupFollowingModalListeners = function() {
             pictureSource = { ...forcePicture, fromPending: true };
         } else if (!omitPendingAvatar && this.pendingProfileAvatar) {
             pictureSource = { ...this.pendingProfileAvatar, fromPending: true };
-        } else if (this.currentUser?.picture) {
+        } else if (!omitPendingAvatar && this.currentUser?.picture) {
             pictureSource = {
                 pictureUrl: this.currentUser.picture,
                 tagUrl: this.currentUser.pictureTagUrl,
@@ -4433,20 +4433,27 @@ App.setupFollowingModalListeners = function() {
         }
 
         if (pictureSource?.pictureUrl) {
-            profileUpdate.picture = pictureSource.pictureUrl;
-            if (pictureSource.tagUrl && (pictureSource.fromPending || pictureSource.fromHypertuna || forcePicture)) {
+            const preferHypertuna = (pictureSource.fromPending || pictureSource.fromHypertuna || !!forcePicture) && pictureSource.tagUrl;
+            if (preferHypertuna) {
+                profileUpdate.picture = pictureSource.tagUrl;
                 profileTags.push(['picture', pictureSource.tagUrl, 'hypertuna:drive:pfp']);
+            } else {
+                profileUpdate.picture = pictureSource.pictureUrl;
             }
         }
 
         try {
+            console.log('[Avatar] publishing profile update', {
+                picture: profileUpdate.picture,
+                tags: profileTags
+            });
             await this.nostr.updateProfile(profileUpdate, { tags: profileTags });
 
             this.currentUser.name = name;
             this.currentUser.about = about;
 
             if (pictureSource?.pictureUrl) {
-                this.currentUser.picture = pictureSource.pictureUrl;
+                this.currentUser.picture = pictureSource.tagUrl || pictureSource.pictureUrl;
                 if (pictureSource.tagUrl) {
                     this.currentUser.pictureTagUrl = pictureSource.tagUrl;
                 }
