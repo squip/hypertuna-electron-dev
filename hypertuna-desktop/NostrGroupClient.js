@@ -71,6 +71,11 @@ class NostrGroupClient {
         this.shutdownRequested = false;
         this.cancelled = false;
 
+        // Discovery bootstrap state
+        this.discoveryPending = false;
+        this.discoveryBootstrapPromise = null;
+        this.discoverySubscriptionsReady = false;
+
         this._registerAuthFailureListener();
 
         // Setup default event handlers
@@ -171,7 +176,12 @@ class NostrGroupClient {
     /**
      * Initialize with discovery relays only
      */
-    async initWithDiscoveryRelays(user, discoveryRelays) {
+    async initWithDiscoveryRelays(user, discoveryRelays, options = {}) {
+        const {
+            deferDiscovery = false,
+            seedProfile = null
+        } = options;
+
         this.cancelled = false;
         this.shutdownRequested = false;
         this.user = user;
@@ -184,17 +194,96 @@ class NostrGroupClient {
             }
             await this.relayManager.addTypedRelay(url, 'discovery');
         }
-        
-        // Fetch user profile and follows
-        await this.fetchUserProfile(user.pubkey);
-        await this.fetchUserFollows();
-        await this.fetchUserRelayList();
-        
-        // Setup minimal subscriptions for discovery
-        this._createDiscoverySubscriptions();
-        
+        // Seed profile cache when supplied so UI has immediate data
+        if (seedProfile && typeof seedProfile === 'object') {
+            const seededProfile = {
+                pubkey: user.pubkey,
+                name: seedProfile.name ?? user.name ?? null,
+                about: seedProfile.about ?? user.about ?? '',
+                picture: seedProfile.picture ?? null,
+                pictureTagUrl: seedProfile.pictureTagUrl ?? null,
+                pictureIsHypertunaPfp: !!seedProfile.pictureIsHypertunaPfp
+            };
+            this.cachedProfiles.set(user.pubkey, seededProfile);
+        } else if ((user?.name || user?.about) && !this.cachedProfiles.has(user.pubkey)) {
+            this.cachedProfiles.set(user.pubkey, {
+                pubkey: user.pubkey,
+                name: user.name || null,
+                about: user.about || ''
+            });
+        }
+
+        this.discoveryPending = true;
+
+        if (deferDiscovery) {
+            this.isInitialized = true;
+            return this;
+        }
+
+        await this.resumeDiscovery({ force: true });
         this.isInitialized = true;
         return this;
+    }
+
+    async resumeDiscovery({ force = false } = {}) {
+        if (!this.user) {
+            return;
+        }
+
+        if (this.discoveryBootstrapPromise) {
+            return this.discoveryBootstrapPromise;
+        }
+
+        if (!force && !this.discoveryPending) {
+            return;
+        }
+
+        this.discoveryPending = true;
+
+        this.discoveryBootstrapPromise = this._bootstrapDiscovery()
+            .catch((error) => {
+                this.discoveryPending = false;
+                console.error('[NostrGroupClient] Discovery bootstrap failed:', error);
+                throw error;
+            })
+            .finally(() => {
+                this.discoveryBootstrapPromise = null;
+                if (this.discoveryPending) {
+                    this.discoveryPending = false;
+                }
+            });
+
+        return this.discoveryBootstrapPromise;
+    }
+
+    async _bootstrapDiscovery() {
+        if (!this.user) {
+            this.discoveryPending = false;
+            return;
+        }
+
+        const steps = [
+            () => this.fetchUserProfile(this.user.pubkey),
+            () => this.fetchUserFollows(),
+            () => this.fetchUserRelayList()
+        ];
+
+        const names = ['profile', 'follows', 'relayList'];
+
+        const results = await Promise.allSettled(steps.map((fn) => fn()));
+        results.forEach((result, index) => {
+            if (result.status === 'rejected') {
+                console.warn(`[NostrGroupClient] Discovery step failed (${names[index]}):`, result.reason);
+            }
+        });
+
+        if (!this.discoverySubscriptionsReady) {
+            this._createDiscoverySubscriptions();
+            this.discoverySubscriptionsReady = true;
+        }
+
+        this.discoveryPending = false;
+        this.isInitialized = true;
     }
 
     /**

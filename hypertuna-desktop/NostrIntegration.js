@@ -48,17 +48,28 @@ class NostrIntegration {
      * @param {Object} user - User object with privateKey and pubkey
      * @returns {Promise} - Resolves when initialized
      */
-    async init(user) {
+    async init(user, options = {}) {
         // Set up event listeners
         this._setupEventListeners();
         
         // Initialize client with discovery relays only
-        await this.client.initWithDiscoveryRelays(user, this.relayUrls);
+        await this.client.initWithDiscoveryRelays(user, this.relayUrls, options);
         
         // Update relay status in UI
         this._updateRelayStatus();
         
         return this;
+    }
+
+    resumeDiscovery(options = {}) {
+        if (!this.client || typeof this.client.resumeDiscovery !== 'function') {
+            return Promise.resolve();
+        }
+        return this.client.resumeDiscovery(options);
+    }
+
+    isDiscoveryPending() {
+        return !!this.client?.discoveryPending;
     }
     
     // Add method to check if connected to a group's relay
