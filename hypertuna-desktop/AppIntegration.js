@@ -1212,6 +1212,17 @@ function integrateNostrRelays(App) {
                 pictureTagUrl: this.currentUser.pictureTagUrl || null,
                 pictureIsHypertunaPfp: !!this.currentUser.pictureIsHypertunaPfp
             };
+        } else {
+            // Backfill missing fields from the local user cache if discovery profile is incomplete
+            if (!profile.picture && this.currentUser.picture) {
+                profile.picture = this.currentUser.picture;
+            }
+            if (!profile.pictureTagUrl && this.currentUser.pictureTagUrl) {
+                profile.pictureTagUrl = this.currentUser.pictureTagUrl;
+            }
+            if (!profile.pictureIsHypertunaPfp && this.currentUser.pictureIsHypertunaPfp) {
+                profile.pictureIsHypertunaPfp = true;
+            }
         }
 
         if (!profile.pictureTagUrl && profile.picture) {
@@ -1224,7 +1235,7 @@ function integrateNostrRelays(App) {
         if (this.currentUser?.tempAvatarPreview) {
             resolvedPicture = this.currentUser.tempAvatarPreview;
         } else if (profile) {
-            const tagUrl = profile.pictureTagUrl || profile.picture || null;
+            const tagUrl = profile.pictureTagUrl || profile.picture || this.currentUser.picture || null;
             if (tagUrl) {
                 resolvedPicture = HypertunaUtils.resolvePfpUrl(tagUrl, profile.pictureIsHypertunaPfp);
             }
