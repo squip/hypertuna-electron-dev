@@ -599,6 +599,19 @@ class NostrIntegration {
     rejectJoinRequest(groupId, pubkey) {
         this.client.rejectJoinRequest(groupId, pubkey);
     }
+
+    cancelPending(reason = 'cancelled') {
+        if (this.client && typeof this.client.cancelPending === 'function') {
+            this.client.cancelPending(reason);
+        }
+    }
+
+    shutdown({ clearState = true } = {}) {
+        this.connecting = false;
+        if (this.client && typeof this.client.shutdown === 'function') {
+            this.client.shutdown({ clearState });
+        }
+    }
     
     /**
      * Update group metadata

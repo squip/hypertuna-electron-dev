@@ -1010,6 +1010,18 @@
       },
           
           saveUserToLocalStorage() {
+              let explicitLogoutActive = false;
+              try {
+                  explicitLogoutActive = localStorage.getItem('explicit_logout') === 'true';
+              } catch (_) {
+                  explicitLogoutActive = false;
+              }
+
+              if (explicitLogoutActive && this.currentUser) {
+                  console.warn('Skipping user persistence because explicit logout flag is active');
+                  return;
+              }
+
               if (this.currentUser) {
                   localStorage.setItem('nostr_user', JSON.stringify(this.currentUser));
               } else {
@@ -1937,12 +1949,15 @@ const OnboardingFlow = {
     overlayFadeTimeoutId: null,
     lastSessionWasLogout: false,
     suppressAutoAuth: false,
+    abortController: null,
+    pendingOperations: new Set(),
 
     init() {
         console.log('[Onboarding] Initializing onboarding flow');
         this.overlay = document.getElementById('onboarding-overlay');
         this.particles = document.getElementById('onboarding-particles');
-        
+        this.abortController = new AbortController();
+
         if (!this.overlay || !this.particles) {
             console.error('[Onboarding] Required elements not found');
             return;
@@ -2032,7 +2047,7 @@ const OnboardingFlow = {
         this.overlay.style.opacity = '1';
     },
 
-    clearPendingTimers() {
+    clearPendingTimers({ cancelNostr = true } = {}) {
         if (this.splashTimeoutId) {
             clearTimeout(this.splashTimeoutId);
             this.splashTimeoutId = null;
@@ -2044,6 +2059,30 @@ const OnboardingFlow = {
         if (this.overlayFadeTimeoutId) {
             clearTimeout(this.overlayFadeTimeoutId);
             this.overlayFadeTimeoutId = null;
+        }
+        this.cancelPendingOperations({ cancelNostr });
+    },
+
+    cancelPendingOperations({ cancelNostr = true } = {}) {
+        if (this.abortController) {
+            this.abortController.abort();
+        }
+        this.abortController = new AbortController();
+        if (cancelNostr) {
+            this.pendingOperations.forEach(cleanup => {
+                try { cleanup?.(); } catch (error) {
+                    console.error('[Onboarding] Cleanup error during cancellation:', error);
+                }
+            });
+        }
+        this.pendingOperations.clear();
+
+        if (cancelNostr && typeof App !== 'undefined' && App?.nostr && typeof App.nostr.cancelPending === 'function') {
+            try {
+                App.nostr.cancelPending('onboarding-cancel');
+            } catch (error) {
+                console.error('[Onboarding] Failed to cancel pending Nostr operations:', error);
+            }
         }
     },
 
@@ -2081,6 +2120,7 @@ const OnboardingFlow = {
 
         this.lastSessionWasLogout = false;
         this.suppressAutoAuth = false;
+        this.abortController = new AbortController();
     },
 
     startFreshSession({ skipSplash = true, clearPersistedUser = true } = {}) {
@@ -2098,6 +2138,14 @@ const OnboardingFlow = {
             localStorage.setItem('explicit_logout', 'true');
         } catch (error) {
             console.error('[Onboarding] Failed to persist logout flag:', error);
+        }
+
+        if (typeof App !== 'undefined' && App?.nostr && typeof App.nostr.cancelPending === 'function') {
+            try {
+                App.nostr.cancelPending('logout');
+            } catch (error) {
+                console.error('[Onboarding] Failed to cancel Nostr pending operations during logout:', error);
+            }
         }
 
         if (typeof App !== 'undefined' && App) {
@@ -2227,6 +2275,7 @@ const OnboardingFlow = {
             
             // Set as current user in App
             App.currentUser = user;
+            this.markAuthenticated();
             
             // Setup Hypertuna config using existing logic
             console.log('[Onboarding] Setting up Hypertuna config');
@@ -2330,6 +2379,7 @@ const OnboardingFlow = {
             
             // Set as current user
             App.currentUser = user;
+            this.markAuthenticated();
             App.saveUserToLocalStorage();
 
             // Sync config
@@ -2386,6 +2436,8 @@ const OnboardingFlow = {
                 return;
             }
 
+            const localSignal = this.abortController?.signal;
+
             const savedUser = localStorage.getItem('nostr_user');
             if (!savedUser) {
                 console.log('[Onboarding] No saved user, showing welcome');
@@ -2395,19 +2447,45 @@ const OnboardingFlow = {
             
             const user = JSON.parse(savedUser);
             App.currentUser = user;
-            
+
+            if (localSignal?.aborted) {
+                console.log('[Onboarding] Auto-authentication aborted before init');
+                return;
+            }
+
             // Initialize nostr using existing logic
             console.log('[Onboarding] Initializing Nostr for auto-login');
             if (!App.nostr) {
                 App.nostr = new NostrIntegration(App);
             }
-            await App.nostr.init(user);
-            
+            const initCleanup = () => {
+                if (typeof App.nostr?.cancelPending === 'function') {
+                    App.nostr.cancelPending('auto-auth-init');
+                }
+            };
+            this.pendingOperations.add(initCleanup);
+            const initPromise = App.nostr.init(user);
+            try {
+                await initPromise;
+            } finally {
+                this.pendingOperations.delete(initCleanup);
+            }
+
+            if (localSignal?.aborted) {
+                console.log('[Onboarding] Auto-authentication aborted after init');
+                return;
+            }
+
             // Configure discovery relays
             if (App.configureRelays) {
                 await App.configureRelays(App.nostr.relayUrls || [], { skipNetwork: true, includePersisted: true });
             }
-            
+
+            if (localSignal?.aborted) {
+                console.log('[Onboarding] Auto-authentication aborted after relay configuration');
+                return;
+            }
+
             // Fetch latest profile
             try {
                 const profile = await App.nostr.client.fetchUserProfile(user.pubkey);
@@ -2417,7 +2495,12 @@ const OnboardingFlow = {
             } catch (err) {
                 console.warn('[Onboarding] Could not fetch profile during auto-auth:', err);
             }
-            
+
+            if (localSignal?.aborted) {
+                console.log('[Onboarding] Auto-authentication aborted before worker start');
+                return;
+            }
+
             // Start worker using existing logic
             if (window.startWorker) {
                 console.log('[Onboarding] Starting worker');
@@ -2431,10 +2514,15 @@ const OnboardingFlow = {
                     await window.refreshGatewayStatus({ fetchOptions: false });
                 }
             }
-            
+
+            if (localSignal?.aborted) {
+                console.log('[Onboarding] Auto-authentication aborted before completion');
+                return;
+            }
+
             // Complete onboarding
             this.completeOnboarding();
-            
+
         } catch (error) {
             console.error('[Onboarding] Auto-authentication failed:', error);
             this.navigateTo('welcome');
@@ -2444,7 +2532,7 @@ const OnboardingFlow = {
     completeOnboarding() {
         console.log('[Onboarding] Completing onboarding flow');
 
-        this.clearPendingTimers();
+        this.clearPendingTimers({ cancelNostr: false });
         this.ensureOverlayVisible();
         this.markAuthenticated();
 

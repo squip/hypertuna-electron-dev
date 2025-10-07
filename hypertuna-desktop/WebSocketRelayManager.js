@@ -20,7 +20,9 @@ class WebSocketRelayManager {
         this.relayTypes = new Map();
         this.groupRelays = new Map();
         this.discoveryRelays = new Set();
-        
+        this.reconnectTimers = new Set();
+        this.shutdownRequested = false;
+
         // NEW: Add subscription ID counter and mapping
         this.subscriptionCounter = 0;
         this.subscriptionIdMap = new Map(); // Maps original ID to unique short ID
@@ -305,8 +307,16 @@ class WebSocketRelayManager {
             }
         }
     
+        if (this.shutdownRequested) {
+            return Promise.reject(new Error('Relay manager shutting down'));
+        }
+
         return new Promise((resolve, reject) => {
             try {
+                if (this.shutdownRequested) {
+                    reject(new Error('Relay manager shutting down'));
+                    return;
+                }
                 // If token exists, append it back for the actual connection
                 const connectionUrl = token ? `${normalizedUrl}?token=${token}` : normalizedUrl;
                 const ws = new WebSocket(connectionUrl);
@@ -317,7 +327,9 @@ class WebSocketRelayManager {
                     subscriptions: new Map(),
                     pendingMessages: [],
                     type: 'discovery',
-                    authToken: token // Store the token
+                    authToken: token,
+                    preventReconnect: false,
+                    reconnectTimer: null
                 };
                 
                 this.relays.set(normalizedUrl, relayData);
@@ -361,14 +373,24 @@ class WebSocketRelayManager {
                     this.disconnectCallbacks.forEach(callback => callback(url));
                     
                     // Only attempt reconnection if not explicitly prevented
-                    if (!relayData.preventReconnect) {
-                        // Attempt reconnection after delay
-                        setTimeout(() => {
-                            this.addRelay(url).catch(console.error);
+                    if (!relayData.preventReconnect && !this.shutdownRequested) {
+                        const timer = setTimeout(() => {
+                            this.reconnectTimers.delete(timer);
+                            relayData.reconnectTimer = null;
+                            if (!this.shutdownRequested) {
+                                this.addRelay(url).catch(console.error);
+                            }
                         }, 5000);
+                        relayData.reconnectTimer = timer;
+                        this.reconnectTimers.add(timer);
                     } else {
                         // Clean up the relay from our map
                         this.relays.delete(normalizedUrl);
+                        if (relayData.reconnectTimer) {
+                            clearTimeout(relayData.reconnectTimer);
+                            this.reconnectTimers.delete(relayData.reconnectTimer);
+                            relayData.reconnectTimer = null;
+                        }
                     }
                 };
 
@@ -542,6 +564,12 @@ _validateEvent(event) {
         }
 
         const relay = this.relays.get(normalizedKey);
+        relay.preventReconnect = true;
+        if (relay.reconnectTimer) {
+            clearTimeout(relay.reconnectTimer);
+            this.reconnectTimers.delete(relay.reconnectTimer);
+            relay.reconnectTimer = null;
+        }
         if (relay.conn && relay.conn.readyState !== WebSocket.CLOSED) {
             relay.conn.close();
         }
@@ -591,6 +619,50 @@ _validateEvent(event) {
             return null;
         }
         return this.relays.get(cleanUrl).status;
+    }
+
+    cancelAllReconnects() {
+        this.reconnectTimers.forEach(timer => clearTimeout(timer));
+        this.reconnectTimers.clear();
+        this.relays.forEach((relayData) => {
+            relayData.preventReconnect = true;
+            if (relayData.reconnectTimer) {
+                clearTimeout(relayData.reconnectTimer);
+                relayData.reconnectTimer = null;
+            }
+        });
+    }
+
+    shutdown({ clearSubscriptions = true } = {}) {
+        console.log('[WebSocketRelayManager] Shutdown initiated');
+        this.shutdownRequested = true;
+        this.cancelAllReconnects();
+
+        this.relays.forEach((relayData) => {
+            relayData.preventReconnect = true;
+            try {
+                if (relayData.conn && relayData.conn.readyState !== WebSocket.CLOSED) {
+                    relayData.conn.close();
+                }
+            } catch (error) {
+                console.error('[WebSocketRelayManager] Error closing relay during shutdown:', error);
+            }
+        });
+
+        this.relays.clear();
+        this.relayTypes.clear();
+        this.groupRelays.clear();
+        this.discoveryRelays.clear();
+
+        this.requestQueue = [];
+        this.processingQueue = false;
+
+        if (clearSubscriptions) {
+            this.globalSubscriptions.clear();
+            this.subscriptionIdMap.clear();
+            this.reverseSubscriptionMap.clear();
+            this.subscriptionCounter = 0;
+        }
     }
 
     /**

@@ -68,6 +68,8 @@ class NostrGroupClient {
         this.defaultRetryDelay = 1500;
         this.maxRetryDelay = 30000;
         this._authFailureListenerRegistered = false;
+        this.shutdownRequested = false;
+        this.cancelled = false;
 
         this._registerAuthFailureListener();
 
@@ -137,6 +139,8 @@ class NostrGroupClient {
      * @returns {Promise} - Resolves when initialized
      */
     async init(user, relayUrls) {
+        this.cancelled = false;
+        this.shutdownRequested = false;
         // Save user
         this.user = user;
         
@@ -168,11 +172,16 @@ class NostrGroupClient {
      * Initialize with discovery relays only
      */
     async initWithDiscoveryRelays(user, discoveryRelays) {
+        this.cancelled = false;
+        this.shutdownRequested = false;
         this.user = user;
         this.relevantPubkeys.add(user.pubkey);
         
         // Connect only to discovery relays initially
         for (const url of discoveryRelays) {
+            if (this.shutdownRequested || this.cancelled) {
+                throw new Error('Discovery relay initialization cancelled');
+            }
             await this.relayManager.addTypedRelay(url, 'discovery');
         }
         
@@ -322,6 +331,9 @@ class NostrGroupClient {
      * Queue a relay connection attempt
      */
     queueRelayConnection(publicIdentifier, relayUrl) {
+        if (this.shutdownRequested || this.cancelled) {
+            return;
+        }
         if (!this.pendingRelayConnections.has(publicIdentifier)) {
             this.pendingRelayConnections.set(publicIdentifier, {
                 identifier: publicIdentifier,
@@ -374,6 +386,9 @@ class NostrGroupClient {
      * This means the worker has started the relay instance.
      */
     handleRelayInitialized(identifier, gatewayUrl, authToken = null, metadata = {}) {
+        if (this.shutdownRequested || this.cancelled) {
+            return;
+        }
         console.log(`[NostrGroupClient] Relay initialized signal for ${identifier}.`);
         console.log(`[NostrGroupClient] Gateway URL: ${gatewayUrl}, Has token: ${!!authToken}`);
     
@@ -425,6 +440,9 @@ class NostrGroupClient {
     }
     
     async _attemptConnectionIfReady(identifier) {
+        if (this.shutdownRequested || this.cancelled) {
+            return;
+        }
         const connection = this.pendingRelayConnections.get(identifier);
 
         if (!connection) {
@@ -498,6 +516,9 @@ class NostrGroupClient {
     }
 
     async handleRelayRegistered(identifier) {
+        if (this.shutdownRequested || this.cancelled) {
+            return;
+        }
         console.log(`[NostrGroupClient] Relay registered signal for ${identifier}.`);
 
         let targetId = identifier;
@@ -575,6 +596,9 @@ class NostrGroupClient {
     }
 
     _scheduleRelayRetry(identifier, reason, delayOverride) {
+        if (this.shutdownRequested || this.cancelled) {
+            return;
+        }
         const connection = this.pendingRelayConnections.get(identifier);
         if (!connection) {
             return;
@@ -590,6 +614,10 @@ class NostrGroupClient {
         console.log(`[NostrGroupClient] Scheduling retry for ${identifier} in ${delay}ms (${reason})`);
 
         const timer = setTimeout(() => {
+            if (this.shutdownRequested || this.cancelled) {
+                this.connectionRetryTimers.delete(identifier);
+                return;
+            }
             this.connectionRetryTimers.delete(identifier);
             if (!this.pendingRelayConnections.has(identifier)) {
                 return;
@@ -631,6 +659,9 @@ class NostrGroupClient {
      * Handle all relays ready notification
      */
     handleAllRelaysReady() {
+        if (this.shutdownRequested || this.cancelled) {
+            return;
+        }
         console.log(`[NostrGroupClient] All stored relays are ready`);
 
         // Process any remaining pending connections
@@ -644,6 +675,9 @@ class NostrGroupClient {
      * Process all queued relay connections applying any stored readiness info
      */
     processRelayConnectionQueue() {
+        if (this.shutdownRequested || this.cancelled) {
+            return;
+        }
         for (const [identifier, connection] of this.pendingRelayConnections.entries()) {
             if (this.relayReadyStates.has(identifier)) {
                 const state = this.relayReadyStates.get(identifier);
@@ -682,6 +716,9 @@ class NostrGroupClient {
      * Connect to a specific group relay
      */
     async connectToGroupRelay(publicIdentifier, relayUrl) {
+        if (this.shutdownRequested || this.cancelled) {
+            throw new Error('NostrGroupClient shutting down');
+        }
         try {
             let finalUrl = relayUrl;
             if (!finalUrl.includes('token=')) {
@@ -3460,6 +3497,70 @@ async fetchMultipleProfiles(pubkeys) {
                 console.error(`Error in event listener for ${eventName}:`, e);
             }
         });
+    }
+
+    cancelPending(reason = 'cancelled') {
+        console.log(`[NostrGroupClient] Cancelling pending operations (${reason})`);
+        this.cancelled = true;
+        this.pendingRelayConnections.forEach((connection) => {
+            connection.status = 'cancelled';
+        });
+        this.pendingRelayConnections.clear();
+
+        this.connectionRetryTimers.forEach((timer) => clearTimeout(timer));
+        this.connectionRetryTimers.clear();
+
+        if (this.relayManager && typeof this.relayManager.cancelAllReconnects === 'function') {
+            this.relayManager.cancelAllReconnects();
+        }
+
+        Object.values(this._recomputeTimeouts || {}).forEach(timer => clearTimeout(timer));
+        this._recomputeTimeouts = {};
+
+        if (this._pendingMemberUpdates && typeof this._pendingMemberUpdates.forEach === 'function') {
+            this._pendingMemberUpdates.forEach((timer) => clearTimeout(timer));
+            this._pendingMemberUpdates.clear();
+        }
+    }
+
+    shutdown({ clearState = false } = {}) {
+        if (this.shutdownRequested) {
+            return;
+        }
+        console.log('[NostrGroupClient] Shutdown requested');
+        this.shutdownRequested = true;
+        this.cancelled = true;
+        this.cancelPending('shutdown');
+
+        if (this.relayManager && typeof this.relayManager.shutdown === 'function') {
+            this.relayManager.shutdown({ clearSubscriptions: true });
+        }
+
+        if (clearState) {
+            this.user = null;
+            this.isInitialized = false;
+            this.userRelayListEvent = null;
+            this.groups.clear();
+            this.groupMembers.clear();
+            this.groupAdmins.clear();
+            this.groupMessages.clear();
+            this.groupInvites.clear();
+            this.invites.clear();
+            this.joinRequests.clear();
+            this.groupSubscriptions.clear();
+            this.subscriptionsByFilter.clear();
+            this.relayReadyStates.clear();
+            this.relayAuthTokens.clear();
+            this.publicToInternalMap.clear();
+            this.internalToPublicMap.clear();
+            this.relayConnectionAttempts.clear();
+            this.pendingRelayConnections.clear();
+            this.follows.clear();
+            this.relevantPubkeys.clear();
+            this.userRelayIds.clear();
+            this.eventListeners.clear();
+            this.eventCallbacks = [];
+        }
     }
 }
 

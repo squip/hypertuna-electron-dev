@@ -800,27 +800,37 @@ function integrateNostrRelays(App) {
                 }
             }
 
-            if (this.nostr && this.nostr.client) {
-                try {
-                    this.nostr.client.activeSubscriptions.forEach(subId => {
-                        this.nostr.client.relayManager.unsubscribe(subId);
-                    });
-                    this.nostr.client.activeSubscriptions.clear();
+            if (this.nostr) {
+                if (this.nostr.client) {
+                    try {
+                        this.nostr.client.activeSubscriptions.forEach(subId => {
+                            this.nostr.client.relayManager.unsubscribe(subId);
+                        });
+                        this.nostr.client.activeSubscriptions.clear();
 
-                    this.nostr.client.relayManager.getRelays().forEach(url => {
-                        const relay = this.nostr.client.relayManager.relays.get(url);
-                        if (relay && relay.conn) {
-                            relay.preventReconnect = true;
-                            try {
-                                relay.conn.close();
-                            } catch (error) {
-                                console.error('Failed to close relay connection during logout:', error);
+                        this.nostr.client.relayManager.getRelays().forEach(url => {
+                            const relay = this.nostr.client.relayManager.relays.get(url);
+                            if (relay && relay.conn) {
+                                relay.preventReconnect = true;
+                                try {
+                                    relay.conn.close();
+                                } catch (error) {
+                                    console.error('Failed to close relay connection during logout:', error);
+                                }
                             }
-                        }
-                        this.nostr.client.relayManager.relays.delete(url);
-                    });
-                } catch (error) {
-                    console.error('Failed to clean up Nostr integration during logout:', error);
+                            this.nostr.client.relayManager.relays.delete(url);
+                        });
+                    } catch (error) {
+                        console.error('Failed to clean up Nostr integration during logout:', error);
+                    }
+                }
+
+                if (typeof this.nostr.shutdown === 'function') {
+                    try {
+                        this.nostr.shutdown({ clearState: true });
+                    } catch (error) {
+                        console.error('Failed to shutdown Nostr integration during logout:', error);
+                    }
                 }
 
                 this.nostr = null;
@@ -880,7 +890,19 @@ function integrateNostrRelays(App) {
             method: 'saveUserToLocalStorage',
             attempting: true
         });
-        
+
+        let explicitLogoutActive = false;
+        try {
+            explicitLogoutActive = localStorage.getItem('explicit_logout') === 'true';
+        } catch (_) {
+            explicitLogoutActive = false;
+        }
+
+        if (explicitLogoutActive && this.currentUser) {
+            console.warn('Skipping user persistence because explicit logout flag is active');
+            return;
+        }
+
         if (this.currentUser) {
             // Create a clean copy of the user object without any circular references
             const userToSave = {
