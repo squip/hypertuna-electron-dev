@@ -3003,7 +3003,7 @@ members-list,.member-list {
     left: 0;
     width: 100%;
     height: 100vh;
-    background: linear-gradient(135deg, #10162d 0%, #1b3193 100%);
+    background: linear-gradient(135deg, #0a1628 0%, #0d2847 50%, #1a4d6d 100%);
     z-index: 10000;
     display: none;
 }
@@ -3012,6 +3012,118 @@ members-list,.member-list {
     display: block;
 }
 
+/* Static base gradient layer */
+.gradient-base {
+    position: fixed;
+    top: -50%;
+    left: -50%;
+    width: 200%;
+    height: 200%;
+    background: 
+        radial-gradient(ellipse 1200px 900px at 20% 10%, rgba(139, 213, 235, 0.2) 0%, rgba(139, 213, 235, 0.1) 30%, rgba(139, 213, 235, 0.05) 50%, transparent 75%),
+        radial-gradient(ellipse 1000px 1000px at 80% 15%, rgba(180, 230, 255, 0.18) 0%, rgba(180, 230, 255, 0.09) 30%, rgba(180, 230, 255, 0.04) 50%, transparent 75%),
+        radial-gradient(ellipse 900px 750px at 40% 5%, rgba(100, 200, 230, 0.16) 0%, rgba(100, 200, 230, 0.08) 30%, rgba(100, 200, 230, 0.03) 50%, transparent 75%),
+        radial-gradient(ellipse 1300px 1000px at 60% 8%, rgba(200, 240, 255, 0.15) 0%, rgba(200, 240, 255, 0.08) 30%, rgba(200, 240, 255, 0.04) 50%, transparent 75%),
+        radial-gradient(ellipse 950px 950px at 30% 12%, rgba(120, 210, 240, 0.14) 0%, rgba(120, 210, 240, 0.07) 30%, rgba(120, 210, 240, 0.03) 50%, transparent 75%),
+        radial-gradient(ellipse 850px 900px at 70% 3%, rgba(160, 225, 245, 0.16) 0%, rgba(160, 225, 245, 0.08) 30%, rgba(160, 225, 245, 0.03) 50%, transparent 75%);
+    z-index: 0;
+    pointer-events: none;
+    filter: blur(45px);
+}
+
+/* Animated gradient layer 1 */
+.gradient-animated-1 {
+    position: fixed;
+    top: -50%;
+    left: -50%;
+    width: 200%;
+    height: 200%;
+    background: 
+        radial-gradient(ellipse 1200px 900px at 20% 10%, rgba(139, 213, 235, 0.35) 0%, rgba(139, 213, 235, 0.18) 25%, rgba(139, 213, 235, 0.07) 50%, transparent 75%),
+        radial-gradient(ellipse 1000px 1000px at 80% 15%, rgba(180, 230, 255, 0.32) 0%, rgba(180, 230, 255, 0.16) 25%, rgba(180, 230, 255, 0.06) 50%, transparent 75%),
+        radial-gradient(ellipse 900px 750px at 40% 5%, rgba(100, 200, 230, 0.32) 0%, rgba(100, 200, 230, 0.14) 25%, rgba(100, 200, 230, 0.05) 50%, transparent 75%);
+    animation: underwaterWave 6s ease-in-out infinite;
+    z-index: 0;
+    pointer-events: none;
+    filter: blur(45px);
+}
+
+/* Animated gradient layer 2 */
+.gradient-animated-2 {
+    position: fixed;
+    top: -50%;
+    left: -50%;
+    width: 200%;
+    height: 200%;
+    background: 
+        radial-gradient(ellipse 1300px 1000px at 60% 8%, rgba(200, 240, 255, 0.3) 0%, rgba(200, 240, 255, 0.14) 25%, rgba(200, 240, 255, 0.06) 50%, transparent 75%),
+        radial-gradient(ellipse 950px 950px at 30% 12%, rgba(120, 210, 240, 0.28) 0%, rgba(120, 210, 240, 0.13) 25%, rgba(120, 210, 240, 0.05) 50%, transparent 75%),
+        radial-gradient(ellipse 850px 900px at 70% 3%, rgba(160, 225, 245, 0.28) 0%, rgba(160, 225, 245, 0.13) 25%, rgba(160, 225, 245, 0.05) 50%, transparent 75%);
+    animation: underwaterWave2 8s ease-in-out infinite;
+    z-index: 0;
+    pointer-events: none;
+    filter: blur(55px);
+}
+
+@keyframes underwaterWave {
+    0% {
+        transform: translate(0, 0) scale(1);
+        opacity: 0.25;
+    }
+    15% {
+        transform: translate(-6%, -2%) scale(1.03);
+        opacity: 0.65;
+    }
+    35% {
+        transform: translate(4%, 3%) scale(0.97);
+        opacity: 0.95;
+    }
+    50% {
+        transform: translate(3%, 6%) scale(1.02);
+        opacity: 1;
+    }
+    70% {
+        transform: translate(-4%, 4%) scale(0.98);
+        opacity: 0.85;
+    }
+    85% {
+        transform: translate(-2%, -3%) scale(1.01);
+        opacity: 0.5;
+    }
+    100% {
+        transform: translate(0, 0) scale(1);
+        opacity: 0.25;
+    }
+}
+
+@keyframes underwaterWave2 {
+    0% {
+        transform: translate(0, 0) scale(1) rotate(0deg);
+        opacity: 0.25;
+    }
+    20% {
+        transform: translate(5%, -4%) scale(1.04) rotate(0.8deg);
+        opacity: 0.6;
+    }
+    40% {
+        transform: translate(-3%, 5%) scale(0.96) rotate(-0.5deg);
+        opacity: 0.9;
+    }
+    60% {
+        transform: translate(-5%, 7%) scale(1.02) rotate(-1deg);
+        opacity: 1;
+    }
+    80% {
+        transform: translate(4%, -2%) scale(0.98) rotate(0.5deg);
+        opacity: 0.7;
+    }
+    100% {
+        transform: translate(0, 0) scale(1) rotate(0deg);
+        opacity: 0.25;
+    }
+}
+
+/* Bubble particles - UPDATED */
 .onboarding-particles {
     position: fixed;
     top: 0;
@@ -3020,28 +3132,192 @@ members-list,.member-list {
     height: 100%;
     pointer-events: none;
     z-index: 0;
+    overflow: hidden;
 }
 
 .onboarding-particle {
     position: absolute;
-    width: 6px;
-    height: 6px;
-    background: white;
+    bottom: -50px;
     border-radius: 50%;
-    opacity: 0.6;
-    animation: onboardingParticleFloat 4s infinite;
+    background: rgba(255, 255, 255, 0.1);
+    border: 1px solid rgba(255, 255, 255, 0.3);
+    backdrop-filter: blur(2px);
+    opacity: 0;
 }
 
-@keyframes onboardingParticleFloat {
+@keyframes float-bubble-1 {
     0% {
-        transform: translateY(100vh) translateX(0) scale(0);
+        bottom: -50px;
         opacity: 0;
+        transform: translateX(0);
     }
-    10% { opacity: 0.6; }
-    90% { opacity: 0.6; }
+    10% {
+        opacity: 0.6;
+    }
+    50% {
+        transform: translateX(20px);
+    }
+    90% {
+        opacity: 0.6;
+    }
     100% {
-        transform: translateY(-100px) translateX(50px) scale(1);
+        bottom: 110%;
         opacity: 0;
+        transform: translateX(-10px);
+    }
+}
+
+@keyframes float-bubble-2 {
+    0% {
+        bottom: -50px;
+        opacity: 0;
+        transform: translateX(0);
+    }
+    10% {
+        opacity: 0.5;
+    }
+    50% {
+        transform: translateX(-30px);
+    }
+    90% {
+        opacity: 0.5;
+    }
+    100% {
+        bottom: 110%;
+        opacity: 0;
+        transform: translateX(15px);
+    }
+}
+
+@keyframes float-bubble-3 {
+    0% {
+        bottom: -50px;
+        opacity: 0;
+        transform: translateX(0);
+    }
+    10% {
+        opacity: 0.7;
+    }
+    50% {
+        transform: translateX(15px);
+    }
+    90% {
+        opacity: 0.7;
+    }
+    100% {
+        bottom: 110%;
+        opacity: 0;
+        transform: translateX(-20px);
+    }
+}
+
+@keyframes float-bubble-4 {
+    0% {
+        bottom: -50px;
+        opacity: 0;
+        transform: translateX(0);
+    }
+    10% {
+        opacity: 0.55;
+    }
+    50% {
+        transform: translateX(-15px);
+    }
+    90% {
+        opacity: 0.55;
+    }
+    100% {
+        bottom: 110%;
+        opacity: 0;
+        transform: translateX(25px);
+    }
+}
+
+@keyframes float-bubble-5 {
+    0% {
+        bottom: -50px;
+        opacity: 0;
+        transform: translateX(0);
+    }
+    10% {
+        opacity: 0.65;
+    }
+    50% {
+        transform: translateX(10px);
+    }
+    90% {
+        opacity: 0.65;
+    }
+    100% {
+        bottom: 110%;
+        opacity: 0;
+        transform: translateX(-15px);
+    }
+}
+
+@keyframes float-bubble-6 {
+    0% {
+        bottom: -50px;
+        opacity: 0;
+        transform: translateX(0);
+    }
+    10% {
+        opacity: 0.6;
+    }
+    50% {
+        transform: translateX(-20px);
+    }
+    90% {
+        opacity: 0.6;
+    }
+    100% {
+        bottom: 110%;
+        opacity: 0;
+        transform: translateX(10px);
+    }
+}
+
+@keyframes float-bubble-7 {
+    0% {
+        bottom: -50px;
+        opacity: 0;
+        transform: translateX(0);
+    }
+    10% {
+        opacity: 0.75;
+    }
+    50% {
+        transform: translateX(25px);
+    }
+    90% {
+        opacity: 0.75;
+    }
+    100% {
+        bottom: 110%;
+        opacity: 0;
+        transform: translateX(-5px);
+    }
+}
+
+@keyframes float-bubble-8 {
+    0% {
+        bottom: -50px;
+        opacity: 0;
+        transform: translateX(0);
+    }
+    10% {
+        opacity: 0.5;
+    }
+    50% {
+        transform: translateX(-10px);
+    }
+    90% {
+        opacity: 0.5;
+    }
+    100% {
+        bottom: 110%;
+        opacity: 0;
+        transform: translateX(20px);
     }
 }
 

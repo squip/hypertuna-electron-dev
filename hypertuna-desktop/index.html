@@ -17,17 +17,23 @@
 </head>
 <body>
     <!-- Onboarding Overlay -->
-<div id="onboarding-overlay" class="onboarding-overlay">
-    <div class="onboarding-particles" id="onboarding-particles"></div>
-
-    <!-- Splash Screen -->
-    <div id="onboarding-splash" class="onboarding-page active">
-        <div class="onboarding-splash">
-            <div class="onboarding-logo-container">
-                <img src="hypertuna-logo.png" alt="Hypertuna Logo" class="onboarding-logo">
+    <div id="onboarding-overlay" class="onboarding-overlay">
+        <!-- Gradient layers -->
+        <div class="gradient-base"></div>
+        <div class="gradient-animated-1"></div>
+        <div class="gradient-animated-2"></div>
+        
+        <!-- Bubble particles -->
+        <div class="onboarding-particles" id="onboarding-particles"></div>
+    
+        <!-- Splash Screen -->
+        <div id="onboarding-splash" class="onboarding-page active">
+            <div class="onboarding-splash">
+                <div class="onboarding-logo-container">
+                    <img src="hypertuna-logo.png" alt="Hypertuna Logo" class="onboarding-logo">
+                </div>
             </div>
         </div>
-    </div>
 
     <!-- Welcome/Login Page -->
     <div id="onboarding-welcome" class="onboarding-page">
@@ -1948,17 +1954,31 @@ const OnboardingFlow = {
     },
     
     createParticles() {
-        const particleCount = 15;
-        for (let i = 0; i < particleCount; i++) {
-            const particle = document.createElement('div');
-            particle.className = 'onboarding-particle';
-            particle.style.left = Math.random() * 100 + '%';
-            particle.style.animationDelay = Math.random() * 4 + 's';
-            particle.style.animationDuration = (Math.random() * 3 + 3) + 's';
-            this.particles.appendChild(particle);
-        }
-    },
+    const particleCount = 8; // Increased from 15
+    const particleStyles = [
+        { width: '15px', height: '15px', left: '20%', animation: 'float-bubble-1 8s ease-in-out infinite' },
+        { width: '25px', height: '25px', left: '35%', animation: 'float-bubble-2 10s ease-in-out infinite', delay: '2s' },
+        { width: '10px', height: '10px', left: '50%', animation: 'float-bubble-3 7s ease-in-out infinite', delay: '4s' },
+        { width: '20px', height: '20px', left: '65%', animation: 'float-bubble-4 9s ease-in-out infinite', delay: '1s' },
+        { width: '12px', height: '12px', left: '80%', animation: 'float-bubble-5 11s ease-in-out infinite', delay: '3s' },
+        { width: '18px', height: '18px', left: '15%', animation: 'float-bubble-6 8.5s ease-in-out infinite', delay: '5s' },
+        { width: '8px', height: '8px', left: '45%', animation: 'float-bubble-7 6s ease-in-out infinite', delay: '2.5s' },
+        { width: '22px', height: '22px', left: '75%', animation: 'float-bubble-8 9.5s ease-in-out infinite', delay: '4.5s' }
+    ];
     
+    particleStyles.forEach((style, i) => {
+        const particle = document.createElement('div');
+        particle.className = 'onboarding-particle';
+        particle.style.width = style.width;
+        particle.style.height = style.height;
+        particle.style.left = style.left;
+        particle.style.animation = style.animation;
+        if (style.delay) {
+            particle.style.animationDelay = style.delay;
+        }
+        this.particles.appendChild(particle);
+    });
+},
     setupEventListeners() {
         // Welcome page buttons
         const btnCreate = document.getElementById('onboarding-btn-create');
