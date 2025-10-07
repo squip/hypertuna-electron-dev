@@ -25,6 +25,49 @@ const ELECTRON_CONFIG_PATH = 'electron-storage/relay-config.json';
 function integrateNostrRelays(App) {
     console.log('Integrating nostr relays with Hypertuna support...');
     
+    let workerBridgeReadyPromise = null;
+    const ensureWorkerBridgeReady = () => {
+        if (typeof window.sendWorkerCommand === 'function') {
+            return Promise.resolve();
+        }
+        if (workerBridgeReadyPromise) return workerBridgeReadyPromise;
+
+        workerBridgeReadyPromise = new Promise((resolve) => {
+            const handler = () => {
+                if (typeof window.sendWorkerCommand === 'function') {
+                    window.removeEventListener('worker-bridge-ready', handler);
+                    resolve();
+                }
+            };
+            window.addEventListener('worker-bridge-ready', handler);
+            // In case the event already fired before we registered the listener
+            setTimeout(handler, 0);
+        });
+
+        return workerBridgeReadyPromise;
+    };
+
+    const sendToWorkerQueued = async (message, options = {}) => {
+        await ensureWorkerBridgeReady().catch(() => {});
+        if (typeof window.sendWorkerCommand === 'function') {
+            return window.sendWorkerCommand(message, options);
+        }
+        if (isElectron && electronAPI?.sendToWorker) {
+            const result = await electronAPI.sendToWorker(message);
+            if (result?.success === false && /Worker not running/i.test(result?.error || '')) {
+                if (typeof window.startWorker === 'function') {
+                    try { await window.startWorker(); } catch (_) {}
+                }
+                await ensureWorkerBridgeReady().catch(() => {});
+                if (typeof window.sendWorkerCommand === 'function') {
+                    return window.sendWorkerCommand(message, options);
+                }
+            }
+            return result;
+        }
+        throw new Error('Worker messaging unavailable');
+    };
+
     // Save original methods before replacing them - check if they exist first
     const originalMethods = {};
     
@@ -640,6 +683,19 @@ function integrateNostrRelays(App) {
         }
         return btoa(binary);
     };
+
+    const inferExtension = (mimeType, fileName = '') => {
+        const fromName = (fileName || '').match(/\.[a-z0-9]+$/i);
+        if (fromName) return fromName[0];
+        switch ((mimeType || '').toLowerCase()) {
+            case 'image/png': return '.png';
+            case 'image/jpeg':
+            case 'image/jpg': return '.jpg';
+            case 'image/webp': return '.webp';
+            case 'image/gif': return '.gif';
+            default: return '.bin';
+        }
+    };
     
 
     
@@ -765,6 +821,10 @@ function integrateNostrRelays(App) {
             localStorage.setItem('explicit_logout', 'true');
         } catch (error) {
             console.error('Failed to set explicit logout flag:', error);
+        }
+
+        if (typeof window.prunePfpQueueForOwner === 'function' && this.currentUser?.pubkey) {
+            window.prunePfpQueueForOwner(this.currentUser.pubkey);
         }
 
         const clearUserData = () => {
@@ -1297,44 +1357,225 @@ function integrateNostrRelays(App) {
             const pictureUrl = `${baseUrl}/pfp/${owner}/${fileName}`;
             const tagUrl = `${baseUrl}/pfp/${owner}/${fileName}`;
 
-            if (isElectron && electronAPI?.sendToWorker) {
-                await electronAPI.sendToWorker({
-                    type: 'upload-pfp',
-                    data: {
-                        owner,
-                        fileHash,
-                        metadata: {
-                            mimeType: result.mimeType,
-                            filename: fileName
-                        },
-                        buffer: base64
-                    }
-                }).catch((err) => {
-                    console.error('Failed to send avatar to worker:', err);
-                });
-            }
-
-            this.pendingProfileAvatar = {
+            const pendingAvatar = {
                 fileHash,
                 extension: result.extension,
                 mimeType: result.mimeType,
                 owner,
                 pictureUrl,
                 tagUrl,
-                preview: result.preview
+                preview: result.preview,
+                status: 'selected',
+                error: null,
+                previousPicture: this.currentUser.picture || null,
+                previousTagUrl: this.currentUser.pictureTagUrl || null,
+                previousIsHypertuna: !!this.currentUser.pictureIsHypertunaPfp
             };
+
+            this.pendingProfileAvatar = pendingAvatar;
 
             this.currentUser.picture = pictureUrl;
             this.currentUser.pictureTagUrl = tagUrl;
             this.currentUser.pictureIsHypertunaPfp = true;
             this.currentUser.tempAvatarPreview = result.preview;
+            this.currentUser.expectedPfpFileHash = fileHash;
             this.saveUserToLocalStorage();
             this.updateProfileDisplay();
+            console.log('[Avatar] queued selection', { owner, fileHash, mime: result.mimeType });
 
-            await this.updateProfile({ silent: true });
+            await this.updateProfile({ silent: true, omitPendingAvatar: true });
+
+            if (isElectron) {
+                pendingAvatar.status = 'queued';
+                const queueTask = {
+                    owner,
+                    fileHash,
+                    metadata: {
+                        mimeType: result.mimeType,
+                        filename: fileName
+                    },
+                    buffer: base64,
+                    pictureUrl,
+                    tagUrl,
+                    preview: result.preview,
+                    createdAt: Date.now(),
+                    pendingAvatar
+                };
+
+                if (typeof window.enqueuePfpUpload === 'function') {
+                    if (typeof window.prunePfpQueueForOwner === 'function') {
+                        window.prunePfpQueueForOwner(owner, fileHash);
+                    }
+                    window.enqueuePfpUpload(queueTask);
+                    console.log('[Avatar] enqueued durable upload task', { owner, fileHash });
+                } else {
+                    console.warn('[App] enqueuePfpUpload unavailable; aborting avatar upload');
+                    await this.handlePendingAvatarUploadFailure(pendingAvatar, new Error('PFP upload queue unavailable'));
+                }
+            }
         } catch (error) {
             console.error('Error updating profile avatar:', error);
             alert('Failed to update avatar: ' + error.message);
+        }
+    };
+
+    App.finalizePendingAvatarUpload = async function(pendingAvatar) {
+        if (!pendingAvatar) return;
+
+        if (this.currentUser?.expectedPfpFileHash && this.currentUser.expectedPfpFileHash !== pendingAvatar.fileHash) {
+            console.warn('Ignoring stale avatar upload confirmation for', pendingAvatar.fileHash);
+            return;
+        }
+
+        try {
+            await this.updateProfile({ silent: true, forcePicture: pendingAvatar });
+        } catch (error) {
+            console.error('Failed to publish Hypertuna avatar:', error);
+            throw error;
+        }
+
+        if (this.pendingProfileAvatar && this.pendingProfileAvatar.fileHash === pendingAvatar.fileHash) {
+            this.pendingProfileAvatar = null;
+        }
+
+        delete this.currentUser.tempAvatarPreview;
+        this.currentUser.picture = pendingAvatar.pictureUrl;
+        this.currentUser.pictureTagUrl = pendingAvatar.tagUrl;
+        this.currentUser.pictureIsHypertunaPfp = true;
+        this.currentUser.expectedPfpFileHash = null;
+        this.saveUserToLocalStorage();
+        this.updateProfileDisplay();
+        console.log('[Avatar] finalized uploaded image', { owner: pendingAvatar.owner, fileHash: pendingAvatar.fileHash });
+    };
+
+    App.handlePfpUploadConfirmed = async function(pendingAvatar) {
+        if (!pendingAvatar) return;
+        console.log('[Avatar] confirmation received', { owner: pendingAvatar.owner, fileHash: pendingAvatar.fileHash });
+        try {
+            await this.finalizePendingAvatarUpload(pendingAvatar);
+        } catch (error) {
+            console.error('Failed to finalize avatar after upload confirmation:', error);
+        }
+    };
+
+    if (Array.isArray(window.pendingPfpConfirmations) && window.pendingPfpConfirmations.length) {
+        const confirmations = [...window.pendingPfpConfirmations];
+        window.pendingPfpConfirmations.length = 0;
+        confirmations.forEach((entry) => {
+            try {
+                console.log('[Avatar] processing deferred confirmation', { owner: entry.owner, fileHash: entry.fileHash });
+                App.handlePfpUploadConfirmed(entry);
+            } catch (err) {
+                console.error('Failed to process pending PFP confirmation:', err);
+            }
+        });
+    }
+
+    App.handlePendingAvatarUploadFailure = async function(pendingAvatar, error) {
+        if (!pendingAvatar) return;
+
+        console.error('Avatar upload failed:', error);
+
+        if (this.pendingProfileAvatar && this.pendingProfileAvatar.fileHash === pendingAvatar.fileHash) {
+            this.pendingProfileAvatar = null;
+        }
+
+        pendingAvatar.notifiedFailure = true;
+        delete this.currentUser.tempAvatarPreview;
+        this.currentUser.picture = pendingAvatar.previousPicture || this.currentUser.picture;
+        this.currentUser.pictureTagUrl = pendingAvatar.previousTagUrl || this.currentUser.pictureTagUrl;
+        this.currentUser.pictureIsHypertunaPfp = !!pendingAvatar.previousIsHypertuna;
+        this.currentUser.expectedPfpFileHash = null;
+        this.saveUserToLocalStorage();
+        this.updateProfileDisplay();
+
+        const message = error?.message || error || 'Unknown error';
+        alert('Avatar upload failed: ' + message + '\nUpload will be retried automatically.');
+        console.warn('[Avatar] upload failure recorded; retry scheduled', { owner: pendingAvatar.owner, fileHash: pendingAvatar.fileHash, message });
+    };
+
+    App.processPendingPfpFile = async function(file) {
+        if (!file || !this.currentUser) return;
+        try {
+            console.log('[Avatar] processing pending onboarding PFP file', { name: file.name, size: file.size });
+            const arrayBuffer = await file.arrayBuffer();
+            const buffer = new Uint8Array(arrayBuffer);
+            const fileHash = await NostrUtils.computeSha256(buffer);
+            const base64 = uint8ArrayToBase64(buffer);
+            const mimeType = file.type || 'application/octet-stream';
+            const extension = inferExtension(mimeType, file.name || '');
+            const preview = `data:${mimeType};base64,${base64}`;
+
+            const gatewaySettings = await HypertunaUtils.getGatewaySettings();
+            const cachedSettings = HypertunaUtils.getCachedGatewaySettings() || {};
+            const baseUrl = (gatewaySettings.gatewayUrl || cachedSettings.gatewayUrl || '').replace(/\/$/, '');
+            const owner = this.currentUser.pubkey;
+            const fileName = `${fileHash}${extension}`;
+            const pictureUrl = `${baseUrl}/pfp/${owner}/${fileName}`;
+            const tagUrl = `${baseUrl}/pfp/${owner}/${fileName}`;
+
+            const pendingAvatar = {
+                fileHash,
+                extension,
+                mimeType,
+                owner,
+                pictureUrl,
+                tagUrl,
+                preview,
+                status: 'queued',
+                error: null,
+                previousPicture: this.currentUser.picture || null,
+                previousTagUrl: this.currentUser.pictureTagUrl || null,
+                previousIsHypertuna: !!this.currentUser.pictureIsHypertunaPfp
+            };
+
+            this.pendingProfileAvatar = pendingAvatar;
+            this.currentUser.picture = pictureUrl;
+            this.currentUser.pictureTagUrl = tagUrl;
+            this.currentUser.pictureIsHypertunaPfp = true;
+            this.currentUser.tempAvatarPreview = preview;
+            this.currentUser.expectedPfpFileHash = fileHash;
+            this.saveUserToLocalStorage();
+            this.updateProfileDisplay();
+            console.log('[Avatar] prepared onboarding avatar', { owner, fileHash, mimeType });
+
+            await this.updateProfile({ silent: true, omitPendingAvatar: true });
+
+            const queueTask = {
+                owner,
+                fileHash,
+                metadata: {
+                    mimeType,
+                    filename: fileName
+                },
+                buffer: base64,
+                pictureUrl,
+                tagUrl,
+                preview,
+                createdAt: Date.now(),
+                pendingAvatar
+            };
+
+            if (typeof window.enqueuePfpUpload === 'function') {
+                if (typeof window.prunePfpQueueForOwner === 'function') {
+                    window.prunePfpQueueForOwner(owner, fileHash);
+                }
+                window.enqueuePfpUpload(queueTask);
+                console.log('[Avatar] enqueued onboarding PFP upload', { owner, fileHash });
+            } else {
+                console.warn('[Avatar] enqueuePfpUpload unavailable during onboarding');
+                await this.handlePendingAvatarUploadFailure(pendingAvatar, new Error('PFP upload queue unavailable'));
+            }
+
+            if (this.currentUser.pendingPfpFile) {
+                delete this.currentUser.pendingPfpFile;
+                this.saveUserToLocalStorage();
+            }
+        } catch (error) {
+            console.error('[Avatar] Failed to process pending onboarding PFP file:', error);
+            if (this.pendingProfileAvatar) {
+                await this.handlePendingAvatarUploadFailure(this.pendingProfileAvatar, error);
+            }
         }
     };
 
@@ -1353,8 +1594,8 @@ function integrateNostrRelays(App) {
             const fileName = `${fileHash}${result.extension}`;
             const pictureUrl = `${baseUrl}/pfp/${fileName}`;
 
-            if (isElectron && electronAPI?.sendToWorker) {
-                await electronAPI.sendToWorker({
+            if (isElectron) {
+                await sendToWorkerQueued({
                     type: 'upload-pfp',
                     data: {
                         owner: '',
@@ -1365,6 +1606,9 @@ function integrateNostrRelays(App) {
                         },
                         buffer: base64
                     }
+                }, {
+                    requirePfpDrive: true,
+                    description: 'relay avatar upload'
                 }).catch((err) => {
                     console.error('Failed to send relay avatar to worker:', err);
                 });
@@ -1404,8 +1648,8 @@ function integrateNostrRelays(App) {
             const fileName = `${fileHash}${result.extension}`;
             const pictureUrl = `${baseUrl}/pfp/${fileName}`;
 
-            if (isElectron && electronAPI?.sendToWorker) {
-                await electronAPI.sendToWorker({
+            if (isElectron) {
+                await sendToWorkerQueued({
                     type: 'upload-pfp',
                     data: {
                         owner: '',
@@ -1416,6 +1660,9 @@ function integrateNostrRelays(App) {
                         },
                         buffer: base64
                     }
+                }, {
+                    requirePfpDrive: true,
+                    description: 'relay avatar upload'
                 }).catch((err) => {
                     console.error('Failed to send relay avatar to worker:', err);
                 });
@@ -4159,43 +4406,67 @@ App.setupFollowingModalListeners = function() {
      */
     App.updateProfile = async function(options = {}) {
         if (!this.currentUser) return;
-        
+
+        const {
+            silent = false,
+            omitPendingAvatar = false,
+            forcePicture = null
+        } = options;
+
         const name = document.getElementById('profile-name-input').value.trim();
         const about = document.getElementById('profile-about-input').value.trim();
         const profileTags = [];
         const profileUpdate = { name, about };
 
-        if (this.pendingProfileAvatar) {
-            profileUpdate.picture = this.pendingProfileAvatar.pictureUrl;
-            profileTags.push(['picture', this.pendingProfileAvatar.tagUrl, 'hypertuna:drive:pfp']);
+        let pictureSource = null;
+
+        if (forcePicture) {
+            pictureSource = { ...forcePicture, fromPending: true };
+        } else if (!omitPendingAvatar && this.pendingProfileAvatar) {
+            pictureSource = { ...this.pendingProfileAvatar, fromPending: true };
         } else if (this.currentUser?.picture) {
-            profileUpdate.picture = this.currentUser.picture;
-            if (this.currentUser.pictureIsHypertunaPfp && this.currentUser.pictureTagUrl) {
-                profileTags.push(['picture', this.currentUser.pictureTagUrl, 'hypertuna:drive:pfp']);
+            pictureSource = {
+                pictureUrl: this.currentUser.picture,
+                tagUrl: this.currentUser.pictureTagUrl,
+                fromHypertuna: !!this.currentUser.pictureIsHypertunaPfp
+            };
+        }
+
+        if (pictureSource?.pictureUrl) {
+            profileUpdate.picture = pictureSource.pictureUrl;
+            if (pictureSource.tagUrl && (pictureSource.fromPending || pictureSource.fromHypertuna || forcePicture)) {
+                profileTags.push(['picture', pictureSource.tagUrl, 'hypertuna:drive:pfp']);
             }
         }
-        
+
         try {
             await this.nostr.updateProfile(profileUpdate, { tags: profileTags });
-            
-            // Update user profile metadata
+
             this.currentUser.name = name;
             this.currentUser.about = about;
-            if (profileUpdate.picture) {
-                this.currentUser.picture = profileUpdate.picture;
+
+            if (pictureSource?.pictureUrl) {
+                this.currentUser.picture = pictureSource.pictureUrl;
+                if (pictureSource.tagUrl) {
+                    this.currentUser.pictureTagUrl = pictureSource.tagUrl;
+                }
+                if (pictureSource.fromPending || pictureSource.fromHypertuna || forcePicture) {
+                    this.currentUser.pictureIsHypertunaPfp = true;
+                }
             }
-            if (this.pendingProfileAvatar) {
+
+            if (forcePicture && this.pendingProfileAvatar && this.pendingProfileAvatar.fileHash === forcePicture.fileHash) {
+                this.pendingProfileAvatar = null;
+                delete this.currentUser.tempAvatarPreview;
+            } else if (!omitPendingAvatar && this.pendingProfileAvatar && !forcePicture) {
                 this.pendingProfileAvatar = null;
                 delete this.currentUser.tempAvatarPreview;
             }
-            
-            // Save to localStorage
+
             this.saveUserToLocalStorage();
-            
-            // Update profile display
             this.updateProfileDisplay();
-            
-            if (!options.silent) {
+
+            if (!silent) {
                 alert('Profile updated successfully');
             }
         } catch (e) {

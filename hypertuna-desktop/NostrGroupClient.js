@@ -13,7 +13,10 @@ import { prepareFileAttachment } from './FileAttachmentHelper.js';
 const electronAPI = window.electronAPI || null;
 const isElectron = !!electronAPI;
 
-function sendWorkerMessage(message) {
+function sendWorkerMessage(message, options = {}) {
+    if (typeof window.sendWorkerCommand === 'function') {
+        return window.sendWorkerCommand(message, options);
+    }
     if (!isElectron || !electronAPI?.sendToWorker) {
         return Promise.resolve({ success: false, error: 'Worker bridge unavailable' });
     }

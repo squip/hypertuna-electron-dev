@@ -40,6 +40,12 @@ let pendingRelayMessages = {
 }
 window.pendingRelayMessages = pendingRelayMessages
 
+// PFP upload queue persisted locally
+const PFP_QUEUE_STORAGE_KEY = 'hypertuna_pfp_upload_queue_v1'
+let pfpUploadQueue = []
+let pfpQueueProcessing = false
+let pfpQueueFlushTimer = null
+
 // Promise resolution for swarm key
 let swarmKeyPromise = null
 let swarmKeyResolver = null
@@ -47,6 +53,475 @@ let swarmKeyResolver = null
 // Track initialization state
 let isInitialized = false
 let eventListenersAttached = false
+
+// Worker command queue + readiness tracking
+const workerQueue = []
+let workerQueueProcessing = false
+let workerQueueFlushTimer = null
+let workerInitializedFlag = false
+let workerPfpReady = false
+const pendingPfpUploads = new Map()
+const pendingPfpConfirmations = []
+
+const defaultQueueOptions = {
+  requireWorker: true,
+  requireInitialized: true,
+  requirePfpDrive: false,
+  autoStart: true,
+  maxAttempts: 5,
+  retryDelayMs: 500,
+  retryOnFail: true,
+  description: 'worker message'
+}
+
+function makeQueueKey(owner = '', fileHash = '') {
+  return `${owner || ''}:${fileHash || ''}`
+}
+
+function getQueueOptions(options = {}) {
+  return { ...defaultQueueOptions, ...(options || {}) }
+}
+
+function canSendWorkerMessage(options) {
+  if (options.requireWorker && !workerActive) return false
+  if (options.requireInitialized && !workerInitializedFlag) return false
+  if (options.requirePfpDrive && !workerPfpReady) return false
+  return true
+}
+
+function scheduleWorkerQueueFlush(delay = 0) {
+  if (workerQueueFlushTimer) {
+    clearTimeout(workerQueueFlushTimer)
+    workerQueueFlushTimer = null
+  }
+  workerQueueFlushTimer = setTimeout(() => {
+    workerQueueFlushTimer = null
+    processWorkerQueue().catch((err) => {
+      console.error('[App] Worker queue flush failed:', err)
+    })
+  }, delay)
+}
+
+function markWorkerInitialized(value) {
+  const next = !!value
+  if (workerInitializedFlag !== next) {
+    workerInitializedFlag = next
+    if (next) {
+      scheduleWorkerQueueFlush(0)
+      schedulePfpQueueFlush(0)
+    }
+  }
+}
+
+function markWorkerPfpReady(value) {
+  const next = !!value
+  if (workerPfpReady !== next) {
+    workerPfpReady = next
+    if (next) {
+      scheduleWorkerQueueFlush(0)
+      schedulePfpQueueFlush(0)
+    }
+  }
+}
+
+function resetWorkerReadiness(reason = null) {
+  if (reason) {
+    console.warn('[App] Resetting worker readiness:', reason)
+  }
+  workerInitializedFlag = false
+  workerPfpReady = false
+  workerQueue.forEach((entry) => {
+    entry.nextAttemptAt = Date.now() + entry.options.retryDelayMs
+  })
+  scheduleWorkerQueueFlush(250)
+  failAllPendingPfpUploads(new Error(reason || 'Worker reset'))
+  schedulePfpQueueFlush(2500)
+}
+
+function ensureWorkerForQueue() {
+  if (!isElectron) return
+  if (workerActive) return
+  const needsWorker = workerQueue.some((entry) => entry.options.requireWorker && entry.options.autoStart)
+  if (needsWorker) {
+    startWorker().catch((err) => {
+      console.error('[App] Failed to auto-start worker for queue:', err)
+    })
+  }
+}
+
+function isTransientWorkerError(err) {
+  const message = err?.message || ''
+  if (!message) return false
+  return /Worker not running|IPC send error|channel closed|socket hang up/i.test(message)
+}
+
+async function processWorkerQueue() {
+  if (workerQueueProcessing) return
+  if (!workerQueue.length) return
+  if (!isElectron || !electronAPI?.sendToWorker) {
+    console.warn('[App] Worker queue skipped: electronAPI unavailable')
+    return
+  }
+
+  workerQueueProcessing = true
+  try {
+    let madeProgress = false
+    const now = Date.now()
+
+    for (let i = 0; i < workerQueue.length; ) {
+      const entry = workerQueue[i]
+      if (!entry) {
+        i += 1
+        continue
+      }
+
+      if (!canSendWorkerMessage(entry.options)) {
+        i += 1
+        continue
+      }
+
+      if (entry.nextAttemptAt && entry.nextAttemptAt > now) {
+        i += 1
+        continue
+      }
+
+      try {
+        const result = await electronAPI.sendToWorker(entry.message)
+        if (!result?.success) {
+          throw new Error(result?.error || 'Worker rejected message')
+        }
+        entry.resolve(result)
+        workerQueue.splice(i, 1)
+        madeProgress = true
+        continue
+      } catch (err) {
+        entry.attempts = (entry.attempts || 0) + 1
+        const canRetry = entry.options.retryOnFail && entry.attempts < entry.options.maxAttempts && isTransientWorkerError(err)
+        if (!canRetry) {
+          workerQueue.splice(i, 1)
+          entry.reject(err)
+          console.error('[App] Worker message failed:', entry.options.description, err)
+          continue
+        }
+
+        if (err?.message && /Worker not running/i.test(err.message)) {
+          workerActive = false
+        }
+
+        entry.nextAttemptAt = Date.now() + entry.options.retryDelayMs
+        i += 1
+        ensureWorkerForQueue()
+      }
+    }
+
+    if (madeProgress && workerQueue.length) {
+      scheduleWorkerQueueFlush(0)
+    } else if (workerQueue.length) {
+      const nextRetryIn = workerQueue.reduce((min, entry) => {
+        if (!entry.nextAttemptAt) return min
+        const delta = Math.max(0, entry.nextAttemptAt - Date.now())
+        return min === null ? delta : Math.min(min, delta)
+      }, null)
+      if (nextRetryIn != null) {
+        scheduleWorkerQueueFlush(Math.min(nextRetryIn + 10, 1000))
+      }
+    }
+  } finally {
+    workerQueueProcessing = false
+  }
+}
+
+async function sendWorkerCommand(message, options = {}) {
+  if (!isElectron || !electronAPI?.sendToWorker) {
+    throw new Error('Worker messaging is unavailable outside Electron runtime')
+  }
+
+  const queueOptions = getQueueOptions(options)
+
+  return new Promise((resolve, reject) => {
+    workerQueue.push({
+      message,
+      options: queueOptions,
+      resolve,
+      reject,
+      attempts: 0,
+      nextAttemptAt: 0
+    })
+
+    if (queueOptions.autoStart) {
+      ensureWorkerForQueue()
+    }
+
+    scheduleWorkerQueueFlush(0)
+  })
+}
+
+function waitForPfpAck(owner, fileHash, { timeoutMs = 45000 } = {}) {
+  if (!fileHash) {
+    return Promise.reject(new Error('Missing fileHash for PFP ack wait'))
+  }
+
+  const key = makeQueueKey(owner, fileHash)
+  if (pendingPfpUploads.has(key)) {
+    return pendingPfpUploads.get(key).promise
+  }
+
+  let timeoutId = null
+  let settled = false
+
+  const promise = new Promise((resolve, reject) => {
+    timeoutId = setTimeout(() => {
+      if (settled) return
+      settled = true
+      pendingPfpUploads.delete(key)
+      reject(new Error('PFP upload acknowledgment timed out'))
+    }, Math.max(1000, timeoutMs))
+
+    pendingPfpUploads.set(key, {
+      resolve: (payload) => {
+        if (settled) return
+        settled = true
+        clearTimeout(timeoutId)
+        pendingPfpUploads.delete(key)
+        resolve(payload)
+      },
+      reject: (error) => {
+        if (settled) return
+        settled = true
+        clearTimeout(timeoutId)
+        pendingPfpUploads.delete(key)
+        reject(error)
+      },
+      promise
+    })
+  })
+
+  return promise
+}
+
+function resolvePendingPfpUpload(owner, fileHash, payload = null) {
+  if (!fileHash) return
+  const key = makeQueueKey(owner, fileHash)
+  const entry = pendingPfpUploads.get(key)
+  if (entry?.resolve) {
+    entry.resolve(payload)
+  }
+}
+
+function rejectPendingPfpUpload(owner, fileHash, error) {
+  if (!fileHash) return
+  const key = makeQueueKey(owner, fileHash)
+  const entry = pendingPfpUploads.get(key)
+  if (entry?.reject) {
+    entry.reject(error instanceof Error ? error : new Error(error || 'PFP upload failed'))
+  }
+}
+
+function failAllPendingPfpUploads(error) {
+  if (!pendingPfpUploads.size) return
+  const keys = Array.from(pendingPfpUploads.keys())
+  keys.forEach((key) => {
+    const entry = pendingPfpUploads.get(key)
+    if (entry?.reject) {
+      entry.reject(error instanceof Error ? error : new Error(String(error || 'PFP upload cancelled')))
+    }
+  })
+  pendingPfpUploads.clear()
+}
+
+function enqueuePfpUpload(task) {
+  if (!task || !task.fileHash || !task.buffer) return
+  task.attempts = task.attempts || 0
+  task.nextAttemptAt = null
+  if (task.pendingAvatar && typeof task.pendingAvatar === 'object') {
+    task.pendingAvatar.status = task.pendingAvatar.status || 'queued'
+    task.pendingAvatar.error = null
+    task.pendingAvatar.notifiedFailure = false
+  }
+  console.log('[PFPQueue] enqueue', { owner: task.owner, fileHash: task.fileHash, attempts: task.attempts })
+  const existingIdx = pfpUploadQueue.findIndex((entry) => entry.fileHash === task.fileHash && entry.owner === task.owner)
+  if (existingIdx >= 0) {
+    console.log('[PFPQueue] replacing existing entry', { owner: task.owner, fileHash: task.fileHash })
+    pfpUploadQueue[existingIdx] = task
+  } else {
+    pfpUploadQueue.push(task)
+  }
+  persistPfpQueue()
+  schedulePfpQueueFlush(0)
+}
+
+function removePfpUpload(owner, fileHash) {
+  const idx = pfpUploadQueue.findIndex((entry) => entry.fileHash === fileHash && entry.owner === owner)
+  if (idx >= 0) {
+    pfpUploadQueue.splice(idx, 1)
+    persistPfpQueue()
+    console.log('[PFPQueue] removed entry', { owner, fileHash })
+  }
+}
+
+function prunePfpQueueForOwner(owner, exceptHash = null) {
+  const before = pfpUploadQueue.length
+  pfpUploadQueue = pfpUploadQueue.filter((entry) => {
+    if (!entry) return false
+    if (entry.owner !== owner) return true
+    if (exceptHash && entry.fileHash === exceptHash) return true
+    return false
+  })
+  if (pfpUploadQueue.length !== before) {
+    persistPfpQueue()
+    console.log('[PFPQueue] pruned entries for owner', { owner, exceptHash, removed: before - pfpUploadQueue.length })
+  }
+}
+
+function schedulePfpQueueFlush(delay = 0) {
+  if (pfpQueueFlushTimer) {
+    clearTimeout(pfpQueueFlushTimer)
+    pfpQueueFlushTimer = null
+  }
+  pfpQueueFlushTimer = setTimeout(() => {
+    pfpQueueFlushTimer = null
+    processPfpQueue().catch((err) => {
+      console.error('[App] PFP queue flush failed:', err)
+    })
+  }, delay)
+  console.log('[PFPQueue] scheduled flush', delay)
+}
+
+async function ensureWorkerReadyForPfp () {
+  if (!isElectron) throw new Error('Worker unavailable')
+  if (!workerActive) {
+    await startWorker().catch((err) => {
+      throw new Error(`Failed to start worker: ${err?.message || err}`)
+    })
+  }
+
+  const maxWaitMs = 45000
+  const start = Date.now()
+  while (!workerInitializedFlag || !workerPfpReady) {
+    if (Date.now() - start > maxWaitMs) {
+      throw new Error('Timed out waiting for worker to become ready')
+    }
+    await new Promise((resolve) => setTimeout(resolve, 200))
+  }
+  console.log('[PFPQueue] worker ready (initialized & pfp drive)')
+}
+
+async function processPfpQueue () {
+  if (pfpQueueProcessing) return
+  if (!pfpUploadQueue.length) return
+
+  pfpQueueProcessing = true
+  try {
+    await ensureWorkerReadyForPfp()
+  } catch (err) {
+    console.error('[App] Worker not ready for PFP queue:', err)
+    pfpQueueProcessing = false
+    schedulePfpQueueFlush(2000)
+    return
+  }
+
+  try {
+    console.log('[PFPQueue] processing run start', { queueSize: pfpUploadQueue.length })
+    for (let i = 0; i < pfpUploadQueue.length; ) {
+      const task = pfpUploadQueue[i]
+      if (!task) {
+        pfpUploadQueue.splice(i, 1)
+        persistPfpQueue()
+        continue
+      }
+
+      if (task.nextAttemptAt && task.nextAttemptAt > Date.now()) {
+        console.log('[PFPQueue] skipping until nextAttemptAt', { owner: task.owner, fileHash: task.fileHash, nextAttemptAt: task.nextAttemptAt })
+        i += 1
+        continue
+      }
+
+      const baseOptions = {
+        requirePfpDrive: true,
+        description: 'pfp upload queue'
+      }
+
+      try {
+        if (task.pendingAvatar) {
+          task.pendingAvatar.status = 'processing'
+        }
+        console.log('[PFPQueue] sending to worker', { owner: task.owner, fileHash: task.fileHash, attempts: task.attempts })
+        const ackPromise = waitForPfpAck(task.owner, task.fileHash, { timeoutMs: 60000 })
+        await sendWorkerCommand({
+          type: 'upload-pfp',
+          data: {
+            owner: task.owner,
+            fileHash: task.fileHash,
+            metadata: task.metadata,
+            buffer: task.buffer
+          }
+        }, baseOptions)
+
+        await ackPromise
+        removePfpUpload(task.owner, task.fileHash)
+        const confirmationPayload = task.pendingAvatar ? { ...task.pendingAvatar, status: 'confirmed', notifiedFailure: false } : task
+        if (task.pendingAvatar) {
+          task.pendingAvatar.status = 'confirmed'
+        }
+        console.log('[PFPQueue] worker ack received', { owner: task.owner, fileHash: task.fileHash })
+        if (typeof window.App?.handlePfpUploadConfirmed === 'function') {
+          try { window.App.handlePfpUploadConfirmed(confirmationPayload) } catch (err) { console.warn('[App] handlePfpUploadConfirmed failed:', err) }
+        } else {
+          pendingPfpConfirmations.push(confirmationPayload)
+        }
+        continue
+      } catch (err) {
+        console.error('[App] Failed to process PFP upload task:', err)
+        rejectPendingPfpUpload(task.owner, task.fileHash, err)
+        if (task.attempts == null) task.attempts = 0
+        task.attempts += 1
+        task.lastError = err?.message || String(err)
+        task.nextAttemptAt = Date.now() + Math.min(60000, task.attempts * 4000)
+        if (task.pendingAvatar) {
+          task.pendingAvatar.status = 'retrying'
+          task.pendingAvatar.error = task.lastError
+        }
+        if (task.attempts >= 5 && task.pendingAvatar && !task.pendingAvatar.notifiedFailure && typeof window.App?.handlePendingAvatarUploadFailure === 'function') {
+          task.pendingAvatar.notifiedFailure = true
+          try { window.App.handlePendingAvatarUploadFailure(task.pendingAvatar, err) } catch (notifyErr) { console.warn('[App] handlePendingAvatarUploadFailure failed:', notifyErr) }
+        }
+        pfpUploadQueue[i] = task
+        persistPfpQueue()
+        console.log('[PFPQueue] scheduled retry', { owner: task.owner, fileHash: task.fileHash, attempts: task.attempts, nextAttemptAt: task.nextAttemptAt })
+        i += 1
+        continue
+      }
+    }
+  } finally {
+    pfpQueueProcessing = false
+    const soonest = pfpUploadQueue.reduce((min, entry) => {
+      if (!entry?.nextAttemptAt) return min
+      const delta = Math.max(0, entry.nextAttemptAt - Date.now())
+      return min == null ? delta : Math.min(min, delta)
+    }, null)
+    if (soonest != null) {
+      console.log('[PFPQueue] run complete; next flush in', Math.min(soonest + 50, 60000))
+      schedulePfpQueueFlush(Math.min(soonest + 50, 60000))
+    } else if (pfpUploadQueue.length) {
+      console.log('[PFPQueue] queue non-empty, scheduling watchdog flush')
+      schedulePfpQueueFlush(5000)
+    }
+  }
+}
+
+window.sendWorkerCommand = sendWorkerCommand
+window.waitForPfpAck = waitForPfpAck
+window.rejectPendingPfpUpload = rejectPendingPfpUpload
+window.enqueuePfpUpload = enqueuePfpUpload
+window.schedulePfpQueueFlush = schedulePfpQueueFlush
+window.prunePfpQueueForOwner = prunePfpQueueForOwner
+window.pendingPfpConfirmations = pendingPfpConfirmations
+try {
+  window.dispatchEvent(new Event('worker-bridge-ready'))
+} catch (_) {}
+
+loadPfpQueueFromStorage()
+schedulePfpQueueFlush(1000)
 
 // DOM elements - Initialize after DOM is ready
 let workerStatusIndicator = null
@@ -125,6 +600,53 @@ function formatRelativeTime(value) {
   if (diff < 3_600_000) return `${Math.floor(diff / 60_000)}m ago`
   if (diff < 86_400_000) return `${Math.floor(diff / 3_600_000)}h ago`
   return new Date(timestamp).toLocaleString()
+}
+
+function loadPfpQueueFromStorage () {
+  try {
+    const raw = localStorage.getItem(PFP_QUEUE_STORAGE_KEY)
+    if (!raw) {
+      console.log('[PFPQueue] storage empty')
+      pfpUploadQueue = []
+      return
+    }
+    const parsed = JSON.parse(raw)
+    if (Array.isArray(parsed)) {
+      console.log('[PFPQueue] loaded entries from storage', parsed.length)
+      pfpUploadQueue = parsed
+        .filter(entry => entry && entry.fileHash && entry.buffer)
+        .map(entry => {
+          const normalized = { ...entry }
+          normalized.metadata = entry.metadata && typeof entry.metadata === 'object' ? { ...entry.metadata } : {}
+          if (entry.pendingAvatar && typeof entry.pendingAvatar === 'object') {
+            normalized.pendingAvatar = {
+              ...entry.pendingAvatar,
+              status: entry.pendingAvatar.status || 'queued',
+              error: entry.pendingAvatar.error || null,
+              notifiedFailure: !!entry.pendingAvatar.notifiedFailure
+            }
+          }
+          normalized.attempts = entry.attempts || 0
+          normalized.nextAttemptAt = entry.nextAttemptAt || null
+          return normalized
+        })
+    } else {
+      console.warn('[PFPQueue] invalid storage payload, clearing queue')
+      pfpUploadQueue = []
+    }
+  } catch (err) {
+    console.warn('[App] Failed to load PFP queue from storage:', err)
+    pfpUploadQueue = []
+  }
+}
+
+function persistPfpQueue () {
+  try {
+    localStorage.setItem(PFP_QUEUE_STORAGE_KEY, JSON.stringify(pfpUploadQueue))
+    console.log('[PFPQueue] persisted queue size', pfpUploadQueue.length)
+  } catch (err) {
+    console.warn('[App] Failed to persist PFP queue:', err)
+  }
 }
 
 function buildPublicGatewaySummary() {
@@ -942,6 +1464,7 @@ function attachWorkerEventListeners() {
     updateWorkerStatus('stopped', 'Error');
     workerActive = false;
     stopPolling();
+    resetWorkerReadiness('worker error')
   });
 
   electronAPI.onWorkerExit((code) => {
@@ -949,6 +1472,7 @@ function attachWorkerEventListeners() {
     updateWorkerStatus('stopped', 'Stopped');
     workerActive = false;
     stopPolling();
+    resetWorkerReadiness('worker exit')
   });
 
   electronAPI.onWorkerStdout((output) => {
@@ -1015,6 +1539,10 @@ async function startWorker() {
   swarmKeyPromise = new Promise((resolve) => {
     swarmKeyResolver = resolve;
   });
+
+  markWorkerInitialized(false)
+  markWorkerPfpReady(false)
+  failAllPendingPfpUploads(new Error('Worker restarting'))
 
   if (!isElectron) {
     addLog('Electron runtime not detected. Worker cannot be started.', 'error');
@@ -1130,16 +1658,26 @@ async function startWorker() {
       hasBech32: !!(configMessage.data.nostr_npub && configMessage.data.nostr_nsec)
     });
 
-    const sendResult = await electronAPI.sendToWorker(configMessage);
-    if (!sendResult?.success) {
-      throw new Error(sendResult?.error || 'Failed to deliver config to worker');
-    }
+    await sendWorkerCommand(configMessage, {
+      requireInitialized: false,
+      requirePfpDrive: false,
+      autoStart: false,
+      description: 'worker config delivery',
+      retryOnFail: true
+    })
 
     setTimeout(() => {
       if (workerActive) {
-        electronAPI.sendToWorker(configMessage).catch(() => {});
+        sendWorkerCommand(configMessage, {
+          requireInitialized: false,
+          requirePfpDrive: false,
+          autoStart: false,
+          description: 'worker config refresh',
+          retryOnFail: false,
+          maxAttempts: 1
+        }).catch(() => {})
       }
-    }, 1000);
+    }, 1000)
 
     startPolling();
     startHealthPolling();
@@ -1177,10 +1715,13 @@ async function stopWorker() {
     updateWorkerStatus('stopping', 'Stopping...');
     stopPolling();
 
-    const shutdownResult = await electronAPI.sendToWorker({ type: 'shutdown' });
-    if (!shutdownResult?.success) {
-      throw new Error(shutdownResult?.error || 'Worker did not accept shutdown request');
-    }
+    await sendWorkerCommand({ type: 'shutdown' }, {
+      requireInitialized: false,
+      requirePfpDrive: false,
+      autoStart: false,
+      description: 'worker shutdown command',
+      maxAttempts: 3
+    })
 
     setTimeout(async () => {
       try {
@@ -1193,6 +1734,7 @@ async function stopWorker() {
       } finally {
         workerActive = false;
         updateWorkerStatus('stopped', 'Stopped');
+        resetWorkerReadiness('worker stopped')
       }
     }, 3000);
   } catch (error) {
@@ -1200,6 +1742,7 @@ async function stopWorker() {
     addLog(`Error stopping worker: ${error.message}`, 'error');
     workerActive = false;
     updateWorkerStatus('stopped', 'Error');
+    resetWorkerReadiness('worker stop failed')
   }
 }
 
@@ -1207,6 +1750,12 @@ async function stopWorker() {
 // Handle messages from worker
 async function handleWorkerMessage(message) {
   console.log('[App] Received worker message:', message)
+
+  try {
+    window.dispatchEvent(new CustomEvent('worker-message', { detail: message }))
+  } catch (err) {
+    console.warn('[App] Failed to dispatch worker-message event', err)
+  }
 
   switch (message.type) {
     case 'status':
@@ -1232,6 +1781,7 @@ async function handleWorkerMessage(message) {
             }
         }
         if (message.initialized) {
+                markWorkerInitialized(true)
                 updateWorkerStatus('running', 'Running')
         }
         break
@@ -1257,6 +1807,7 @@ async function handleWorkerMessage(message) {
 
     case 'pfp-drive-key':
       try {
+        markWorkerPfpReady(true)
         const cfg = (await HypertunaUtils.loadConfig()) || {}
         cfg.pfpDriveKey = message.driveKey
         await HypertunaUtils.saveConfig(cfg)
@@ -1276,6 +1827,13 @@ async function handleWorkerMessage(message) {
 
     case 'upload-pfp-complete':
       console.log(`[App] Worker stored avatar owner=${message.owner || 'root'} fileHash=${message.fileHash}`)
+      resolvePendingPfpUpload(message.owner || '', message.fileHash, message)
+      break
+
+    case 'upload-pfp-error':
+      console.error('[App] Worker reported upload-pfp error:', message?.error)
+      rejectPendingPfpUpload(message.owner || '', message.fileHash, message?.error || 'upload-pfp failed')
+      addLog(`Worker upload-pfp error: ${message?.error || 'Unknown error'}`, 'error')
       break
 
     case 'heartbeat':
@@ -1516,9 +2074,15 @@ function startHealthPolling() {
 
   const requestHealth = () => {
     if (workerActive) {
-      electronAPI.sendToWorker({ type: 'get-health' }).catch(() => {});
+      sendWorkerCommand({ type: 'get-health' }, {
+        requirePfpDrive: false,
+        autoStart: false,
+        maxAttempts: 1,
+        retryOnFail: false,
+        description: 'worker health request'
+      }).catch(() => {})
     }
-  };
+  }
 
   requestHealth();
 
@@ -1625,10 +2189,12 @@ async function fetchRelays() {
   if (workerStatus !== 'running' || !workerActive || !isElectron) return;
   
   try {
-    const result = await electronAPI.sendToWorker({ type: 'get-relays' });
-    if (!result?.success) {
-      throw new Error(result?.error || 'Worker rejected get-relays request');
-    }
+    await sendWorkerCommand({ type: 'get-relays' }, {
+      requirePfpDrive: false,
+      autoStart: false,
+      description: 'relay fetch',
+      maxAttempts: 2
+    })
   } catch (error) {
     addLog(`Failed to fetch relays: ${error.message}`, 'error');
   }
@@ -1699,19 +2265,19 @@ async function disconnectRelay(identifier) {
     addLog(`Disconnecting from relay ${displayName}`, 'status');
     
     try {
-      const result = await electronAPI.sendToWorker({
+      await sendWorkerCommand({
         type: 'disconnect-relay',
         data: {
           relayKey: identifier,
           identifier
         }
-      });
+      }, {
+        requirePfpDrive: false,
+        autoStart: false,
+        description: 'disconnect relay'
+      })
 
-      if (!result?.success) {
-        addLog(result?.error || `Failed to disconnect ${displayName}`, 'error');
-      } else {
-        addLog(`Disconnect request sent for ${displayName}`, 'status');
-      }
+      addLog(`Disconnect request sent for ${displayName}`, 'status');
     } catch (error) {
       addLog(`Failed to disconnect ${displayName}: ${error.message}`, 'error');
     }
@@ -1746,14 +2312,14 @@ async function createRelay() {
     
     // Send create relay command to worker
     const fileSharing = true
-    const result = await electronAPI.sendToWorker({
+    await sendWorkerCommand({
       type: 'create-relay',
       data: { name, description, fileSharing }
+    }, {
+      requirePfpDrive: false,
+      autoStart: false,
+      description: 'create relay'
     })
-
-    if (!result?.success) {
-      throw new Error(result?.error || 'Worker rejected create-relay command');
-    }
     
     // Clear inputs
     nameInput.value = ''
@@ -1778,15 +2344,17 @@ async function createRelayInstance(name, description, isPublic, isOpen, fileShar
       else reject(new Error(msg.data.error))
     })
 
-    electronAPI
-      .sendToWorker({
-        type: 'create-relay',
-        data: { name, description, isPublic, isOpen, fileSharing }
-      })
-      .catch((error) => {
-        addLog(`Failed to send create-relay command: ${error.message}`, 'error')
-        reject(error)
-      })
+    sendWorkerCommand({
+      type: 'create-relay',
+      data: { name, description, isPublic, isOpen, fileSharing }
+    }, {
+      requirePfpDrive: false,
+      autoStart: false,
+      description: 'create relay (instance)'
+    }).catch((error) => {
+      addLog(`Failed to send create-relay command: ${error.message}`, 'error')
+      reject(error)
+    })
   })
 }
 
@@ -1818,16 +2386,18 @@ async function joinRelayInstance(publicIdentifier, fileSharing = true) {
     addLog(`Failed to resolve relay host peers: ${err.message}`, 'warn')
   }
 
-  electronAPI
-    .sendToWorker({
-      type: 'start-join-flow',
-      data: { publicIdentifier, fileSharing, hostPeers }
-    })
-      .catch((error) => {
-        addLog(`Failed to start join flow: ${error.message}`, 'error');
-        relayJoinResolvers.delete(publicIdentifier);
-        reject(error);
-      });
+  sendWorkerCommand({
+    type: 'start-join-flow',
+    data: { publicIdentifier, fileSharing, hostPeers }
+  }, {
+    requirePfpDrive: false,
+    autoStart: false,
+    description: 'start join flow'
+  }).catch((error) => {
+    addLog(`Failed to start join flow: ${error.message}`, 'error');
+    relayJoinResolvers.delete(publicIdentifier);
+    reject(error);
+  })
   });
 }
 
@@ -1840,16 +2410,19 @@ async function joinRelayFromInvite(relayKey, name = '', description = '', public
     }
 
     try {
-      electronAPI
-        .sendToWorker({
-          type: 'join-relay',
-          data: { relayKey, name, description, publicIdentifier, authToken, fileSharing }
-        })
+      sendWorkerCommand({
+        type: 'join-relay',
+        data: { relayKey, name, description, publicIdentifier, authToken, fileSharing }
+      }, {
+        requirePfpDrive: false,
+        autoStart: false,
+        description: 'join relay from invite'
+      })
         .then(() => resolve())
         .catch((error) => {
           addLog(`Failed to join relay from invite: ${error.message}`, 'error');
           reject(error);
-        });
+        })
     } catch (err) {
       addLog(`Failed to join relay from invite: ${err.message}`, 'error');
       reject(err);
@@ -1893,14 +2466,14 @@ async function joinRelay() {
     
     // Send join relay command to worker
     const fileSharing = true
-    const result = await electronAPI.sendToWorker({
+    await sendWorkerCommand({
       type: 'join-relay',
       data: { relayKey, name, description, fileSharing }
+    }, {
+      requirePfpDrive: false,
+      autoStart: false,
+      description: 'join relay'
     })
-
-    if (!result?.success) {
-      throw new Error(result?.error || 'Worker rejected join-relay command');
-    }
     
     // Clear inputs
     keyInput.value = ''
@@ -2190,7 +2763,13 @@ window.addEventListener('beforeunload', () => {
   stopPolling();
 
   if (workerActive && isElectron) {
-    electronAPI.sendToWorker({ type: 'shutdown' }).finally(() => {
+    sendWorkerCommand({ type: 'shutdown' }, {
+      requireInitialized: false,
+      requirePfpDrive: false,
+      autoStart: false,
+      description: 'shutdown before unload',
+      maxAttempts: 1
+    }).finally(() => {
       electronAPI.stopWorker();
     });
   }

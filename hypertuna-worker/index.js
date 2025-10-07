@@ -1095,16 +1095,19 @@ async function handleMessageObject(message) {
     }
 
     case 'upload-pfp': {
+      const payload = message?.data || {}
+      const ownerRaw = typeof payload.owner === 'string' ? payload.owner : ''
+      const ownerKey = ownerRaw.trim()
       try {
-        const { owner, fileHash, metadata, buffer } = message.data || {}
+        const { fileHash, metadata, buffer } = payload
         if (!fileHash || !buffer) throw new Error('Missing fileHash or buffer')
-        const ownerKey = typeof owner === 'string' ? owner.trim() : ''
         console.log(`[UploadPfp] begin owner=${ownerKey || 'root'} fileHash=${fileHash} bufLen=${buffer?.length}`)
         const data = b4a.from(buffer, 'base64')
         await storePfpFile(ownerKey, fileHash, data, metadata || null)
         sendMessage({ type: 'upload-pfp-complete', owner: ownerKey, fileHash })
       } catch (err) {
         console.error('[Worker] upload-pfp error:', err)
+        sendMessage({ type: 'upload-pfp-error', owner: ownerKey, fileHash: payload?.fileHash || null, error: err?.message || String(err) })
         sendMessage({ type: 'error', message: `upload-pfp failed: ${err.message}` })
       }
       break

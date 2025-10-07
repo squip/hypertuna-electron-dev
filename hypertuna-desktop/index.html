@@ -2328,6 +2328,17 @@ const OnboardingFlow = {
                 about: bio
             });
 
+            if (user.pendingPfpFile && typeof App.processPendingPfpFile === 'function') {
+                console.log('[Onboarding] Queuing pending profile image for upload');
+                try {
+                    await App.processPendingPfpFile(user.pendingPfpFile);
+                    delete user.pendingPfpFile;
+                    App.saveUserToLocalStorage();
+                } catch (pfpError) {
+                    console.error('[Onboarding] Failed to queue pending PFP file:', pfpError);
+                }
+            }
+
             // Start worker using existing logic
             if (window.startWorker) {
                 console.log('[Onboarding] Starting worker');
