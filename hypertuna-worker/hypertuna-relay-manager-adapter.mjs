@@ -843,6 +843,7 @@ async function connectStoredRelayProfile(profile, config, authStore, options = {
                     timestamp: new Date().toISOString()
                 });
             }
+            emitRelayLoadingEvent({ relayKey, publicIdentifier, name: displayName }, 'relay-error', options);
             return {
                 success: false,
                 relayKey,

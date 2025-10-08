@@ -128,6 +128,14 @@ function integrateNostrRelays(App) {
         currentProgress: 0,
         minProgress: 0.05,
         hideTimeout: null,
+        progressQueue: [],
+        processingProgress: false,
+        progressTimer: null,
+        minStepDuration: 240,
+        completedCount: 0,
+        completedCycle: false,
+        completionTimestamp: 0,
+        fallbackVisited: new Set(),
 
         ensureVisible() {
             if (!this.container) return;
@@ -141,26 +149,52 @@ function integrateNostrRelays(App) {
             }
         },
 
-        setProgress(value, { allowComplete = false } = {}) {
-            if (!this.indicator) return;
-            const capped = allowComplete ? Math.min(Math.max(value, this.currentProgress), 1) : Math.min(Math.max(value, this.currentProgress, this.minProgress), 0.95);
-            if (capped <= this.currentProgress + 0.001) return;
-            this.currentProgress = capped;
-            requestAnimationFrame(() => {
-                this.indicator.style.width = `${Math.round(this.currentProgress * 1000) / 10}%`;
-            });
+        updateLabel() {
+            if (!this.label) return;
+            const observedTotal = Math.max(this.expectedRelays || 0, this.seenRelays.size || 0, this.completedCount || 0);
+            const total = Math.max(observedTotal, 0);
+            const completed = Math.min(Math.max(this.completedRelays.size, this.completedCount || 0), total);
+
+            if (total > 0 && completed < total) {
+                this.label.textContent = `Loading your relays... (${completed}/${total})`;
+            } else if (total > 0 && completed >= total && this.currentProgress >= 0.95) {
+                this.label.textContent = 'Finalizing...';
+            } else if (total === 0) {
+                this.label.textContent = 'Loading your relays...';
+            }
         },
 
-        reset({ hide = false } = {}) {
+        setProgress(value, { allowComplete = false } = {}) {
+            if (!this.indicator) return;
+            const ceiling = allowComplete ? 1 : 0.95;
+            const floor = allowComplete ? Math.max(this.currentProgress, value) : Math.max(this.currentProgress, value, this.minProgress);
+            const capped = Math.min(Math.max(floor, this.currentProgress), ceiling);
+            if (capped <= this.currentProgress + 0.001 && !this.progressQueue.length) return;
+            this.queueProgress(capped, allowComplete);
+        },
+
+        reset({ hide = false, preserveCompletion = false } = {}) {
             if (this.hideTimeout) {
                 clearTimeout(this.hideTimeout);
                 this.hideTimeout = null;
+            }
+            if (this.progressTimer) {
+                clearTimeout(this.progressTimer);
+                this.progressTimer = null;
             }
             this.expectedRelays = null;
             this.completedRelays.clear();
             this.seenRelays.clear();
             this.fallbackIndex = 0;
             this.currentProgress = 0;
+            this.progressQueue = [];
+            this.processingProgress = false;
+            this.completedCount = 0;
+            this.fallbackVisited.clear();
+            if (!preserveCompletion) {
+                this.completedCycle = false;
+                this.completionTimestamp = 0;
+            }
             if (this.indicator) {
                 this.indicator.style.width = '0%';
             }
@@ -168,6 +202,51 @@ function integrateNostrRelays(App) {
                 this.container.classList.add('hidden');
             }
             this.active = !hide;
+            if (this.label) {
+                this.label.textContent = 'Loading your relays...';
+            }
+        },
+
+        queueProgress(value, allowComplete = false) {
+            const target = Math.min(Math.max(value, 0), 1);
+            const reference = this.progressQueue.length
+                ? this.progressQueue[this.progressQueue.length - 1].value
+                : this.currentProgress;
+            if (target <= reference + 0.001) {
+                return;
+            }
+            this.progressQueue.push({ value: target, allowComplete });
+            if (!this.processingProgress) {
+                this.processProgressQueue();
+            }
+        },
+
+        processProgressQueue() {
+            if (!this.progressQueue.length) {
+                this.processingProgress = false;
+                this.progressTimer = null;
+                return;
+            }
+
+            this.processingProgress = true;
+            const { value, allowComplete } = this.progressQueue.shift();
+            const targetWidth = Math.round(value * 1000) / 10;
+            const duration = allowComplete ? Math.max(this.minStepDuration, 300) : this.minStepDuration;
+
+            this.currentProgress = value;
+
+            requestAnimationFrame(() => {
+                if (this.indicator) {
+                    this.indicator.style.width = `${targetWidth}%`;
+                }
+            });
+
+            if (this.progressTimer) {
+                clearTimeout(this.progressTimer);
+            }
+            this.progressTimer = setTimeout(() => {
+                this.processProgressQueue();
+            }, duration);
         },
 
         start(options = {}) {
@@ -180,11 +259,14 @@ function integrateNostrRelays(App) {
                 this.expectedRelays = Math.max(1, options.totalSteps);
             }
             this.setProgress(this.minProgress);
+            this.updateLabel();
         },
 
         noteTotalRelays(count) {
-            if (typeof count !== 'number' || count < 1) return;
-            this.expectedRelays = Math.max(count, this.expectedRelays || 0, this.seenRelays.size || 1);
+            if (typeof count !== 'number' || count < 0) return;
+            const baseline = Math.max(this.seenRelays.size || 0, this.completedRelays.size || 0, this.completedCount || 0);
+            this.expectedRelays = Math.max(count, this.expectedRelays || 0, baseline);
+            this.updateLabel();
         },
 
         registerRelay(relayKey) {
@@ -198,6 +280,7 @@ function integrateNostrRelays(App) {
                     this.expectedRelays = this.seenRelays.size;
                 }
             }
+            this.updateLabel();
         },
 
         markRelayComplete(relayKey) {
@@ -206,28 +289,47 @@ function integrateNostrRelays(App) {
                 this.seenRelays.add(relayKey);
                 this.completedRelays.add(relayKey);
             }
+            this.completedCount = Math.max(this.completedCount, this.completedRelays.size);
             const total = Math.max(this.expectedRelays || this.seenRelays.size || 1, 1);
             const completed = Math.min(this.completedRelays.size, total);
             const target = completed / total;
             this.setProgress(target * 0.95);
+            this.updateLabel();
         },
 
         fallbackAdvance(stage = '') {
             if (this.expectedRelays && this.expectedRelays >= 1) {
                 return;
             }
+            if (!stage || !this.fallbackStages.includes(stage)) {
+                return;
+            }
+            if (this.fallbackVisited.has(stage)) {
+                return;
+            }
+            this.fallbackVisited.add(stage);
             if (this.fallbackIndex < this.fallbackStages.length) {
                 this.fallbackIndex += 1;
             }
-            const base = this.fallbackIndex / (this.fallbackStages.length + 1);
-            const target = Math.min(0.85, base || this.minProgress);
+            const visitedCount = this.fallbackVisited.size;
+            const target = Math.min(0.5, this.minProgress + visitedCount * 0.1);
+            if (target <= this.currentProgress + 0.001) {
+                return;
+            }
             this.setProgress(target);
+            this.updateLabel();
         },
 
         markError() {
             this.ensureVisible();
             if (this.label) {
                 this.label.textContent = 'Unable to load relays';
+            }
+            this.progressQueue = [];
+            this.processingProgress = false;
+            if (this.progressTimer) {
+                clearTimeout(this.progressTimer);
+                this.progressTimer = null;
             }
             this.setProgress(1, { allowComplete: true });
             if (this.hideTimeout) clearTimeout(this.hideTimeout);
@@ -239,12 +341,21 @@ function integrateNostrRelays(App) {
         complete(totalCount = null) {
             if (typeof totalCount === 'number') {
                 this.noteTotalRelays(totalCount);
+                this.completedCount = Math.max(this.completedCount, totalCount);
+            }
+            this.completedCycle = true;
+            this.completionTimestamp = Date.now();
+            if (typeof totalCount === 'number') {
+                this.noteTotalRelays(totalCount);
+            }
+            if (this.label) {
+                this.label.textContent = 'Relays ready!';
             }
             this.setProgress(1, { allowComplete: true });
             if (this.hideTimeout) clearTimeout(this.hideTimeout);
             this.hideTimeout = setTimeout(() => {
-                this.reset({ hide: true });
-            }, 750);
+                this.reset({ hide: true, preserveCompletion: true });
+            }, Math.max(750, this.minStepDuration * 2));
         },
 
         sync() {
@@ -257,6 +368,22 @@ function integrateNostrRelays(App) {
             const stage = detail.stage || '';
             const relayKey = detail.relayKey || detail.publicIdentifier || null;
 
+            if (this.completedCycle) {
+                if (stage === 'clear') {
+                    this.reset({ hide: true });
+                }
+                return;
+            }
+
+            if (stage !== 'relay-count') {
+                if (typeof detail.total === 'number') {
+                    this.noteTotalRelays(detail.total);
+                }
+                if (typeof detail.count === 'number' && !['all-relays-initialized', 'complete'].includes(stage)) {
+                    this.noteTotalRelays(detail.count);
+                }
+            }
+
             switch (stage) {
                 case 'worker-start':
                 case 'worker-status':
@@ -265,15 +392,22 @@ function integrateNostrRelays(App) {
                 case 'account-create':
                 case 'auto-auth-start':
                 case 'relay-configure':
-                case 'syncing':
                     this.start();
-                    this.fallbackAdvance(stage);
                     break;
 
                 case 'worker-ready':
+                    this.start();
+                    this.fallbackAdvance('worker-ready');
+                    break;
+
                 case 'gateway-ready':
                     this.start();
-                    this.fallbackAdvance(stage);
+                    this.fallbackAdvance('gateway-ready');
+                    break;
+
+                case 'syncing':
+                    this.start();
+                    this.fallbackAdvance('relays-synced');
                     break;
 
                 case 'connecting':
@@ -294,18 +428,30 @@ function integrateNostrRelays(App) {
                 case 'relay-count':
                     this.start({ totalSteps: detail.total || detail.count });
                     this.noteTotalRelays(detail.total || detail.count);
+                    this.updateLabel();
                     break;
 
                 case 'all-relays-initialized':
                 case 'complete':
-                    this.noteTotalRelays(detail.count);
-                    this.complete(detail.count);
+                    this.noteTotalRelays(detail.total || detail.count);
+                    if (typeof detail.count === 'number') {
+                        this.completedCount = Math.max(this.completedCount, detail.count);
+                        const total = Math.max(this.expectedRelays || detail.total || detail.count || 1, 1);
+                        const ratio = Math.min(this.completedCount / total, 1);
+                        this.setProgress(ratio * 0.95);
+                    }
+                    this.updateLabel();
+                    this.complete(detail.total || detail.count);
                     break;
 
                 case 'worker-error':
                 case 'auto-auth-error':
                 case 'relay-error':
                     this.markError();
+                    break;
+
+                case 'clear':
+                    this.reset({ hide: true });
                     break;
 
                 default:
@@ -2149,7 +2295,7 @@ App.syncHypertunaConfigToFile = async function() {
     App.showGroupListSpinner = function() {
         const groupsList = document.getElementById('groups-list');
         if (groupsList) {
-            groupsList.innerHTML = '<div class="loading">Loading relays...</div>';
+            groupsList.innerHTML = '';
         }
     };
 
@@ -2225,8 +2371,7 @@ App.syncHypertunaConfigToFile = async function() {
         }
         const initializationComplete = !!this.relayInitializationComplete;
         
-        // Only show spinner if we're not already showing one
-        if (!groupsList.querySelector('.loading')) {
+        if (!initializationComplete) {
             this.showGroupListSpinner();
         }
     
@@ -2682,7 +2827,7 @@ App.syncHypertunaConfigToFile = async function() {
         
         // Show loading state only if membersList doesn't exist
         if (!this.membersList) {
-            container.innerHTML = '<div class="loading">Loading members...</div>';
+            container.textContent = 'Loading members...';
         }
     
         // Ensure member list is built from history
@@ -3800,7 +3945,6 @@ App.loadDiscoverRelays = async function(force = false) {
 
     discoverList.innerHTML = `
         <div class="discover-loading">
-            <div class="loading"></div>
             <div class="discover-loading-text">Loading recommended relays…</div>
         </div>
     `;

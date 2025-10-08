@@ -1782,7 +1782,7 @@
           loadGroups() {
               // This will be replaced by the integration, but adding example structure
               const groupsList = document.getElementById('groups-list');
-              groupsList.innerHTML = '<div class="loading">Loading relays...</div>';
+              if (groupsList) groupsList.innerHTML = '';
           },
           
           loadGroupDetails() {
@@ -2630,8 +2630,6 @@ const OnboardingFlow = {
         this.ensureOverlayVisible();
         this.markAuthenticated();
 
-        this.broadcastStatus('complete', 'Relays ready.');
-
         // Prepare main app view before the overlay fades away
         App.currentPage = 'groups';
         App.updateUIState();
@@ -2652,7 +2650,6 @@ const OnboardingFlow = {
             this.overlay.style.transition = '';
             this.overlay.style.opacity = '1';
             console.log('[Onboarding] Onboarding complete, user in app');
-            this.broadcastStatus('clear', '');
         }, 500);
     }
 };
