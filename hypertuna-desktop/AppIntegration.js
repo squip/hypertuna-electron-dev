@@ -111,6 +111,67 @@ function integrateNostrRelays(App) {
     App.relayGatewayLastToken = null;
     App.currentGroupIsMember = false;
 
+    const relayStatusBanner = document.getElementById('relay-status-banner');
+    const relayStatusVariants = ['info', 'success', 'warning', 'error'];
+
+    App.relayStatusState = { stage: null, message: null, variant: 'info' };
+    App.relayInitializationComplete = false;
+    App.relayInitializationReportedCount = null;
+
+    App.updateRelayStatusBanner = function({ message = '', variant = 'info', stage = null } = {}) {
+        if (!relayStatusBanner) return;
+
+        relayStatusVariants.forEach((key) => relayStatusBanner.classList.remove(key));
+
+        if (!message) {
+            relayStatusBanner.classList.add('hidden');
+            relayStatusBanner.textContent = '';
+            App.relayStatusState = { stage, message: '', variant };
+            return;
+        }
+
+        const normalizedVariant = relayStatusVariants.includes(variant) ? variant : 'info';
+        relayStatusBanner.textContent = message;
+        relayStatusBanner.classList.remove('hidden');
+        relayStatusBanner.classList.add(normalizedVariant);
+        App.relayStatusState = { stage, message, variant: normalizedVariant };
+    };
+
+    App.clearRelayStatusBanner = function() {
+        App.updateRelayStatusBanner({ message: '', stage: 'clear' });
+    };
+
+    window.addEventListener('relay-loading-status', (event) => {
+        const detail = event?.detail || {};
+        let { variant = 'info', stage = null } = detail;
+        const message = detail.message ?? '';
+
+        if (!variant && typeof stage === 'string') {
+            if (stage.includes('error')) {
+                variant = 'error';
+            } else if (stage.includes('warning')) {
+                variant = 'warning';
+            } else if (stage === 'complete' || stage.includes('ready')) {
+                variant = 'success';
+            } else {
+                variant = 'info';
+            }
+        }
+
+        if (stage === 'clear' || (!message && stage !== 'complete')) {
+            App.clearRelayStatusBanner();
+            return;
+        }
+
+        App.updateRelayStatusBanner({ message: message || 'Loading your relays...', variant, stage });
+
+        if (['complete', 'relay-registered', 'all-relays-initialized'].includes(stage) && variant === 'success') {
+            setTimeout(() => {
+                App.updateRelayStatusBanner({ message: '', stage: 'clear' });
+            }, 2000);
+        }
+    });
+
     // Track discovery relay connections displayed in profile UI
     App.discoveryRelays = new Map();
     App.discoveryRelayStorageKey = 'discovery_relay_whitelist';
@@ -2000,6 +2061,19 @@ App.syncHypertunaConfigToFile = async function() {
         if (!this.currentUser) return;
     
         const groupsList = document.getElementById('groups-list');
+        this.relayInitializationComplete = !!App.relayInitializationComplete;
+        const relayCacheKey = window.HypertunaRelayCacheKey || 'hypertuna_relays_cache_v1';
+        let hasCachedRelays = false;
+        try {
+            const cached = localStorage.getItem(relayCacheKey);
+            if (cached) {
+                const parsed = JSON.parse(cached);
+                hasCachedRelays = Array.isArray(parsed) && parsed.length > 0;
+            }
+        } catch (_) {
+            hasCachedRelays = false;
+        }
+        const initializationComplete = !!this.relayInitializationComplete;
         
         // Only show spinner if we're not already showing one
         if (!groupsList.querySelector('.loading')) {
@@ -2049,17 +2123,21 @@ App.syncHypertunaConfigToFile = async function() {
             }
             
             if (groups.length === 0) {
-                groupsList.innerHTML = `
-                    <div class="empty-state">
-                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                            <path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"></path>
-                            <polyline points="3.27 6.96 12 12.01 20.73 6.96"></polyline>
-                            <line x1="12" y1="22.08" x2="12" y2="12"></line>
-                        </svg>
-                        <p>No Hypertuna relays found</p>
-                        <p>Create your first relay to get started!</p>
-                    </div>
-                `;
+                if (!initializationComplete || hasCachedRelays) {
+                    this.showGroupListSpinner();
+                } else {
+                    groupsList.innerHTML = `
+                        <div class="empty-state">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"></path>
+                                <polyline points="3.27 6.96 12 12.01 20.73 6.96"></polyline>
+                                <line x1="12" y1="22.08" x2="12" y2="12"></line>
+                            </svg>
+                            <p>No Hypertuna relays found</p>
+                            <p>Create your first relay to get started!</p>
+                        </div>
+                    `;
+                }
                 return;
             }
             

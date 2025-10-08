@@ -32,6 +32,14 @@ let gatewayPeerRelayMap = new Map();
 let gatewayPeerDetails = new Map();
 const DEFAULT_API_URL = 'http://localhost:1945';
 const DEFAULT_PUBLIC_GATEWAY_URL = 'https://hypertuna.com';
+const RELAY_CACHE_STORAGE_KEY = 'hypertuna_relays_cache_v1';
+
+let relayInitializationComplete = false;
+let relayCacheHydrated = false;
+
+if (typeof window !== 'undefined') {
+  window.HypertunaRelayCacheKey = RELAY_CACHE_STORAGE_KEY;
+}
 
 // Store worker messages that may arrive before AppIntegration sets up handlers
 let pendingRelayMessages = {
@@ -1540,6 +1548,11 @@ function updateWorkerStatus(status, text) {
 async function startWorker() {
   console.log('[App] startWorker() called at:', new Date().toISOString());
 
+  relayInitializationComplete = false
+  if (!relayCacheHydrated) {
+    hydrateRelayListFromCache()
+  }
+
   attachWorkerEventListeners();
 
   swarmKeyPromise = new Promise((resolve) => {
@@ -1766,11 +1779,28 @@ async function handleWorkerMessage(message) {
   switch (message.type) {
     case 'status':
         addLog(`Worker: ${message.message}`, 'status')
-            if (message.swarmKey) {
-            try {
-                const stored = localStorage.getItem('hypertuna_config')
-                const cfg = stored ? JSON.parse(stored) : {}
-                cfg.swarmPublicKey = message.swarmKey
+        try {
+          if (message.message) {
+            const stage = message.initialized ? 'worker-ready' : 'worker-status';
+            const variant = message.initialized ? 'success' : 'info';
+            window.dispatchEvent(new CustomEvent('relay-loading-status', {
+              detail: {
+                stage,
+                message: message.message,
+                variant,
+                source: 'worker',
+                timestamp: Date.now()
+              }
+            }))
+          }
+        } catch (error) {
+          console.warn('[App] Failed to broadcast worker status:', error)
+        }
+        if (message.swarmKey) {
+        try {
+            const stored = localStorage.getItem('hypertuna_config')
+            const cfg = stored ? JSON.parse(stored) : {}
+            cfg.swarmPublicKey = message.swarmKey
                 localStorage.setItem('hypertuna_config', JSON.stringify(cfg))
                 if (window.App && window.App.currentUser && window.App.currentUser.hypertunaConfig) {
                     window.App.currentUser.hypertunaConfig.swarmPublicKey = message.swarmKey
@@ -1876,11 +1906,71 @@ async function handleWorkerMessage(message) {
       }
       break
       
+    case 'relay-loading': {
+      try {
+        const identifier = message.name
+          || message.publicIdentifier
+          || (message.relayKey ? `${message.relayKey.slice(0, 8)}…` : 'Relay')
+        const stage = message.stage || 'relay-loading'
+        let variant = message.variant || 'info'
+
+        if (!message.variant) {
+          if (stage.includes('error')) variant = 'error'
+          else if (stage === 'initialized') variant = 'success'
+          else if (stage === 'skipped') variant = 'warning'
+          else variant = 'info'
+        }
+
+        const statusMessage = message.message
+          || (stage === 'initialized'
+            ? `${identifier} is online.`
+            : stage === 'already-active'
+              ? `${identifier} already running.`
+              : stage === 'skipped'
+                ? `${identifier} skipped (auto-connect disabled).`
+                : `Initializing ${identifier}...`)
+
+        window.dispatchEvent(new CustomEvent('relay-loading-status', {
+          detail: {
+            stage,
+            message: statusMessage,
+            variant,
+            source: 'worker',
+            relayKey: message.relayKey || null,
+            publicIdentifier: message.publicIdentifier || null,
+            timestamp: Date.now()
+          }
+        }))
+      } catch (error) {
+        console.warn('[App] Failed to broadcast relay-loading status:', error)
+      }
+      break
+    }
+
     case 'relay-registration-complete':
       // When a relay has been registered with gateway
       if (message.relayKey) {
         console.log(`[App] Relay registered with gateway: ${message.relayKey}`)
         addLog(`Relay ${message.relayKey} registered with gateway`, 'status')
+
+        try {
+          const identifier = message.publicIdentifier
+            || message.name
+            || `${message.relayKey.slice(0, 8)}…`
+          window.dispatchEvent(new CustomEvent('relay-loading-status', {
+            detail: {
+              stage: 'relay-registered',
+              message: `${identifier} registered with gateway.`,
+              variant: 'success',
+              source: 'worker',
+              relayKey: message.relayKey,
+              publicIdentifier: message.publicIdentifier || null,
+              timestamp: Date.now()
+            }
+          }))
+        } catch (error) {
+          console.warn('[App] Failed to broadcast relay registration status:', error)
+        }
 
         // Notify the nostr client that this relay is fully registered and ready for connection
         if (window.App && typeof window.App.handleRelayRegistered === 'function') {
@@ -1894,8 +1984,36 @@ async function handleWorkerMessage(message) {
     case 'all-relays-initialized':
       // When all stored relays have been initialized
       console.log('[App] All stored relays initialized')
+      relayInitializationComplete = true
+      if (window.App) {
+        window.App.relayInitializationComplete = true
+        window.App.relayInitializationReportedCount = typeof message.count === 'number' ? message.count : null
+      }
+      try {
+        const initializedCount = typeof message.count === 'number' ? message.count : initializedRelays.size
+        const statusMessage = initializedCount > 0
+          ? `Loaded ${initializedCount} relay${initializedCount === 1 ? '' : 's'}.`
+          : 'No relays found for this account.'
+        window.dispatchEvent(new CustomEvent('relay-loading-status', {
+          detail: {
+            stage: 'all-relays-initialized',
+            message: statusMessage,
+            variant: initializedCount > 0 ? 'success' : 'warning',
+            source: 'worker',
+            timestamp: Date.now()
+          }
+        }))
+      } catch (error) {
+        console.warn('[App] Failed to broadcast all-relays-initialized status:', error)
+      }
       if (window.App && window.App.nostr) {
         window.App.nostr.handleAllRelaysReady()
+      }
+
+      if (typeof message.count === 'number' && message.count === 0) {
+        clearRelayCache()
+        relays = []
+        renderRelayListContent([], { showEmpty: true })
       }
       break
       
@@ -2206,31 +2324,59 @@ async function fetchRelays() {
   }
 }
 
-// Update relay list
-function updateRelayList(relayData) {
-  if (!relayList) return;
-  
-  relays = relayData || [];
-  
-  if (relays.length === 0) {
-    relayList.innerHTML = '<p style="color: var(--text-secondary); font-size: 12px;">No active relays</p>';
-    return;
+function loadRelayCache() {
+  try {
+    const raw = localStorage.getItem(RELAY_CACHE_STORAGE_KEY)
+    if (!raw) return []
+    const parsed = JSON.parse(raw)
+    return Array.isArray(parsed) ? parsed : []
+  } catch (error) {
+    console.warn('[App] Failed to load relay cache:', error)
+    return []
   }
-  
-  relayList.innerHTML = '';
-  relays.forEach(relay => {
+}
+
+function saveRelayCache(data) {
+  try {
+    if (Array.isArray(data) && data.length) {
+      localStorage.setItem(RELAY_CACHE_STORAGE_KEY, JSON.stringify(data))
+    }
+  } catch (error) {
+    console.warn('[App] Failed to persist relay cache:', error)
+  }
+}
+
+function clearRelayCache() {
+  try {
+    localStorage.removeItem(RELAY_CACHE_STORAGE_KEY)
+    relayCacheHydrated = false
+  } catch (error) {
+    console.warn('[App] Failed to clear relay cache:', error)
+  }
+}
+
+function renderRelayListContent(relayData = [], { showEmpty = true } = {}) {
+  if (!relayList) return
+
+  if (!Array.isArray(relayData) || relayData.length === 0) {
+    if (showEmpty) {
+      relayList.innerHTML = '<p style="color: var(--text-secondary); font-size: 12px;">No active relays</p>'
+    }
+    return
+  }
+
+  relayList.innerHTML = ''
+
+  relayData.forEach((relay) => {
     if (window.App && window.App.nostr && relay.relayKey && relay.publicIdentifier) {
       window.App.nostr.registerRelayMapping(relay.relayKey, relay.publicIdentifier)
     }
-    const relayElement = document.createElement('div');
-    relayElement.className = 'relay-item';
-    
-    // Use public identifier if available, fallback to relay key
-    const displayKey = relay.publicIdentifier || relay.relayKey || 'unknown';
-    const truncatedKey = displayKey.length > 30 ? 
-      displayKey.substring(0, 30) + '...' : displayKey;
-    
-    // Create relay item with disconnect button
+    const relayElement = document.createElement('div')
+    relayElement.className = 'relay-item'
+
+    const displayKey = relay.publicIdentifier || relay.relayKey || 'unknown'
+    const truncatedKey = displayKey.length > 30 ? `${displayKey.substring(0, 30)}...` : displayKey
+
     relayElement.innerHTML = `
       <div style="flex: 1;">
         <div><strong>${relay.name || 'Unnamed Relay'}</strong></div>
@@ -2245,16 +2391,39 @@ function updateRelayList(relayData) {
       <button class="disconnect-btn" data-relay-identifier="${relay.publicIdentifier || relay.relayKey}">
         Disconnect
       </button>
-    `;
-    
-    // Add disconnect handler
-    const disconnectBtn = relayElement.querySelector('.disconnect-btn');
-    disconnectBtn.addEventListener('click', () => 
+    `
+
+    const disconnectBtn = relayElement.querySelector('.disconnect-btn')
+    disconnectBtn.addEventListener('click', () =>
       disconnectRelay(relay.publicIdentifier || relay.relayKey)
-    );
-    
-    relayList.appendChild(relayElement);
-  });
+    )
+
+    relayList.appendChild(relayElement)
+  })
+}
+
+function hydrateRelayListFromCache() {
+  if (relayCacheHydrated) return
+  const cachedRelays = loadRelayCache()
+  if (Array.isArray(cachedRelays) && cachedRelays.length) {
+    relays = cachedRelays
+    renderRelayListContent(cachedRelays, { showEmpty: false })
+    relayCacheHydrated = true
+  }
+}
+
+// Update relay list
+function updateRelayList(relayData) {
+  if (!relayList) return;
+  
+  relays = relayData || [];
+  
+  if (relays.length) {
+    saveRelayCache(relays)
+  }
+
+  const shouldShowEmpty = relayInitializationComplete && relays.length === 0
+  renderRelayListContent(relays, { showEmpty: shouldShowEmpty })
 }
 
 // Update disconnect function to handle public identifiers
@@ -2732,7 +2901,9 @@ function initializeDOMElements() {
   for (const [name, element] of Object.entries(elements)) {
     console.log(`- ${name}:`, element ? 'found' : 'NOT FOUND');
   }
-  
+
+  hydrateRelayListFromCache()
+
   // Set up event listeners
   setupEventListeners();
 

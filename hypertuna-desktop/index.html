@@ -202,6 +202,8 @@
                         </button>
                     </div>
 
+                    <div id="relay-status-banner" class="relay-status hidden" role="status" aria-live="polite"></div>
+
                     <div id="invite-summary" class="invite-summary hidden">
                         <span id="invite-count">0</span> invite(s) pending
                         <button id="btn-view-invites" class="btn btn-secondary btn-small">View</button>
@@ -1434,6 +1436,9 @@
               
               // Additional UI updates based on current page
               if (this.currentPage === 'groups' && isLoggedIn) {
+                  if (typeof this.updateRelayStatusBanner === 'function' && this.relayStatusState?.message) {
+                      this.updateRelayStatusBanner(this.relayStatusState);
+                  }
                   // Check if relay is connected
                   if ((this.relay && this.relay.isConnected()) || 
                       (this.nostr && this.nostr.client.relayManager.getRelays().length > 0)) {
@@ -1952,6 +1957,22 @@ const OnboardingFlow = {
     abortController: null,
     pendingOperations: new Set(),
 
+    broadcastStatus(stage, message, variant = 'info') {
+        try {
+            window.dispatchEvent(new CustomEvent('relay-loading-status', {
+                detail: {
+                    stage,
+                    message,
+                    variant,
+                    source: 'onboarding',
+                    timestamp: Date.now()
+                }
+            }));
+        } catch (error) {
+            console.error('[Onboarding] Failed to broadcast status:', error);
+        }
+    },
+
     init() {
         console.log('[Onboarding] Initializing onboarding flow');
         this.overlay = document.getElementById('onboarding-overlay');
@@ -2111,6 +2132,143 @@ const OnboardingFlow = {
         }
     },
 
+    async startWorkerWithStatus(user) {
+        if (typeof window.startWorker !== 'function') {
+            return null;
+        }
+
+        this.broadcastStatus('worker-start', 'Starting relay worker...');
+
+        try {
+            const key = await window.startWorker();
+            this.broadcastStatus('worker-ready', 'Relay worker running.');
+
+            if (key && user?.hypertunaConfig) {
+                user.hypertunaConfig.swarmPublicKey = key;
+                await HypertunaUtils.saveConfig(user.hypertunaConfig);
+                if (typeof App.saveUserToLocalStorage === 'function') {
+                    App.saveUserToLocalStorage();
+                }
+            }
+
+            if (typeof window.refreshGatewayStatus === 'function') {
+                try {
+                    await window.refreshGatewayStatus({ fetchOptions: false });
+                } catch (error) {
+                    console.warn('[Onboarding] Failed to refresh gateway status:', error);
+                }
+            }
+
+            return key;
+        } catch (error) {
+            this.broadcastStatus('worker-error', `Relay worker failed: ${error.message}`, 'error');
+            throw error;
+        }
+    },
+
+    async initNostrWithStatus(user, { deferDiscovery = false } = {}) {
+        if (!user) {
+            throw new Error('User information required for Nostr initialization.');
+        }
+
+        this.broadcastStatus('nostr-init', 'Connecting to your account...');
+
+        if (!App.nostr) {
+            App.nostr = new NostrIntegration(App);
+        }
+
+        const initCleanup = () => {
+            if (typeof App.nostr?.cancelPending === 'function') {
+                App.nostr.cancelPending('auto-auth-init');
+            }
+        };
+
+        this.pendingOperations.add(initCleanup);
+
+        try {
+            await App.nostr.init(user, {
+                deferDiscovery,
+                seedProfile: {
+                    name: user.name,
+                    about: user.about,
+                    picture: user.picture || null,
+                    pictureTagUrl: user.pictureTagUrl || null,
+                    pictureIsHypertunaPfp: !!user.pictureIsHypertunaPfp
+                }
+            });
+        } finally {
+            this.pendingOperations.delete(initCleanup);
+        }
+
+        this.broadcastStatus('nostr-ready', 'Account connected.');
+
+        if (typeof App.configureRelays === 'function') {
+            try {
+                this.broadcastStatus('relay-configure', 'Preparing discovery relays...');
+                await App.configureRelays(App.nostr.relayUrls || [], {
+                    skipNetwork: true,
+                    includePersisted: true
+                });
+            } catch (error) {
+                console.warn('[Onboarding] Failed to configure discovery relays:', error);
+            }
+        }
+
+        try {
+            const profile = await App.nostr.client.fetchUserProfile(user.pubkey);
+            if (profile && typeof profile === 'object') {
+                Object.assign(user, profile);
+                if (typeof App.saveUserToLocalStorage === 'function') {
+                    App.saveUserToLocalStorage();
+                }
+                if (typeof App.updateProfileDisplay === 'function') {
+                    App.updateProfileDisplay();
+                }
+            }
+        } catch (error) {
+            console.warn('[Onboarding] Could not fetch user profile:', error);
+        }
+
+        return true;
+    },
+
+    async bootstrapAuthenticatedSession(user, { resumeDiscovery = true } = {}) {
+        const localSignal = this.abortController?.signal;
+
+        const nostrPromise = this.initNostrWithStatus(user, { deferDiscovery: true });
+        const workerPromise = this.startWorkerWithStatus(user);
+
+        const [nostrResult, workerResult] = await Promise.allSettled([nostrPromise, workerPromise]);
+
+        if (nostrResult.status === 'rejected') {
+            throw nostrResult.reason;
+        }
+
+        if (workerResult.status === 'rejected') {
+            throw workerResult.reason;
+        }
+
+        if (localSignal?.aborted) {
+            return;
+        }
+
+        this.broadcastStatus('syncing', 'Syncing relay data...');
+
+        if (resumeDiscovery) {
+            setTimeout(() => {
+                try {
+                    if (App?.nostr && typeof App.nostr.resumeDiscovery === 'function') {
+                        App.nostr.resumeDiscovery({ force: true }).catch((error) => {
+                            console.warn('[Onboarding] Deferred discovery failed:', error);
+                        });
+                    }
+                } catch (error) {
+                    console.warn('[Onboarding] Failed to resume discovery:', error);
+                }
+            }, 0);
+        }
+    },
+
     markAuthenticated() {
         try {
             localStorage.removeItem('explicit_logout');
@@ -2187,9 +2345,11 @@ const OnboardingFlow = {
             this.navigateTo('splash');
             
             // Auto-authenticate in background
-            this.autoAuthTimeoutId = setTimeout(async () => {
-                await this.autoAuthenticate();
-            }, 2000);
+            this.autoAuthTimeoutId = setTimeout(() => {
+                this.autoAuthenticate().catch(error => {
+                    console.error('[Onboarding] Auto-authentication error:', error);
+                });
+            }, 0);
         } else {
             // First time or logged out - show splash then welcome
             console.log('[Onboarding] First time or logged out, showing welcome screen');
@@ -2243,115 +2403,80 @@ const OnboardingFlow = {
     
     async handleCreateAccount() {
         console.log('[Onboarding] Handling create account');
-        
+
         const username = document.getElementById('onboarding-username').value.trim();
         const bio = document.getElementById('onboarding-bio').value.trim();
         const pfpInput = document.getElementById('onboarding-pfp-upload');
-        
+
         if (!username) {
             alert('Please enter a username');
             return;
         }
-        
+
         try {
-            // Generate new keypair using existing NostrUtils
+            this.broadcastStatus('account-create', 'Creating your account...');
+
             const privateKey = NostrUtils.generatePrivateKey();
             const pubkey = NostrUtils.getPublicKey(privateKey);
-            
-            console.log('[Onboarding] Generated new keypair');
-            
-            // Create user object
+
             const user = {
                 privateKey,
                 pubkey,
                 name: username,
                 about: bio
             };
-            
-            // Store pfp file for later processing via AvatarModal workflow
+
             if (pfpInput.files[0]) {
                 user.pendingPfpFile = pfpInput.files[0];
             }
-            
-            // Set as current user in App
+
             App.currentUser = user;
             this.markAuthenticated();
-            
-            // Setup Hypertuna config using existing logic
-            console.log('[Onboarding] Setting up Hypertuna config');
+
             const hypertunaConfig = await HypertunaUtils.setupUserConfig(user);
             user.hypertunaConfig = hypertunaConfig;
-            
-            // Save user to localStorage
-            App.saveUserToLocalStorage();
 
-            // Sync config to file
-            await App.syncHypertunaConfigToFile();
-            
-            // Initialize nostr integration with existing logic
-            console.log('[Onboarding] Initializing Nostr integration');
-            if (!App.nostr) {
-                App.nostr = new NostrIntegration(App);
+            if (typeof App.saveUserToLocalStorage === 'function') {
+                App.saveUserToLocalStorage();
             }
-            await App.nostr.init(user, {
-                deferDiscovery: true,
-                seedProfile: {
-                    name: username,
-                    about: bio
-                }
-            });
 
-            // Release the onboarding overlay before the deferred network work completes
+            if (typeof App.syncHypertunaConfigToFile === 'function') {
+                await App.syncHypertunaConfigToFile();
+            }
+
+            await this.bootstrapAuthenticatedSession(user);
+
             this.completeOnboarding();
 
-            // Resume discovery tasks in the background so the UI stays responsive
-            setTimeout(() => {
-                if (App && App.nostr && typeof App.nostr.resumeDiscovery === 'function') {
-                    const resumePromise = App.nostr.resumeDiscovery();
-                    if (resumePromise && typeof resumePromise.catch === 'function') {
-                        resumePromise.catch(err => {
-                            console.warn('[Onboarding] Deferred discovery failed:', err);
-                        });
+            (async () => {
+                try {
+                    this.broadcastStatus('profile-publish', 'Publishing your profile...');
+                    await App.nostr.updateProfile({
+                        name: username,
+                        about: bio
+                    });
+                } catch (error) {
+                    console.warn('[Onboarding] Failed to publish profile:', error);
+                    this.broadcastStatus('profile-warning', 'Profile publish failed. You can retry from settings.', 'warning');
+                }
+
+                if (user.pendingPfpFile && typeof App.processPendingPfpFile === 'function') {
+                    console.log('[Onboarding] Queuing pending profile image for upload');
+                    try {
+                        await App.processPendingPfpFile(user.pendingPfpFile);
+                        delete user.pendingPfpFile;
+                        if (typeof App.saveUserToLocalStorage === 'function') {
+                            App.saveUserToLocalStorage();
+                        }
+                    } catch (pfpError) {
+                        console.error('[Onboarding] Failed to queue pending PFP file:', pfpError);
                     }
                 }
-            }, 0);
-            
-            // Configure discovery relays
-            if (App.configureRelays) {
-                await App.configureRelays(App.nostr.relayUrls || [], { skipNetwork: true, includePersisted: true });
-            }
+            })();
 
-            // Publish kind 0 profile event using existing logic
-            console.log('[Onboarding] Publishing profile');
-            await App.nostr.updateProfile({
-                name: username,
-                about: bio
-            });
-
-            if (user.pendingPfpFile && typeof App.processPendingPfpFile === 'function') {
-                console.log('[Onboarding] Queuing pending profile image for upload');
-                try {
-                    await App.processPendingPfpFile(user.pendingPfpFile);
-                    delete user.pendingPfpFile;
-                    App.saveUserToLocalStorage();
-                } catch (pfpError) {
-                    console.error('[Onboarding] Failed to queue pending PFP file:', pfpError);
-                }
-            }
-
-            // Start worker using existing logic
-            if (window.startWorker) {
-                console.log('[Onboarding] Starting worker');
-                const key = await window.startWorker();
-                if (key && user.hypertunaConfig) {
-                    user.hypertunaConfig.swarmPublicKey = key;
-                    await HypertunaUtils.saveConfig(user.hypertunaConfig);
-                    App.saveUserToLocalStorage();
-                }
-            }
-            
         } catch (error) {
             console.error('[Onboarding] Error creating account:', error);
+            this.broadcastStatus('account-error', `Failed to create account: ${error.message}`, 'error');
             alert('Failed to create account: ' + error.message);
         }
     },
@@ -2367,90 +2492,65 @@ const OnboardingFlow = {
         }
         
         try {
-            // Normalize key using existing NostrUtils
+            this.broadcastStatus('login-start', 'Signing you in...');
+
             const privateKey = NostrUtils.normalizePrivateKey(privateKeyInput);
             if (!privateKey) {
                 alert('Invalid private key format. Please enter a hex key or nsec format.');
                 return;
             }
-            
+
             const pubkey = NostrUtils.getPublicKey(privateKey);
             console.log('[Onboarding] Key validated, pubkey:', pubkey.substring(0, 8) + '...');
-            
-            // Check if user config exists in localStorage
+
             const savedUser = localStorage.getItem('nostr_user');
-            let user;
-            
+            let user = null;
+
             if (savedUser) {
-                const parsed = JSON.parse(savedUser);
-                if (parsed.pubkey === pubkey) {
-                    // Load existing config
-                    console.log('[Onboarding] Loading existing user config');
-                    user = parsed;
-                    user.privateKey = privateKey; // Update with entered key
+                try {
+                    const parsed = JSON.parse(savedUser);
+                    if (parsed.pubkey === pubkey) {
+                        console.log('[Onboarding] Loading existing user config');
+                        user = parsed;
+                        user.privateKey = privateKey;
+                    }
+                } catch (error) {
+                    console.warn('[Onboarding] Failed to parse stored user – creating fresh config.', error);
                 }
             }
-            
+
             if (!user) {
-                // Create new config for this key
-                console.log('[Onboarding] Creating new config for existing key');
                 user = {
                     privateKey,
                     pubkey,
                     name: 'User_' + NostrUtils.truncatePubkey(pubkey),
                     about: ''
                 };
-                
-                // Setup Hypertuna config using existing logic
+
                 const hypertunaConfig = await HypertunaUtils.setupUserConfig(user);
                 user.hypertunaConfig = hypertunaConfig;
+            } else if (!user.hypertunaConfig) {
+                user.hypertunaConfig = await HypertunaUtils.setupUserConfig(user);
             }
-            
-            // Set as current user
+
             App.currentUser = user;
             this.markAuthenticated();
-            App.saveUserToLocalStorage();
 
-            // Sync config
-            await App.syncHypertunaConfigToFile();
-            
-            // Initialize nostr using existing logic
-            console.log('[Onboarding] Initializing Nostr integration');
-            if (!App.nostr) {
-                App.nostr = new NostrIntegration(App);
-            }
-            await App.nostr.init(user);
-            
-            // Configure discovery relays
-            if (App.configureRelays) {
-                await App.configureRelays(App.nostr.relayUrls || [], { skipNetwork: true, includePersisted: true });
-            }
-            
-            // Fetch user profile from network
-            try {
-                const profile = await App.nostr.client.fetchUserProfile(user.pubkey);
-                Object.assign(user, profile);
+            if (typeof App.saveUserToLocalStorage === 'function') {
                 App.saveUserToLocalStorage();
-            } catch (err) {
-                console.warn('[Onboarding] Could not fetch user profile:', err);
             }
-            
-            // Start worker using existing logic
-            if (window.startWorker) {
-                console.log('[Onboarding] Starting worker');
-                const key = await window.startWorker();
-                if (key && user.hypertunaConfig) {
-                    user.hypertunaConfig.swarmPublicKey = key;
-                    await HypertunaUtils.saveConfig(user.hypertunaConfig);
-                    App.saveUserToLocalStorage();
-                }
+
+            if (typeof App.syncHypertunaConfigToFile === 'function') {
+                await App.syncHypertunaConfigToFile();
             }
-            
-            // Complete onboarding
+
+            await this.bootstrapAuthenticatedSession(user);
+
             this.completeOnboarding();
-            
+
         } catch (error) {
             console.error('[Onboarding] Error logging in:', error);
+            this.broadcastStatus('login-error', `Login failed: ${error.message}`, 'error');
             alert('Login failed: ' + error.message);
         }
     },
@@ -2466,6 +2566,7 @@ const OnboardingFlow = {
             }
 
             const localSignal = this.abortController?.signal;
+            this.broadcastStatus('auto-auth-start', 'Reconnecting to your relays...');
 
             const savedUser = localStorage.getItem('nostr_user');
             if (!savedUser) {
@@ -2473,87 +2574,46 @@ const OnboardingFlow = {
                 this.navigateTo('welcome');
                 return;
             }
-            
+
             const user = JSON.parse(savedUser);
+
+            if (!user?.privateKey || !user?.pubkey) {
+                console.warn('[Onboarding] Stored user missing credentials; aborting auto-auth.');
+                this.navigateTo('welcome');
+                return;
+            }
+
             App.currentUser = user;
+            this.markAuthenticated();
 
-            if (localSignal?.aborted) {
-                console.log('[Onboarding] Auto-authentication aborted before init');
-                return;
-            }
-
-            // Initialize nostr using existing logic
-            console.log('[Onboarding] Initializing Nostr for auto-login');
-            if (!App.nostr) {
-                App.nostr = new NostrIntegration(App);
-            }
-            const initCleanup = () => {
-                if (typeof App.nostr?.cancelPending === 'function') {
-                    App.nostr.cancelPending('auto-auth-init');
+            if (!user.hypertunaConfig) {
+                try {
+                    user.hypertunaConfig = await HypertunaUtils.setupUserConfig(user);
+                } catch (error) {
+                    console.warn('[Onboarding] Failed to hydrate Hypertuna config, continuing with defaults:', error);
                 }
-            };
-            this.pendingOperations.add(initCleanup);
-            const initPromise = App.nostr.init(user);
-            try {
-                await initPromise;
-            } finally {
-                this.pendingOperations.delete(initCleanup);
             }
 
-            if (localSignal?.aborted) {
-                console.log('[Onboarding] Auto-authentication aborted after init');
-                return;
-            }
-
-            // Configure discovery relays
-            if (App.configureRelays) {
-                await App.configureRelays(App.nostr.relayUrls || [], { skipNetwork: true, includePersisted: true });
-            }
-
-            if (localSignal?.aborted) {
-                console.log('[Onboarding] Auto-authentication aborted after relay configuration');
-                return;
-            }
-
-            // Fetch latest profile
-            try {
-                const profile = await App.nostr.client.fetchUserProfile(user.pubkey);
-                Object.assign(user, profile);
+            if (typeof App.saveUserToLocalStorage === 'function') {
                 App.saveUserToLocalStorage();
-                App.updateProfileDisplay();
-            } catch (err) {
-                console.warn('[Onboarding] Could not fetch profile during auto-auth:', err);
             }
 
+            if (typeof App.syncHypertunaConfigToFile === 'function') {
+                await App.syncHypertunaConfigToFile();
+            }
+
+            await this.bootstrapAuthenticatedSession(user);
+
             if (localSignal?.aborted) {
-                console.log('[Onboarding] Auto-authentication aborted before worker start');
+                console.log('[Onboarding] Auto-authentication aborted after bootstrap');
                 return;
             }
 
-            // Start worker using existing logic
-            if (window.startWorker) {
-                console.log('[Onboarding] Starting worker');
-                const key = await window.startWorker();
-                if (key && user.hypertunaConfig) {
-                    user.hypertunaConfig.swarmPublicKey = key;
-                    await HypertunaUtils.saveConfig(user.hypertunaConfig);
-                    App.saveUserToLocalStorage();
-                }
-                if (window.refreshGatewayStatus) {
-                    await window.refreshGatewayStatus({ fetchOptions: false });
-                }
-            }
-
-            if (localSignal?.aborted) {
-                console.log('[Onboarding] Auto-authentication aborted before completion');
-                return;
-            }
-
-            // Complete onboarding
             this.completeOnboarding();
 
         } catch (error) {
             console.error('[Onboarding] Auto-authentication failed:', error);
+            this.broadcastStatus('auto-auth-error', `Auto-authentication failed: ${error.message}`, 'error');
             this.navigateTo('welcome');
         }
     },
@@ -2564,6 +2624,8 @@ const OnboardingFlow = {
         this.clearPendingTimers({ cancelNostr: false });
         this.ensureOverlayVisible();
         this.markAuthenticated();
+
+        this.broadcastStatus('complete', 'Relays ready.');
 
         // Prepare main app view before the overlay fades away
         App.currentPage = 'groups';
@@ -2585,6 +2647,7 @@ const OnboardingFlow = {
             this.overlay.style.transition = '';
             this.overlay.style.opacity = '1';
             console.log('[Onboarding] Onboarding complete, user in app');
+            this.broadcastStatus('clear', '');
         }, 500);
     }
 };

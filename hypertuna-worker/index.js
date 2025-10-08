@@ -1583,25 +1583,34 @@ async function main() {
       
       console.log('[Worker] Relay server base initialization complete')
 
-      let gatewayReady = false
-      try {
-        console.log('[Worker] Starting gateway service before auto-connecting relays...')
-        await startGatewayService()
-        gatewayReady = await waitForGatewayReady()
-        if (!gatewayReady) {
-          console.warn('[Worker] Gateway did not report ready status within timeout; proceeding cautiously')
+      const gatewayReadyPromise = (async () => {
+        try {
+          console.log('[Worker] Starting gateway service before auto-connecting relays...')
+          await startGatewayService()
+          const ready = await waitForGatewayReady()
+          if (!ready) {
+            console.warn('[Worker] Gateway did not report ready status within timeout; proceeding cautiously')
+          }
+          return ready
+        } catch (gatewayError) {
+          console.error('[Worker] Failed to auto-start gateway:', gatewayError)
+          sendMessage({ type: 'gateway-error', message: gatewayError.message })
+          return false
         }
-      } catch (gatewayError) {
-        console.error('[Worker] Failed to auto-start gateway:', gatewayError)
-        sendMessage({ type: 'gateway-error', message: gatewayError.message })
-      }
+      })()
 
-      let connectedRelays = []
-      try {
-        connectedRelays = await relayServer.connectStoredRelays()
-      } catch (connectError) {
-        console.error('[Worker] Failed to auto-connect stored relays:', connectError)
-      }
+      const connectRelaysPromise = (async () => {
+        try {
+          return await relayServer.connectStoredRelays()
+        } catch (connectError) {
+          console.error('[Worker] Failed to auto-connect stored relays:', connectError)
+          return []
+        }
+      })()
+
+      const [connectedRelaysRaw, gatewayReadyResult] = await Promise.all([connectRelaysPromise, gatewayReadyPromise])
+      const connectedRelays = Array.isArray(connectedRelaysRaw) ? connectedRelaysRaw : []
+      const gatewayReady = !!gatewayReadyResult
 
       if (Array.isArray(connectedRelays)) {
         config.relays = connectedRelays
