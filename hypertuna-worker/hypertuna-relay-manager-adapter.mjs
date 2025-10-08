@@ -319,16 +319,25 @@ function generatePublicIdentifier(npub, relayName) {
     return `${npub}:${camelCaseName}`;
 }
 
-function emitRelayLoadingEvent({ relayKey, publicIdentifier = null, name = '' }, stage = 'connecting') {
+function emitRelayLoadingEvent({ relayKey, publicIdentifier = null, name = '' }, stage = 'connecting', extra = {}) {
     if (!global.sendMessage) return;
     try {
-        global.sendMessage({
+        const payload = {
             type: 'relay-loading',
             relayKey,
             publicIdentifier,
             name,
             stage,
             timestamp: new Date().toISOString()
+        };
+        if (typeof extra.totalRelays === 'number') {
+            payload.total = extra.totalRelays;
+        }
+        if (typeof extra.count === 'number') {
+            payload.count = extra.count;
+        }
+        global.sendMessage({
+            ...payload
         });
     } catch (error) {
         console.warn('[RelayAdapter] Failed to emit relay-loading event:', error?.message || error);
@@ -607,12 +616,25 @@ export async function autoConnectStoredRelays(config) {
         // Import auth store for loading auth configurations
         const { getRelayAuthStore } = await import('./relay-auth-store.mjs');
         const authStore = getRelayAuthStore();
-        
+
+        if (global.sendMessage) {
+            try {
+                global.sendMessage({
+                    type: 'relay-loading',
+                    stage: 'relay-count',
+                    total: relayProfiles.length,
+                    timestamp: new Date().toISOString()
+                });
+            } catch (error) {
+                console.warn('[RelayAdapter] Failed to emit relay-count event:', error?.message || error);
+            }
+        }
+
         const connectedRelays = [];
         const failedRelays = [];
 
         const connectTasks = relayProfiles.map((profile) =>
-            connectStoredRelayProfile(profile, config, authStore)
+            connectStoredRelayProfile(profile, config, authStore, { totalRelays: relayProfiles.length })
         );
 
         const settledResults = await Promise.allSettled(connectTasks);
@@ -678,7 +700,7 @@ export async function autoConnectStoredRelays(config) {
     }
 }
 
-async function connectStoredRelayProfile(profile, config, authStore) {
+async function connectStoredRelayProfile(profile, config, authStore, options = {}) {
     const relayKey = profile?.relay_key;
     if (!relayKey) {
         return { success: false, relayKey: null, error: 'Missing relay key' };
@@ -692,7 +714,7 @@ async function connectStoredRelayProfile(profile, config, authStore) {
         relayKey,
         publicIdentifier,
         name: displayName
-    }, isAlreadyActive ? 'already-active' : 'connecting');
+    }, isAlreadyActive ? 'already-active' : 'connecting', options);
 
     try {
         if (isAlreadyActive) {
@@ -753,7 +775,7 @@ async function connectStoredRelayProfile(profile, config, authStore) {
         }
 
         if (profile.auto_connect === false) {
-            emitRelayLoadingEvent({ relayKey, publicIdentifier, name: displayName }, 'skipped');
+            emitRelayLoadingEvent({ relayKey, publicIdentifier, name: displayName }, 'skipped', options);
             return {
                 success: false,
                 relayKey,
@@ -860,7 +882,7 @@ async function connectStoredRelayProfile(profile, config, authStore) {
             });
         }
 
-        emitRelayLoadingEvent({ relayKey, publicIdentifier, name: displayName }, 'initialized');
+        emitRelayLoadingEvent({ relayKey, publicIdentifier, name: displayName }, 'initialized', options);
 
         return { success: true, relayKey };
     } catch (error) {
@@ -873,6 +895,7 @@ async function connectStoredRelayProfile(profile, config, authStore) {
                 timestamp: new Date().toISOString()
             });
         }
+        emitRelayLoadingEvent({ relayKey, publicIdentifier, name: displayName }, 'relay-error', { ...options, count: options.totalRelays });
         return {
             success: false,
             relayKey,

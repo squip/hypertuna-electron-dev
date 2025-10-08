@@ -202,7 +202,12 @@
                         </button>
                     </div>
 
-                    <div id="relay-status-banner" class="relay-status hidden" role="status" aria-live="polite"></div>
+                    <div id="relay-progress" class="relay-progress hidden" role="status" aria-live="polite">
+                        <div class="relay-progress__label">Loading your relays...</div>
+                        <div class="relay-progress__track">
+                            <div class="relay-progress__indicator"></div>
+                        </div>
+                    </div>
 
                     <div id="invite-summary" class="invite-summary hidden">
                         <span id="invite-count">0</span> invite(s) pending
@@ -1436,8 +1441,8 @@
               
               // Additional UI updates based on current page
               if (this.currentPage === 'groups' && isLoggedIn) {
-                  if (typeof this.updateRelayStatusBanner === 'function' && this.relayStatusState?.message) {
-                      this.updateRelayStatusBanner(this.relayStatusState);
+                  if (this.relayProgress && typeof this.relayProgress.sync === 'function') {
+                      this.relayProgress.sync();
                   }
                   // Check if relay is connected
                   if ((this.relay && this.relay.isConnected()) || 

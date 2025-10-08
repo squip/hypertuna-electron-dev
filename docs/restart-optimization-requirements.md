@@ -27,3 +27,11 @@
 4. The status component must hide automatically once relay initialization completes and at least one relay is available (or when the worker reports no relays).
 5. Status updates must be accessible across both the legacy worker log list and the new groups page without duplicating business logic.
 
+## R5. Progress Bar Loading Experience
+1. Replace the existing relay status banner with a compact progress bar element rendered beneath the “Your Relays” header, accompanied by static text “Loading your relays…”.
+2. The progress bar must initialize in a hidden state and become visible when the first loading signal (worker status, onboarding stage, or `relay-loading` event) is received.
+3. Progress should advance in discrete intervals that correspond to relay initialization milestones. When worker payloads disclose the number of relays expected, set `totalSteps` equal to that value (minimum of 1) and advance the bar as each relay completes (`initialized`, `already-active`, or `relay-registered`).
+4. When the relay count is unknown, fall back to a deterministic three-step sequence (worker ready, gateway ready, relays synced) so the bar still animates smoothly.
+5. Clamp visible progress at 95% until a terminal event (`all-relays-initialized` or explicit completion) arrives, then animate the bar to 100% and fade the component away after a short delay (~750 ms) if relays exist. If no relays are found, show an empty-state message once the bar completes.
+6. Debounce rapid event bursts to maintain readability: each advancement should animate over at least 150 ms, and consecutive updates should not jump backwards.
+7. Provide a simple controller API (`start`, `advance`, `complete`, `reset`) accessible from onboarding, worker message handlers, and future flows without duplicating logic.

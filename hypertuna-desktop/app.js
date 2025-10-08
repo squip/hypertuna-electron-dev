@@ -1549,6 +1549,9 @@ async function startWorker() {
   console.log('[App] startWorker() called at:', new Date().toISOString());
 
   relayInitializationComplete = false
+  if (window.App?.relayProgress && typeof window.App.relayProgress.reset === 'function') {
+    window.App.relayProgress.reset({ hide: true })
+  }
   if (!relayCacheHydrated) {
     hydrateRelayListFromCache()
   }
@@ -1938,6 +1941,8 @@ async function handleWorkerMessage(message) {
             source: 'worker',
             relayKey: message.relayKey || null,
             publicIdentifier: message.publicIdentifier || null,
+            count: typeof message.count === 'number' ? message.count : undefined,
+            total: typeof message.total === 'number' ? message.total : undefined,
             timestamp: Date.now()
           }
         }))
@@ -2000,6 +2005,7 @@ async function handleWorkerMessage(message) {
             message: statusMessage,
             variant: initializedCount > 0 ? 'success' : 'warning',
             source: 'worker',
+            count: typeof message.count === 'number' ? message.count : undefined,
             timestamp: Date.now()
           }
         }))
@@ -2041,6 +2047,25 @@ async function handleWorkerMessage(message) {
       }
       break
       
+    case 'relay-initialization-failed':
+      addLog(`Relay initialization failed for ${message.relayKey || 'unknown'}: ${message.error}`, 'error')
+      try {
+        window.dispatchEvent(new CustomEvent('relay-loading-status', {
+          detail: {
+            stage: 'relay-error',
+            message: message.error || 'Relay initialization failed',
+            variant: 'error',
+            source: 'worker',
+            relayKey: message.relayKey || null,
+            publicIdentifier: message.publicIdentifier || null,
+            timestamp: Date.now()
+          }
+        }))
+      } catch (error) {
+        console.warn('[App] Failed to broadcast relay error status:', error)
+      }
+      break
+
     case 'relay-disconnected':
       if (message.data.success) {
         addLog(`Disconnected from relay successfully`, 'status')

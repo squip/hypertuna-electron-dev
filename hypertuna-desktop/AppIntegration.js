@@ -111,65 +111,215 @@ function integrateNostrRelays(App) {
     App.relayGatewayLastToken = null;
     App.currentGroupIsMember = false;
 
-    const relayStatusBanner = document.getElementById('relay-status-banner');
-    const relayStatusVariants = ['info', 'success', 'warning', 'error'];
+    const relayProgressContainer = document.getElementById('relay-progress');
+    const relayProgressIndicator = relayProgressContainer?.querySelector('.relay-progress__indicator') || null;
+    const relayProgressLabel = relayProgressContainer?.querySelector('.relay-progress__label') || null;
 
-    App.relayStatusState = { stage: null, message: null, variant: 'info' };
+    const RelayProgressController = {
+        container: relayProgressContainer,
+        indicator: relayProgressIndicator,
+        label: relayProgressLabel,
+        active: false,
+        expectedRelays: null,
+        completedRelays: new Set(),
+        seenRelays: new Set(),
+        fallbackStages: ['worker-ready', 'gateway-ready', 'relays-synced'],
+        fallbackIndex: 0,
+        currentProgress: 0,
+        minProgress: 0.05,
+        hideTimeout: null,
+
+        ensureVisible() {
+            if (!this.container) return;
+            if (this.hideTimeout) {
+                clearTimeout(this.hideTimeout);
+                this.hideTimeout = null;
+            }
+            this.container.classList.remove('hidden');
+            if (this.label) {
+                this.label.textContent = 'Loading your relays...';
+            }
+        },
+
+        setProgress(value, { allowComplete = false } = {}) {
+            if (!this.indicator) return;
+            const capped = allowComplete ? Math.min(Math.max(value, this.currentProgress), 1) : Math.min(Math.max(value, this.currentProgress, this.minProgress), 0.95);
+            if (capped <= this.currentProgress + 0.001) return;
+            this.currentProgress = capped;
+            requestAnimationFrame(() => {
+                this.indicator.style.width = `${Math.round(this.currentProgress * 1000) / 10}%`;
+            });
+        },
+
+        reset({ hide = false } = {}) {
+            if (this.hideTimeout) {
+                clearTimeout(this.hideTimeout);
+                this.hideTimeout = null;
+            }
+            this.expectedRelays = null;
+            this.completedRelays.clear();
+            this.seenRelays.clear();
+            this.fallbackIndex = 0;
+            this.currentProgress = 0;
+            if (this.indicator) {
+                this.indicator.style.width = '0%';
+            }
+            if (hide && this.container) {
+                this.container.classList.add('hidden');
+            }
+            this.active = !hide;
+        },
+
+        start(options = {}) {
+            this.ensureVisible();
+            if (!this.active) {
+                this.reset();
+                this.active = true;
+            }
+            if (options.totalSteps && (!this.expectedRelays || options.totalSteps > this.expectedRelays)) {
+                this.expectedRelays = Math.max(1, options.totalSteps);
+            }
+            this.setProgress(this.minProgress);
+        },
+
+        noteTotalRelays(count) {
+            if (typeof count !== 'number' || count < 1) return;
+            this.expectedRelays = Math.max(count, this.expectedRelays || 0, this.seenRelays.size || 1);
+        },
+
+        registerRelay(relayKey) {
+            this.start();
+            if (!relayKey) return;
+            if (!this.seenRelays.has(relayKey)) {
+                this.seenRelays.add(relayKey);
+                if (this.expectedRelays) {
+                    this.expectedRelays = Math.max(this.expectedRelays, this.seenRelays.size);
+                } else {
+                    this.expectedRelays = this.seenRelays.size;
+                }
+            }
+        },
+
+        markRelayComplete(relayKey) {
+            this.start();
+            if (relayKey) {
+                this.seenRelays.add(relayKey);
+                this.completedRelays.add(relayKey);
+            }
+            const total = Math.max(this.expectedRelays || this.seenRelays.size || 1, 1);
+            const completed = Math.min(this.completedRelays.size, total);
+            const target = completed / total;
+            this.setProgress(target * 0.95);
+        },
+
+        fallbackAdvance(stage = '') {
+            if (this.expectedRelays && this.expectedRelays >= 1) {
+                return;
+            }
+            if (this.fallbackIndex < this.fallbackStages.length) {
+                this.fallbackIndex += 1;
+            }
+            const base = this.fallbackIndex / (this.fallbackStages.length + 1);
+            const target = Math.min(0.85, base || this.minProgress);
+            this.setProgress(target);
+        },
+
+        markError() {
+            this.ensureVisible();
+            if (this.label) {
+                this.label.textContent = 'Unable to load relays';
+            }
+            this.setProgress(1, { allowComplete: true });
+            if (this.hideTimeout) clearTimeout(this.hideTimeout);
+            this.hideTimeout = setTimeout(() => {
+                this.reset({ hide: true });
+            }, 1200);
+        },
+
+        complete(totalCount = null) {
+            if (typeof totalCount === 'number') {
+                this.noteTotalRelays(totalCount);
+            }
+            this.setProgress(1, { allowComplete: true });
+            if (this.hideTimeout) clearTimeout(this.hideTimeout);
+            this.hideTimeout = setTimeout(() => {
+                this.reset({ hide: true });
+            }, 750);
+        },
+
+        sync() {
+            if (!this.active && this.container) {
+                this.container.classList.add('hidden');
+            }
+        },
+
+        handleStage(detail = {}) {
+            const stage = detail.stage || '';
+            const relayKey = detail.relayKey || detail.publicIdentifier || null;
+
+            switch (stage) {
+                case 'worker-start':
+                case 'worker-status':
+                case 'nostr-init':
+                case 'login-start':
+                case 'account-create':
+                case 'auto-auth-start':
+                case 'relay-configure':
+                case 'syncing':
+                    this.start();
+                    this.fallbackAdvance(stage);
+                    break;
+
+                case 'worker-ready':
+                case 'gateway-ready':
+                    this.start();
+                    this.fallbackAdvance(stage);
+                    break;
+
+                case 'connecting':
+                    this.registerRelay(relayKey);
+                    break;
+
+                case 'already-active':
+                    this.registerRelay(relayKey);
+                    this.markRelayComplete(relayKey);
+                    break;
+
+                case 'initialized':
+                case 'relay-registered':
+                case 'skipped':
+                    this.markRelayComplete(relayKey);
+                    break;
+
+                case 'relay-count':
+                    this.start({ totalSteps: detail.total || detail.count });
+                    this.noteTotalRelays(detail.total || detail.count);
+                    break;
+
+                case 'all-relays-initialized':
+                case 'complete':
+                    this.noteTotalRelays(detail.count);
+                    this.complete(detail.count);
+                    break;
+
+                case 'worker-error':
+                case 'auto-auth-error':
+                case 'relay-error':
+                    this.markError();
+                    break;
+
+                default:
+                    break;
+            }
+        }
+    };
+
+    App.relayProgress = RelayProgressController;
     App.relayInitializationComplete = false;
     App.relayInitializationReportedCount = null;
 
-    App.updateRelayStatusBanner = function({ message = '', variant = 'info', stage = null } = {}) {
-        if (!relayStatusBanner) return;
-
-        relayStatusVariants.forEach((key) => relayStatusBanner.classList.remove(key));
-
-        if (!message) {
-            relayStatusBanner.classList.add('hidden');
-            relayStatusBanner.textContent = '';
-            App.relayStatusState = { stage, message: '', variant };
-            return;
-        }
-
-        const normalizedVariant = relayStatusVariants.includes(variant) ? variant : 'info';
-        relayStatusBanner.textContent = message;
-        relayStatusBanner.classList.remove('hidden');
-        relayStatusBanner.classList.add(normalizedVariant);
-        App.relayStatusState = { stage, message, variant: normalizedVariant };
-    };
-
-    App.clearRelayStatusBanner = function() {
-        App.updateRelayStatusBanner({ message: '', stage: 'clear' });
-    };
-
     window.addEventListener('relay-loading-status', (event) => {
-        const detail = event?.detail || {};
-        let { variant = 'info', stage = null } = detail;
-        const message = detail.message ?? '';
-
-        if (!variant && typeof stage === 'string') {
-            if (stage.includes('error')) {
-                variant = 'error';
-            } else if (stage.includes('warning')) {
-                variant = 'warning';
-            } else if (stage === 'complete' || stage.includes('ready')) {
-                variant = 'success';
-            } else {
-                variant = 'info';
-            }
-        }
-
-        if (stage === 'clear' || (!message && stage !== 'complete')) {
-            App.clearRelayStatusBanner();
-            return;
-        }
-
-        App.updateRelayStatusBanner({ message: message || 'Loading your relays...', variant, stage });
-
-        if (['complete', 'relay-registered', 'all-relays-initialized'].includes(stage) && variant === 'success') {
-            setTimeout(() => {
-                App.updateRelayStatusBanner({ message: '', stage: 'clear' });
-            }, 2000);
-        }
+        RelayProgressController.handleStage(event?.detail || {});
     });
 
     // Track discovery relay connections displayed in profile UI
