@@ -2219,20 +2219,31 @@ const OnboardingFlow = {
             }
         }
 
-        try {
-            const profile = await App.nostr.client.fetchUserProfile(user.pubkey);
-            if (profile && typeof profile === 'object') {
-                Object.assign(user, profile);
-                if (typeof App.saveUserToLocalStorage === 'function') {
-                    App.saveUserToLocalStorage();
-                }
-                if (typeof App.updateProfileDisplay === 'function') {
-                    App.updateProfileDisplay();
-                }
+        const hydrateProfile = async (context = 'initial') => {
+            if (!App?.nostr?.client || typeof App.nostr.client.fetchUserProfile !== 'function') {
+                return;
             }
-        } catch (error) {
-            console.warn('[Onboarding] Could not fetch user profile:', error);
-        }
+
+            try {
+                const forceRefresh = context !== 'initial';
+                const profile = await App.nostr.client.fetchUserProfile(user.pubkey, { forceRefresh });
+                if (profile && typeof profile === 'object') {
+                    Object.assign(user, profile);
+                    if (typeof App.saveUserToLocalStorage === 'function') {
+                        App.saveUserToLocalStorage();
+                    }
+                    if (typeof App.updateProfileDisplay === 'function') {
+                        App.updateProfileDisplay();
+                    }
+                }
+            } catch (error) {
+                console.warn(`[Onboarding] Could not fetch user profile (${context}):`, error);
+            }
+        };
+
+        this._hydrateProfile = hydrateProfile;
+
+        await hydrateProfile('initial');
 
         return true;
     },
@@ -2263,9 +2274,17 @@ const OnboardingFlow = {
             setTimeout(() => {
                 try {
                     if (App?.nostr && typeof App.nostr.resumeDiscovery === 'function') {
-                        App.nostr.resumeDiscovery({ force: true }).catch((error) => {
-                            console.warn('[Onboarding] Deferred discovery failed:', error);
-                        });
+                        const postDiscoveryHydrator = this._hydrateProfile;
+                        App.nostr.resumeDiscovery({ force: true })
+                            .then(() => {
+                                if (typeof postDiscoveryHydrator === 'function') {
+                                    return postDiscoveryHydrator('post-discovery');
+                                }
+                                return null;
+                            })
+                            .catch((error) => {
+                                console.warn('[Onboarding] Deferred discovery failed:', error);
+                            });
                     }
                 } catch (error) {
                     console.warn('[Onboarding] Failed to resume discovery:', error);

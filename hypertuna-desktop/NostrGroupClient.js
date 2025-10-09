@@ -12,6 +12,25 @@ import { prepareFileAttachment } from './FileAttachmentHelper.js';
 
 const GROUP_METADATA_CACHE_KEY = 'hypertuna_group_metadata_cache_v1';
 
+function markProfileSeed(profile) {
+    if (!profile || typeof profile !== 'object') {
+        return profile;
+    }
+    if (profile.__seed) {
+        return profile;
+    }
+    Object.defineProperty(profile, '__seed', {
+        value: true,
+        enumerable: false,
+        configurable: true
+    });
+    return profile;
+}
+
+function isSeedProfile(profile) {
+    return !!(profile && profile.__seed);
+}
+
 const electronAPI = window.electronAPI || null;
 const isElectron = !!electronAPI;
 
@@ -279,13 +298,14 @@ class NostrGroupClient {
                 pictureTagUrl: seedProfile.pictureTagUrl ?? null,
                 pictureIsHypertunaPfp: !!seedProfile.pictureIsHypertunaPfp
             };
-            this.cachedProfiles.set(user.pubkey, seededProfile);
+            this.cachedProfiles.set(user.pubkey, markProfileSeed(seededProfile));
         } else if ((user?.name || user?.about) && !this.cachedProfiles.has(user.pubkey)) {
-            this.cachedProfiles.set(user.pubkey, {
+            const seededProfile = {
                 pubkey: user.pubkey,
                 name: user.name || null,
                 about: user.about || ''
-            });
+            };
+            this.cachedProfiles.set(user.pubkey, markProfileSeed(seededProfile));
         }
 
         this.discoveryPending = true;
@@ -1397,14 +1417,17 @@ async fetchMultipleProfiles(pubkeys) {
     // Add default profiles for any still missing
     missingPubkeys.forEach(pubkey => {
         if (!profilesMap.has(pubkey)) {
-            const defaultProfile = {
+            const defaultProfile = markProfileSeed({
                 name: `User_${NostrUtils.truncatePubkey(pubkey)}`,
                 pubkey
-            };
+            });
             profilesMap.set(pubkey, defaultProfile);
+            if (!this.cachedProfiles.has(pubkey)) {
+                this.cachedProfiles.set(pubkey, defaultProfile);
+            }
         }
     });
-    
+
     return profilesMap;
 }
 
@@ -2386,12 +2409,19 @@ async fetchMultipleProfiles(pubkeys) {
      * @param {string} pubkey - Public key
      * @returns {Promise<Object>} - Profile data
      */
-    async fetchUserProfile(pubkey) {
+    async fetchUserProfile(pubkey, options = {}) {
+        const { forceRefresh = false } = options;
+
         // Check cache first
         if (this.cachedProfiles.has(pubkey)) {
             const cachedProfile = this.cachedProfiles.get(pubkey);
-            console.log(`Using cached profile for ${pubkey.substring(0, 8)}...`, cachedProfile);
-            return cachedProfile;
+            if (!forceRefresh && !isSeedProfile(cachedProfile)) {
+                console.log(`Using cached profile for ${pubkey.substring(0, 8)}...`, cachedProfile);
+                return cachedProfile;
+            }
+            if (!forceRefresh && isSeedProfile(cachedProfile)) {
+                console.log(`Cached profile for ${pubkey.substring(0, 8)} is placeholder, refreshing...`);
+            }
         }
         
         // Create a temporary subscription for this profile
@@ -2447,10 +2477,10 @@ async fetchMultipleProfiles(pubkeys) {
             // Set a timeout to resolve with default profile if no profile found
             timeoutId = setTimeout(() => {
                 this.relayManager.unsubscribe(subId);
-                const defaultProfile = { 
+                const defaultProfile = markProfileSeed({ 
                     name: `User_${NostrUtils.truncatePubkey(pubkey)}`,
                     pubkey
-                };
+                });
                 console.log(`Profile fetch timeout for ${pubkey.substring(0, 8)}, using default:`, defaultProfile);
                 this.cachedProfiles.set(pubkey, defaultProfile);
                 resolve(defaultProfile);
