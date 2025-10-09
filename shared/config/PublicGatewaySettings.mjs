@@ -1,7 +1,7 @@
 const VALID_SELECTION_MODES = new Set(['default', 'discovered', 'manual']);
 
 const DEFAULT_SETTINGS = Object.freeze({
-  enabled: false,
+  enabled: true,
   selectionMode: 'default',
   selectedGatewayId: null,
   preferredBaseUrl: 'https://hypertuna.com',
@@ -123,6 +123,10 @@ function withDefaults(raw = {}) {
 
   if (!merged.preferredBaseUrl) {
     merged.preferredBaseUrl = DEFAULT_SETTINGS.preferredBaseUrl;
+  }
+
+  if (normalized.enabled === false && (!normalized.sharedSecret || normalized.sharedSecret.length === 0) && (normalized.selectionMode || 'default') !== 'manual') {
+    merged.enabled = true;
   }
 
   const hasLegacySecret = typeof normalized.sharedSecret === 'string' && normalized.sharedSecret.trim().length > 0;

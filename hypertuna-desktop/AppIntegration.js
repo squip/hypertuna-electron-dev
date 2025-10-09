@@ -2388,17 +2388,26 @@ App.syncHypertunaConfigToFile = async function() {
             const allowedIds = this.nostr.getUserRelayGroupIds();
             
             // Extra safety: filter out any groups that don't have the user as a member
+            const membershipMap = this.nostr?.client?.groupMembers || null;
             const groups = allGroups.filter(g => {
+                const hypertunaId = g.hypertunaId || g.id;
+                if (!hypertunaId) return false;
+
                 // Must be in the user's relay list
-                if (!allowedIds.includes(g.hypertunaId)) {
+                if (!allowedIds.includes(hypertunaId)) {
                     return false;
                 }
-                
-                // Additional check: verify user is actually a member
+
+                const membershipKnown = membershipMap ? membershipMap.has(g.id) : false;
+                if (!membershipKnown) {
+                    return true;
+                }
+
+                // Additional check: verify user is actually a member when data is available
                 const isMember = this.nostr.isGroupMember(g.id, this.currentUser.pubkey);
                 const isAdmin = this.nostr.isGroupAdmin(g.id, this.currentUser.pubkey);
                 const isCreator = g.event && g.event.pubkey === this.currentUser.pubkey;
-                
+
                 return isMember || isAdmin || isCreator;
             });
             
@@ -4725,6 +4734,17 @@ App.setupFollowingModalListeners = function() {
         state.initCount++;
         state.lastUrl = data.gatewayUrl;
         state.requiresAuth = data.requiresAuth === true;
+        if (data.userAuthToken) {
+            state.authToken = data.userAuthToken;
+            if (data.gatewayUrl) {
+                this.relayGatewayLastToken = {
+                    relayKey: identifier,
+                    connectionUrl: data.gatewayUrl,
+                    token: data.userAuthToken,
+                    expiresAt: data.expiresAt || null
+                };
+            }
+        }
         
         console.log(`[App] Relay ${identifier} state after initialized:`, state);
         
@@ -4764,12 +4784,33 @@ App.setupFollowingModalListeners = function() {
         if (data.gatewayUrl) {
             state.lastUrl = data.gatewayUrl;
         }
-        
+        const authToken = data.userAuthToken || data.authToken || null;
+        if (authToken) {
+            state.authToken = authToken;
+        }
+
         console.log(`[App] Relay ${identifier} state after registered:`, state);
         console.log('[App] All relay states:', Array.from(relayReadinessTracker.entries()));
-        
+
+        if (authToken && data.gatewayUrl) {
+            this.relayGatewayLastToken = {
+                relayKey: identifier,
+                connectionUrl: data.gatewayUrl,
+                token: authToken,
+                expiresAt: data.expiresAt || null
+            };
+        }
+
         if (this.nostr) {
-            this.nostr.handleRelayRegistered(identifier);
+            this.nostr.handleRelayRegistered(identifier, {
+                gatewayUrl: data.gatewayUrl || null,
+                authToken,
+                requiresAuth: data.requiresAuth === true
+            });
+        }
+
+        if (typeof this.refreshRelayGatewayCard === 'function') {
+            this.refreshRelayGatewayCard();
         }
     };
 

@@ -101,9 +101,9 @@ class NostrIntegration {
     /**
      * Handle relay registered notification from worker
      */
-    handleRelayRegistered(identifier) {
+    handleRelayRegistered(identifier, details = {}) {
         if (this.client) {
-            this.client.handleRelayRegistered(identifier);
+            this.client.handleRelayRegistered(identifier, details);
         }
     }
 

@@ -10,6 +10,8 @@ import NostrEvents from './NostrEvents.js';
 import { NostrUtils } from './NostrUtils.js';
 import { prepareFileAttachment } from './FileAttachmentHelper.js';
 
+const GROUP_METADATA_CACHE_KEY = 'hypertuna_group_metadata_cache_v1';
+
 const electronAPI = window.electronAPI || null;
 const isElectron = !!electronAPI;
 
@@ -96,6 +98,9 @@ class NostrGroupClient {
                 });
             });
         }
+
+        this.metadataCache = new Map();
+        this._loadMetadataCache();
     }
 
     _getBaseRelayUrl(url) {
@@ -139,7 +144,72 @@ class NostrGroupClient {
 
         this._authFailureListenerRegistered = true;
     }
-    
+
+    _loadMetadataCache() {
+        if (typeof localStorage === 'undefined') {
+            return;
+        }
+
+        try {
+            const raw = localStorage.getItem(GROUP_METADATA_CACHE_KEY);
+            if (!raw) return;
+            const parsed = JSON.parse(raw);
+            if (!parsed || typeof parsed !== 'object') return;
+            const entries = Array.isArray(parsed.entries) ? parsed.entries : []; 
+            entries.forEach((entry) => {
+                if (!entry || !entry.id) return;
+                this.metadataCache.set(entry.id, entry);
+            });
+        } catch (error) {
+            console.warn('[NostrGroupClient] Failed to load group metadata cache:', error);
+        }
+    }
+
+    _saveMetadataCache() {
+        if (typeof localStorage === 'undefined') {
+            return;
+        }
+
+        try {
+            const serialized = JSON.stringify({ entries: Array.from(this.metadataCache.values()) });
+            localStorage.setItem(GROUP_METADATA_CACHE_KEY, serialized);
+        } catch (error) {
+            console.warn('[NostrGroupClient] Failed to persist group metadata cache:', error);
+        }
+    }
+
+    _cacheGroupMetadata(groupData = null) {
+        if (!groupData || !groupData.id) return;
+
+        const { event, ...rest } = groupData;
+        const cached = this.metadataCache.get(groupData.id) || {};
+        const nextEntry = {
+            ...cached,
+            ...rest,
+            createdAt: groupData.createdAt || cached.createdAt || null
+        };
+
+        this.metadataCache.set(groupData.id, nextEntry);
+        this._saveMetadataCache();
+    }
+
+    _hydrateCachedMetadata() {
+        if (!this.metadataCache || this.metadataCache.size === 0) {
+            return;
+        }
+
+        this.metadataCache.forEach((entry, groupId) => {
+            if (!entry || !groupId) return;
+            if (!this.groups.has(groupId)) {
+                this.groups.set(groupId, entry);
+            }
+            if (entry.hypertunaId) {
+                this.hypertunaGroups.set(entry.hypertunaId, groupId);
+                this.groupHypertunaIds.set(groupId, entry.hypertunaId);
+            }
+        });
+    }
+
     /**
      * Initialize the client
      * @param {Object} user - User object with privateKey and pubkey
@@ -189,8 +259,10 @@ class NostrGroupClient {
         this.shutdownRequested = false;
         this.user = user;
         this.relevantPubkeys.add(user.pubkey);
-        
+
         // Connect only to discovery relays initially
+        this._hydrateCachedMetadata();
+
         for (const url of discoveryRelays) {
             if (this.shutdownRequested || this.cancelled) {
                 throw new Error('Discovery relay initialization cancelled');
@@ -519,7 +591,7 @@ class NostrGroupClient {
             console.log(`[NostrGroupClient] No pending connection for ${targetId}, queueing now...`);
             this.queueRelayConnection(targetId, gatewayUrl);
         }
-    
+
         // Always store readiness in case the connection hasn't been queued yet
         const existing = this.relayReadyStates.get(targetId) || {};
         this.relayReadyStates.set(targetId, {
@@ -529,6 +601,10 @@ class NostrGroupClient {
             authToken: authToken || existing.authToken || null,
             requiresAuth
         });
+
+        if (gatewayUrl) {
+            this.groupRelayUrls.set(targetId, gatewayUrl);
+        }
     }
     
     async _attemptConnectionIfReady(identifier) {
@@ -607,11 +683,11 @@ class NostrGroupClient {
         }
     }
 
-    async handleRelayRegistered(identifier) {
+    async handleRelayRegistered(identifier, details = {}) {
         if (this.shutdownRequested || this.cancelled) {
             return;
         }
-        console.log(`[NostrGroupClient] Relay registered signal for ${identifier}.`);
+        console.log(`[NostrGroupClient] Relay registered signal for ${identifier}.`, details);
 
         let targetId = identifier;
         if (!this.pendingRelayConnections.has(targetId) && this.internalToPublicMap.has(identifier)) {
@@ -619,19 +695,55 @@ class NostrGroupClient {
             console.log(`[NostrGroupClient] Mapped internal key ${identifier} to public identifier ${targetId}`);
         }
 
+        const state = this.relayReadyStates.get(targetId) || {};
+        const incomingUrl = details.gatewayUrl || state.relayUrl || null;
+        const requiresAuth = details.requiresAuth != null ? !!details.requiresAuth : state.requiresAuth;
+        const authToken = details.authToken || state.authToken || null;
+
         const connection = this.pendingRelayConnections.get(targetId);
         if (connection) {
             connection.isRegistered = true;
-            console.log(`[NostrGroupClient] Relay ${targetId} is now registered. Checking readiness...`);
-            this._clearRetryTimer(targetId);
-            this._attemptConnectionIfReady(targetId);
+            if (incomingUrl) {
+                connection.relayUrl = incomingUrl;
+            }
+            if (requiresAuth != null) {
+                connection.requiresAuth = requiresAuth;
+            }
         }
 
-        const existing = this.relayReadyStates.get(targetId) || {};
+        if (!connection && incomingUrl) {
+            console.log(`[NostrGroupClient] No pending connection for ${targetId}, queueing after registration.`);
+            this.queueRelayConnection(targetId, incomingUrl);
+        }
+
+        if (incomingUrl) {
+            this.groupRelayUrls.set(targetId, incomingUrl);
+        }
+
+        if (authToken) {
+            this.relayAuthTokens.set(targetId, authToken);
+        }
+
+        // Update readiness state
         this.relayReadyStates.set(targetId, {
-            ...existing,
-            isRegistered: true
+            ...state,
+            isRegistered: true,
+            relayUrl: incomingUrl || state.relayUrl || null,
+            requiresAuth,
+            authToken
         });
+
+        if (authToken) {
+            // Force the relay connection to use the latest tokenised URL
+            const currentUrl = this.groupRelayUrls.get(targetId) || incomingUrl || state.relayUrl || (connection && connection.originalUrl) || null;
+            if (currentUrl) {
+                this.relayManager.removeRelay(currentUrl);
+                this.queueRelayConnection(targetId, currentUrl);
+            }
+        }
+
+        this._clearRetryTimer(targetId);
+        this._attemptConnectionIfReady(targetId);
     }
 
     _resolveRelayUrl(connection, identifier, state = {}) {
@@ -2713,6 +2825,9 @@ async fetchMultipleProfiles(pubkeys) {
         // Extract relay URL from hypertuna event
         const relayUrl = NostrEvents._getTagValue(hypertunaEvent, 'd');
         const finalRelayUrl = normalizedData.authenticatedRelayUrl || relayUrl;
+        const relayUrlForList = this._getBaseRelayUrl(
+            normalizedData.authenticatedRelayUrl || finalRelayUrl || relayUrl
+        );
         
         if (normalizedData.isPublic) {
             // PUBLIC RELAY: Publish to discovery relays first
@@ -2728,8 +2843,8 @@ async fetchMultipleProfiles(pubkeys) {
         }
         
         // Update user relay list (always goes to discovery relays)
-        if (relayUrl && !normalizedData.authenticatedRelayUrl) {
-            await this.updateUserRelayList(hypertunaId, relayUrl, normalizedData.isPublic, true);
+        if (relayUrlForList) {
+            await this.updateUserRelayList(hypertunaId, relayUrlForList, normalizedData.isPublic, true);
         }
 
         // Connect to the new group relay
@@ -2796,10 +2911,6 @@ async fetchMultipleProfiles(pubkeys) {
 
         // Subscribe to this group
         this.subscribeToGroup(groupId);
-
-        if (finalRelayUrl && !normalizedData.authenticatedRelayUrl) {
-            await this.updateUserRelayList(hypertunaId, finalRelayUrl, normalizedData.isPublic, true);
-        }
 
         return eventsCollection;
     }

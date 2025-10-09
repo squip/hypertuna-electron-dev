@@ -19,6 +19,7 @@ import {
 import PublicGatewayRegistrar from './PublicGatewayRegistrar.mjs';
 import PublicGatewayDiscoveryClient from './PublicGatewayDiscoveryClient.mjs';
 import { getRelayAuthStore } from '../relay-auth-store.mjs';
+import { updatePublicGatewaySettings } from '../../shared/config/PublicGatewaySettings.mjs';
 
 const MAX_LOG_ENTRIES = 500;
 const DEFAULT_PORT = 8443;
@@ -215,6 +216,7 @@ export class GatewayService extends EventEmitter {
     this.discoveryDisabledReason = null;
     this.discoveryClient = null;
     this.discoveryClientReady = null;
+    this._discoveryRefreshScheduled = false;
     this.getCurrentPubkey = typeof options.getCurrentPubkey === 'function'
       ? options.getCurrentPubkey
       : () => options.currentPubkey || null;
@@ -326,6 +328,9 @@ export class GatewayService extends EventEmitter {
       this.discoveryClient = new PublicGatewayDiscoveryClient({ logger: this.loggerBridge });
       this.discoveryClient.on('updated', (catalog) => {
         this.discoveredGateways = catalog;
+        if (this.publicGatewaySettings?.enabled) {
+          this.#scheduleDiscoveryConfigRefresh();
+        }
         this.#emitPublicGatewayStatus();
       });
     }
@@ -345,6 +350,23 @@ export class GatewayService extends EventEmitter {
     } catch (error) {
       throw error;
     }
+  }
+
+  #scheduleDiscoveryConfigRefresh() {
+    if (this._discoveryRefreshScheduled) {
+      return;
+    }
+    this._discoveryRefreshScheduled = true;
+
+    queueMicrotask(() => {
+      this._discoveryRefreshScheduled = false;
+      if (!this.publicGatewaySettings?.enabled) {
+        return;
+      }
+      this.updatePublicGatewayConfig({ ...this.publicGatewaySettings }).catch((error) => {
+        this.log('debug', `[PublicGateway] Discovery refresh skipped: ${error.message}`);
+      });
+    });
   }
 
   async #resolvePublicGatewayConfig(rawConfig = {}) {
@@ -379,9 +401,7 @@ export class GatewayService extends EventEmitter {
     try {
       await this.#ensureDiscoveryClient();
     } catch (error) {
-      config.enabled = false;
       config.disabledReason = error?.message || 'Gateway discovery unavailable';
-      config.baseUrl = '';
       config.sharedSecret = '';
       return config;
     }
@@ -410,29 +430,23 @@ export class GatewayService extends EventEmitter {
 
     if (config.selectionMode === 'discovered') {
       if (!config.selectedGatewayId) {
-        config.enabled = false;
         config.disabledReason = 'No public gateway selected';
-        config.baseUrl = '';
         config.sharedSecret = '';
         return config;
       }
 
       const entry = this.discoveryClient.getGatewayById(config.selectedGatewayId);
       if (!entry) {
-        config.enabled = false;
         config.disabledReason = 'Selected public gateway is offline';
-        config.baseUrl = '';
         config.sharedSecret = '';
         return config;
       }
 
       resolvedEntry = await ensureEntrySecret(entry);
       if (!resolvedEntry || !resolvedEntry.sharedSecret) {
-        config.enabled = false;
         config.disabledReason = entry.isExpired
           ? 'Selected public gateway advertisement expired'
           : 'Unable to retrieve shared secret for selected gateway';
-        config.baseUrl = '';
         config.sharedSecret = '';
         return config;
       }
@@ -457,9 +471,7 @@ export class GatewayService extends EventEmitter {
       }
 
       if (!resolvedEntry || !resolvedEntry.sharedSecret) {
-        config.enabled = false;
         config.disabledReason = 'No open public gateways available';
-        config.baseUrl = '';
         config.sharedSecret = '';
         return config;
       }
@@ -950,6 +962,7 @@ export class GatewayService extends EventEmitter {
   }
 
   async updatePublicGatewayConfig(rawConfig = {}) {
+    const previousSettings = this.publicGatewaySettings;
     this.publicGatewaySettings = await this.#resolvePublicGatewayConfig(rawConfig);
     this.#configurePublicGateway();
 
@@ -963,6 +976,19 @@ export class GatewayService extends EventEmitter {
       }
     } else {
       this.publicGatewayRelayState.clear();
+    }
+
+    const previousHash = previousSettings?.resolvedSharedSecretHash || null;
+    const nextHash = this.publicGatewaySettings?.resolvedSharedSecretHash || null;
+    const statusChanged = Boolean(previousSettings?.enabled) !== Boolean(this.publicGatewaySettings?.enabled);
+    const secretChanged = previousHash !== nextHash && nextHash !== null;
+
+    if (statusChanged || secretChanged) {
+      try {
+        await updatePublicGatewaySettings(this.publicGatewaySettings);
+      } catch (error) {
+        this.log('warn', `[PublicGateway] Failed to persist settings: ${error.message}`);
+      }
     }
 
     this.#emitPublicGatewayStatus();
