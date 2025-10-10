@@ -609,7 +609,13 @@ function formatRelativeTime(value) {
   const timestamp = typeof value === 'string' ? Date.parse(value) : value
   if (!Number.isFinite(timestamp)) return '—'
   const diff = Date.now() - timestamp
-  if (diff < 0) return 'just now'
+  if (diff < 0) {
+    const ahead = Math.abs(diff)
+    if (ahead < 60_000) return 'in <1m'
+    if (ahead < 3_600_000) return `in ${Math.max(1, Math.floor(ahead / 60_000))}m`
+    if (ahead < 86_400_000) return `in ${Math.max(1, Math.floor(ahead / 3_600_000))}h`
+    return `on ${new Date(timestamp).toLocaleString()}`
+  }
   if (diff < 60_000) return `${Math.max(1, Math.floor(diff / 1000))}s ago`
   if (diff < 3_600_000) return `${Math.floor(diff / 60_000)}m ago`
   if (diff < 86_400_000) return `${Math.floor(diff / 3_600_000)}h ago`
@@ -737,6 +743,10 @@ function formatRelayGatewayStats(relayInfo) {
   parts.push(`Synced: ${syncedText}`)
   const gatewayPath = relayInfo.metadata?.gatewayPath
   if (gatewayPath) parts.push(`Path: ${gatewayPath}`)
+  const expiresAt = Number(relayInfo.expiresAt || relayInfo.tokenExpiresAt || 0)
+  if (Number.isFinite(expiresAt) && expiresAt > 0) {
+    parts.push(`Token expires ${formatRelativeTime(expiresAt)}`)
+  }
   return parts
 }
 
@@ -3016,5 +3026,6 @@ window.requestPublicGatewayToken = requestPublicGatewayToken;
 window.copyTextToClipboard = copyTextToClipboard;
 window.getPublicGatewaySummary = buildPublicGatewaySummary;
 window.formatRelayGatewayStats = formatRelayGatewayStats;
+window.formatRelativeTime = formatRelativeTime;
 
 console.log('[App] app.js loading completed at:', new Date().toISOString());

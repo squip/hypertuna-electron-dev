@@ -210,6 +210,8 @@ export class GatewayService extends EventEmitter {
     this.publicGatewaySettings = this.#normalizePublicGatewayConfig(options.publicGateway);
     this.publicGatewayRegistrar = null;
     this.publicGatewayRelayState = new Map();
+    this.publicGatewayRelayTokens = new Map();
+    this.publicGatewayRelayTokenTimers = new Map();
     this.publicGatewayWsBase = null;
     this.publicGatewayStatusUpdatedAt = null;
     this.discoveredGateways = [];
@@ -316,6 +318,7 @@ export class GatewayService extends EventEmitter {
     } else {
       this.publicGatewayRegistrar = null;
       this.publicGatewayWsBase = null;
+      this.#clearAllRelayTokens();
     }
     this.discoveryDisabledReason = config.disabledReason || null;
     if (config.disabledReason) {
@@ -370,6 +373,209 @@ export class GatewayService extends EventEmitter {
         this.log('debug', `[PublicGateway] Discovery refresh skipped: ${error.message}`);
       });
     });
+  }
+
+  #clearRelayToken(relayKey) {
+    if (!relayKey) return;
+    const timer = this.publicGatewayRelayTokenTimers.get(relayKey);
+    if (timer) {
+      clearTimeout(timer);
+      this.publicGatewayRelayTokenTimers.delete(relayKey);
+    }
+    this.publicGatewayRelayTokens.delete(relayKey);
+    if (this.publicGatewayRelayState.has(relayKey)) {
+      const current = this.publicGatewayRelayState.get(relayKey);
+      if (current) {
+        const next = { ...current };
+        delete next.token;
+        delete next.expiresAt;
+        delete next.ttlSeconds;
+        delete next.connectionUrl;
+        delete next.tokenIssuedAt;
+        this.publicGatewayRelayState.set(relayKey, next);
+      }
+    }
+  }
+
+  #clearAllRelayTokens() {
+    for (const timer of this.publicGatewayRelayTokenTimers.values()) {
+      clearTimeout(timer);
+    }
+    this.publicGatewayRelayTokenTimers.clear();
+    this.publicGatewayRelayTokens.clear();
+    for (const [relayKey, state] of this.publicGatewayRelayState.entries()) {
+      if (!state) continue;
+      const next = { ...state };
+      delete next.token;
+      delete next.expiresAt;
+      delete next.ttlSeconds;
+      delete next.connectionUrl;
+      delete next.tokenIssuedAt;
+      this.publicGatewayRelayState.set(relayKey, next);
+    }
+  }
+
+  #scheduleRelayTokenRetry(relayKey) {
+    if (!relayKey) return;
+    const existing = this.publicGatewayRelayTokenTimers.get(relayKey);
+    if (existing) {
+      clearTimeout(existing);
+      this.publicGatewayRelayTokenTimers.delete(relayKey);
+    }
+    const handle = setTimeout(() => {
+      this.publicGatewayRelayTokenTimers.delete(relayKey);
+      this.#refreshRelayToken(relayKey, { force: true }).catch((error) => {
+        this.log('warn', `[PublicGateway] Token retry failed for ${relayKey}: ${error.message}`);
+        this.#scheduleRelayTokenRetry(relayKey);
+      });
+    }, 30_000);
+    handle.unref?.();
+    this.publicGatewayRelayTokenTimers.set(relayKey, handle);
+  }
+
+  #scheduleRelayTokenRefresh(relayKey, expiresAt) {
+    if (!relayKey) return;
+    if (!Number.isFinite(expiresAt)) return;
+    const existing = this.publicGatewayRelayTokenTimers.get(relayKey);
+    if (existing) {
+      clearTimeout(existing);
+      this.publicGatewayRelayTokenTimers.delete(relayKey);
+    }
+    const now = Date.now();
+    let delay = expiresAt - now - 60_000;
+    if (!Number.isFinite(delay)) {
+      delay = 30_000;
+    }
+    if (delay <= 0) {
+      delay = expiresAt > now ? Math.max(5_000, expiresAt - now - 5_000) : 5_000;
+    }
+    const handle = setTimeout(() => {
+      this.publicGatewayRelayTokenTimers.delete(relayKey);
+      this.#refreshRelayToken(relayKey, { force: true }).catch((error) => {
+        this.log('warn', `[PublicGateway] Automatic token refresh failed for ${relayKey}: ${error.message}`);
+        this.#scheduleRelayTokenRetry(relayKey);
+      });
+    }, Math.max(5_000, delay));
+    handle.unref?.();
+    this.publicGatewayRelayTokenTimers.set(relayKey, handle);
+  }
+
+  #resolveRelayAuth(relayKey, requestingPubkey) {
+    if (!relayKey || !requestingPubkey) return null;
+    const relayData = this.activeRelays.get(relayKey);
+    if (!relayData) return null;
+
+    const authStore = getRelayAuthStore();
+    const candidateIdentifiers = new Set([relayKey]);
+
+    const metadataIdentifier = relayData.metadata?.identifier;
+    if (metadataIdentifier) {
+      candidateIdentifiers.add(metadataIdentifier);
+    }
+
+    const metadataGatewayPath = relayData.metadata?.gatewayPath;
+    if (metadataGatewayPath && typeof metadataGatewayPath === 'string') {
+      const normalizedPath = this._normalizeRelayIdentifier(metadataGatewayPath);
+      if (normalizedPath) {
+        candidateIdentifiers.add(normalizedPath);
+      }
+    }
+
+    for (const identifier of candidateIdentifiers) {
+      if (!identifier) continue;
+      const record = authStore.getAuthByPubkey(identifier, requestingPubkey);
+      if (record) {
+        return { identifier, ...record };
+      }
+    }
+
+    return null;
+  }
+
+  #recordRelayToken(relayKey, info, { schedule = true } = {}) {
+    if (!relayKey || !info) return;
+    const storedInfo = { ...info };
+    this.publicGatewayRelayTokens.set(relayKey, storedInfo);
+    if (schedule && storedInfo.expiresAt) {
+      this.#scheduleRelayTokenRefresh(relayKey, storedInfo.expiresAt);
+    }
+    const current = this.publicGatewayRelayState.get(relayKey);
+    if (current) {
+      const issuedAt = Number.isFinite(info.issuedAt) ? info.issuedAt : null;
+      const next = {
+        ...current,
+        token: info.token,
+        expiresAt: info.expiresAt,
+        ttlSeconds: info.ttlSeconds,
+        connectionUrl: info.connectionUrl,
+        tokenIssuedAt: issuedAt
+      };
+      this.publicGatewayRelayState.set(relayKey, next);
+      this.#emitPublicGatewayStatus();
+    }
+  }
+
+  async #refreshRelayToken(relayKey, { force = false } = {}) {
+    if (!relayKey) return;
+    const state = this.publicGatewayRelayState.get(relayKey);
+    const isBridgeEnabled = this.publicGatewaySettings?.enabled && this.publicGatewayRegistrar?.isEnabled?.();
+    if (!isBridgeEnabled || !state || state.status !== 'registered') {
+      this.#clearRelayToken(relayKey);
+      this.#emitPublicGatewayStatus();
+      return;
+    }
+
+    const requestingPubkey = this.getCurrentPubkey?.() || null;
+    if (!requestingPubkey) {
+      this.log('debug', `[PublicGateway] Skipping token refresh for ${relayKey}: no active pubkey`);
+      this.#clearRelayToken(relayKey);
+      this.#emitPublicGatewayStatus();
+      return;
+    }
+
+    const authResolution = this.#resolveRelayAuth(relayKey, requestingPubkey);
+    if (!authResolution?.token) {
+      this.log('debug', `[PublicGateway] Skipping token refresh for ${relayKey}: no relay auth available`);
+      this.#clearRelayToken(relayKey);
+      this.#scheduleRelayTokenRetry(relayKey);
+      return;
+    }
+
+    const authToken = authResolution.token;
+    const existing = this.publicGatewayRelayTokens.get(relayKey);
+    const now = Date.now();
+    const tokenMismatch = !existing?.relayAuthToken || existing.relayAuthToken !== authToken;
+
+    if (existing) {
+      existing.relayAuthToken = authToken;
+      this.publicGatewayRelayTokens.set(relayKey, { ...existing });
+    }
+
+    if (!force && existing?.expiresAt && (existing.expiresAt - now) > 120_000 && !tokenMismatch) {
+      this.#scheduleRelayTokenRefresh(relayKey, existing.expiresAt);
+      const next = {
+        ...state,
+        token: existing.token,
+        expiresAt: existing.expiresAt,
+        ttlSeconds: existing.ttlSeconds,
+        connectionUrl: existing.connectionUrl,
+        tokenIssuedAt: existing.issuedAt || null
+      };
+      this.publicGatewayRelayState.set(relayKey, next);
+      this.#emitPublicGatewayStatus();
+      return;
+    }
+
+    if (tokenMismatch) {
+      this.log('debug', `[PublicGateway] Relay auth updated for ${relayKey}; issuing new public gateway token`);
+    }
+
+    try {
+      this.issuePublicGatewayToken(relayKey);
+    } catch (error) {
+      this.log('warn', `[PublicGateway] Failed to refresh relay token for ${relayKey}: ${error.message}`);
+      this.#scheduleRelayTokenRetry(relayKey);
+    }
   }
 
   async #resolvePublicGatewayConfig(rawConfig = {}) {
@@ -638,11 +844,12 @@ export class GatewayService extends EventEmitter {
     });
   }
 
-  async #syncPublicGatewayRelay(relayKey) {
+  async #syncPublicGatewayRelay(relayKey, { forceTokenRefresh = false } = {}) {
     const enabled = this.publicGatewaySettings?.enabled && this.publicGatewayRegistrar?.isEnabled?.();
 
     if (!enabled) {
       this.publicGatewayRelayState.delete(relayKey);
+      this.#clearRelayToken(relayKey);
       this.#emitPublicGatewayStatus();
       return;
     }
@@ -650,6 +857,7 @@ export class GatewayService extends EventEmitter {
     const relayData = this.activeRelays.get(relayKey);
     if (!relayData) {
       this.publicGatewayRelayState.delete(relayKey);
+      this.#clearRelayToken(relayKey);
       this.#emitPublicGatewayStatus();
       return;
     }
@@ -683,6 +891,7 @@ export class GatewayService extends EventEmitter {
         });
         this.log('warn', `[PublicGateway] Failed to unregister relay ${relayKey}: ${error.message}`);
       }
+      this.#clearRelayToken(relayKey);
       this.#emitPublicGatewayStatus();
       return;
     }
@@ -694,6 +903,7 @@ export class GatewayService extends EventEmitter {
 
     try {
       await this.publicGatewayRegistrar.registerRelay(relayKey, payload);
+      const tokenInfo = this.publicGatewayRelayTokens.get(relayKey) || null;
       this.publicGatewayRelayState.set(relayKey, {
         relayKey,
         status: 'registered',
@@ -701,7 +911,15 @@ export class GatewayService extends EventEmitter {
         lastSyncedAt: now,
         message: null,
         metadata: metadataCopy,
-        peers
+        peers,
+        token: tokenInfo?.token || null,
+        expiresAt: tokenInfo?.expiresAt || null,
+        ttlSeconds: tokenInfo?.ttlSeconds || null,
+        connectionUrl: tokenInfo?.connectionUrl || null,
+        tokenIssuedAt: tokenInfo?.issuedAt || null
+      });
+      await this.#refreshRelayToken(relayKey, {
+        force: forceTokenRefresh || !tokenInfo
       });
     } catch (error) {
       this.publicGatewayRelayState.set(relayKey, {
@@ -714,6 +932,7 @@ export class GatewayService extends EventEmitter {
         peers
       });
       this.log('warn', `[PublicGateway] Failed to sync relay ${relayKey}: ${error.message}`);
+      this.#scheduleRelayTokenRetry(relayKey);
     }
 
     this.#emitPublicGatewayStatus();
@@ -982,14 +1201,15 @@ export class GatewayService extends EventEmitter {
     };
   }
 
-  async syncPublicGatewayRelay(relayKey) {
-    await this.#syncPublicGatewayRelay(relayKey);
+  async syncPublicGatewayRelay(relayKey, { forceTokenRefresh = true } = {}) {
+    await this.#syncPublicGatewayRelay(relayKey, { forceTokenRefresh });
   }
 
   async resyncPublicGateway() {
     const enabled = this.publicGatewaySettings?.enabled && this.publicGatewayRegistrar?.isEnabled?.();
     if (!enabled) {
       this.publicGatewayRelayState.clear();
+      this.#clearAllRelayTokens();
       this.#emitPublicGatewayStatus();
       return;
     }
@@ -997,7 +1217,7 @@ export class GatewayService extends EventEmitter {
     for (const key of this.activeRelays.keys()) {
       // Sequential resync to avoid saturating registrar
       // eslint-disable-next-line no-await-in-loop
-      await this.#syncPublicGatewayRelay(key);
+      await this.#syncPublicGatewayRelay(key, { forceTokenRefresh: true });
     }
   }
 
@@ -1016,6 +1236,7 @@ export class GatewayService extends EventEmitter {
       }
     } else {
       this.publicGatewayRelayState.clear();
+      this.#clearAllRelayTokens();
     }
 
     const previousHash = previousSettings?.resolvedSharedSecretHash || null;
@@ -1053,30 +1274,7 @@ export class GatewayService extends EventEmitter {
       throw new Error('Unable to determine requesting pubkey for token issuance');
     }
 
-    const authStore = getRelayAuthStore();
-    const candidateIdentifiers = new Set([relayKey]);
-
-    const metadataIdentifier = relayData.metadata?.identifier;
-    if (metadataIdentifier) {
-      candidateIdentifiers.add(metadataIdentifier);
-    }
-
-    const metadataGatewayPath = relayData.metadata?.gatewayPath;
-    if (metadataGatewayPath && typeof metadataGatewayPath === 'string') {
-      const normalizedPath = this._normalizeRelayIdentifier(metadataGatewayPath);
-      if (normalizedPath) {
-        candidateIdentifiers.add(normalizedPath);
-      }
-    }
-
-    let authRecord = null;
-    for (const identifier of candidateIdentifiers) {
-      authRecord = authStore.getAuthByPubkey(identifier, requestingPubkey);
-      if (authRecord) {
-        break;
-      }
-    }
-
+    const authRecord = this.#resolveRelayAuth(relayKey, requestingPubkey);
     if (!authRecord) {
       throw new Error('No relay authentication token found for requesting user');
     }
@@ -1088,13 +1286,15 @@ export class GatewayService extends EventEmitter {
       ? Math.round(ttl)
       : this.publicGatewaySettings?.defaultTokenTtl || 3600;
 
+    const issuedAt = Date.now();
+
     const token = this.publicGatewayRegistrar.issueClientToken(relayKey, {
       ttlSeconds,
       relayAuthToken,
       pubkey: requestingPubkey,
       scope: options.scope || 'relay-access'
     });
-    const expiresAt = Date.now() + ttlSeconds * 1000;
+    const expiresAt = issuedAt + ttlSeconds * 1000;
     const metadata = relayData.metadata || {};
     let gatewayPath = metadata.gatewayPath || null;
     if (!gatewayPath) {
@@ -1118,6 +1318,17 @@ export class GatewayService extends EventEmitter {
       pubkey: `${requestingPubkey.slice(0, 16)}...`
     };
     this.log('info', `[PublicGateway] Issued public token ${JSON.stringify(logDetails)}`);
+
+    this.#recordRelayToken(relayKey, {
+      token,
+      expiresAt,
+      ttlSeconds,
+      connectionUrl,
+      baseUrl: this.publicGatewaySettings.baseUrl,
+      issuedForPubkey: requestingPubkey,
+      issuedAt,
+      relayAuthToken
+    }, { schedule: true });
 
     return {
       relayKey,
@@ -1573,7 +1784,7 @@ export class GatewayService extends EventEmitter {
     peer.lastSeen = Date.now();
 
     updatedRelays.forEach(identifier => {
-      this.#syncPublicGatewayRelay(identifier).catch(error => {
+      this.#syncPublicGatewayRelay(identifier, { forceTokenRefresh: true }).catch(error => {
         this.log('warn', `[PublicGateway] Sync error for ${identifier}: ${error.message}`);
       });
     });

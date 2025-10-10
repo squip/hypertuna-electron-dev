@@ -560,13 +560,22 @@ function integrateNostrRelays(App) {
                     if (Number.isFinite(ts)) metadata.metadataUpdatedAt = ts;
                 }
 
+                const expiresAt = Number(info?.expiresAt);
+                const ttlSeconds = Number(info?.ttlSeconds);
+                const tokenIssuedAt = Number(info?.tokenIssuedAt);
+
                 nextRelayMap.set(identifier, {
                     peers,
                     peerCount: typeof info?.peerCount === 'number' ? info.peerCount : peers.size,
                     status: info?.status || 'unknown',
                     lastActive: info?.lastActive || null,
                     createdAt: info?.createdAt || null,
-                    metadata
+                    metadata,
+                    connectionUrl: typeof info?.connectionUrl === 'string' ? info.connectionUrl : null,
+                    token: typeof info?.token === 'string' ? info.token : null,
+                    expiresAt: Number.isFinite(expiresAt) ? expiresAt : null,
+                    ttlSeconds: Number.isFinite(ttlSeconds) ? ttlSeconds : null,
+                    tokenIssuedAt: Number.isFinite(tokenIssuedAt) ? tokenIssuedAt : null
                 });
             }
         } else if (relayMap && typeof relayMap === 'object') {
@@ -581,13 +590,22 @@ function integrateNostrRelays(App) {
                     if (Number.isFinite(ts)) metadata.metadataUpdatedAt = ts;
                 }
 
+                const expiresAt = Number(info?.expiresAt);
+                const ttlSeconds = Number(info?.ttlSeconds);
+                const tokenIssuedAt = Number(info?.tokenIssuedAt);
+
                 nextRelayMap.set(identifier, {
                     peers,
                     peerCount: typeof info?.peerCount === 'number' ? info.peerCount : peers.size,
                     status: info?.status || 'unknown',
                     lastActive: info?.lastActive || null,
                     createdAt: info?.createdAt || null,
-                    metadata
+                    metadata,
+                    connectionUrl: typeof info?.connectionUrl === 'string' ? info.connectionUrl : null,
+                    token: typeof info?.token === 'string' ? info.token : null,
+                    expiresAt: Number.isFinite(expiresAt) ? expiresAt : null,
+                    ttlSeconds: Number.isFinite(ttlSeconds) ? ttlSeconds : null,
+                    tokenIssuedAt: Number.isFinite(tokenIssuedAt) ? tokenIssuedAt : null
                 });
             }
         }
@@ -799,16 +817,21 @@ function integrateNostrRelays(App) {
 
     App.updateRelayGatewayTokenOutput = function(value, expiresAt = null) {
         const { tokenOutput, copyBtn } = this.relayGatewayElements;
+        const previousValue = tokenOutput ? tokenOutput.value : '';
         if (tokenOutput) {
             tokenOutput.value = value || '';
         }
         if (copyBtn) {
             copyBtn.disabled = !value;
         }
-        if (value) {
-            const expiryText = expiresAt ? new Date(expiresAt).toLocaleString() : 'soon';
-            this.setRelayGatewayFeedback('success', `Share link ready. Expires ${expiryText}.`);
+        if (!value) {
+            this.setRelayGatewayFeedback(null, '');
+            return;
         }
+
+        const expiryText = expiresAt ? formatRelativeTime(expiresAt) : 'soon';
+        const variant = previousValue && previousValue === value ? 'info' : 'success';
+        this.setRelayGatewayFeedback(variant, `Share link ready. Expires ${expiryText}.`);
     };
 
     App.refreshRelayGatewayCard = function() {
@@ -878,12 +901,46 @@ function integrateNostrRelays(App) {
             elements.copyBtn.disabled = !elements.tokenOutput?.value;
         }
 
-        // Preserve last generated token if it matches current relay
-        if (this.relayGatewayLastToken?.relayKey === identifier) {
-            this.updateRelayGatewayTokenOutput(this.relayGatewayLastToken.connectionUrl, this.relayGatewayLastToken.expiresAt);
+        let latestToken = null;
+        if (relayState?.connectionUrl) {
+            latestToken = {
+                relayKey: identifier,
+                connectionUrl: relayState.connectionUrl,
+                expiresAt: relayState.expiresAt || null,
+                ttlSeconds: relayState.ttlSeconds || null,
+                token: relayState.token || null
+            };
+        } else if (peerEntry?.connectionUrl) {
+            latestToken = {
+                relayKey: identifier,
+                connectionUrl: peerEntry.connectionUrl,
+                expiresAt: peerEntry.expiresAt || null,
+                ttlSeconds: peerEntry.ttlSeconds || null,
+                token: peerEntry.token || null
+            };
+        }
+
+        if (latestToken) {
+            this.relayGatewayLastToken = latestToken;
+        } else if (this.relayGatewayLastToken?.relayKey === identifier) {
+            this.relayGatewayLastToken = null;
+        }
+
+        const activeToken = this.relayGatewayLastToken?.relayKey === identifier
+            ? this.relayGatewayLastToken
+            : null;
+
+        if (elements.copyBtn) {
+            elements.copyBtn.disabled = !activeToken || !bridgeReady;
+        }
+        if (elements.headerCopyBtn) {
+            elements.headerCopyBtn.disabled = !activeToken || !bridgeReady;
+        }
+
+        if (activeToken) {
+            this.updateRelayGatewayTokenOutput(activeToken.connectionUrl, activeToken.expiresAt);
         } else {
             this.updateRelayGatewayTokenOutput('', null);
-            this.setRelayGatewayFeedback(null, '');
         }
     };
 
