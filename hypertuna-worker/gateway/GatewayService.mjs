@@ -214,6 +214,7 @@ export class GatewayService extends EventEmitter {
     this.publicGatewayStatusUpdatedAt = null;
     this.discoveredGateways = [];
     this.discoveryDisabledReason = null;
+    this.discoveryWarning = null;
     this.discoveryClient = null;
     this.discoveryClientReady = null;
     this._discoveryRefreshScheduled = false;
@@ -317,6 +318,9 @@ export class GatewayService extends EventEmitter {
       this.publicGatewayWsBase = null;
     }
     this.discoveryDisabledReason = config.disabledReason || null;
+    if (config.disabledReason) {
+      this.discoveryWarning = null;
+    }
   }
 
   async #ensureDiscoveryClient() {
@@ -370,6 +374,7 @@ export class GatewayService extends EventEmitter {
 
   async #resolvePublicGatewayConfig(rawConfig = {}) {
     const config = this.#normalizePublicGatewayConfig(rawConfig);
+    this.discoveryWarning = null;
     const previousResolved = {
       baseUrl: config.baseUrl,
       sharedSecret: config.sharedSecret,
@@ -504,7 +509,8 @@ export class GatewayService extends EventEmitter {
       }
 
       if (!resolvedEntry || !resolvedEntry.sharedSecret) {
-        config.disabledReason = 'No open public gateways available';
+        this.discoveryWarning = 'No open public gateways available; using cached discovery state';
+        this.log('debug', '[PublicGateway] Discovery catalog empty; reusing cached gateway credentials');
         restorePreviousResolved();
         return config;
       }
@@ -971,6 +977,7 @@ export class GatewayService extends EventEmitter {
       relays,
       discoveredGateways: this.discoveredGateways || [],
       discoveryUnavailableReason: this.discoveryDisabledReason,
+      discoveryWarning: this.discoveryWarning,
       disabledReason: enabled ? null : (config.disabledReason || this.discoveryDisabledReason || null)
     };
   }
