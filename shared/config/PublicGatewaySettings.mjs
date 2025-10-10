@@ -143,7 +143,6 @@ function withDefaults(raw = {}) {
     merged.selectedGatewayId = null;
     merged.preferredBaseUrl = merged.preferredBaseUrl || DEFAULT_SETTINGS.preferredBaseUrl;
     merged.baseUrl = merged.preferredBaseUrl || DEFAULT_SETTINGS.baseUrl;
-    merged.sharedSecret = '';
   }
 
   if (merged.selectionMode === 'manual') {

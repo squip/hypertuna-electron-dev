@@ -275,7 +275,6 @@ export class GatewayService extends EventEmitter {
 
     if (config.selectionMode === 'default') {
       config.baseUrl = config.preferredBaseUrl || envBaseUrl || 'https://hypertuna.com';
-      config.sharedSecret = '';
       config.selectedGatewayId = null;
     } else if (config.selectionMode === 'manual' && !config.baseUrl) {
       config.baseUrl = envBaseUrl || config.preferredBaseUrl || 'https://hypertuna.com';
@@ -371,6 +370,19 @@ export class GatewayService extends EventEmitter {
 
   async #resolvePublicGatewayConfig(rawConfig = {}) {
     const config = this.#normalizePublicGatewayConfig(rawConfig);
+    const previousResolved = {
+      baseUrl: config.baseUrl,
+      sharedSecret: config.sharedSecret,
+      resolvedGatewayId: config.resolvedGatewayId,
+      resolvedSecretVersion: config.resolvedSecretVersion,
+      resolvedSharedSecretHash: config.resolvedSharedSecretHash,
+      resolvedDisplayName: config.resolvedDisplayName,
+      resolvedRegion: config.resolvedRegion,
+      resolvedWsUrl: config.resolvedWsUrl,
+      resolvedAt: config.resolvedAt,
+      resolvedFallback: config.resolvedFallback,
+      resolvedFromDiscovery: config.resolvedFromDiscovery
+    };
     config.resolvedFromDiscovery = false;
     config.resolvedFallback = false;
     config.disabledReason = null;
@@ -381,6 +393,27 @@ export class GatewayService extends EventEmitter {
     config.resolvedRegion = null;
     config.resolvedWsUrl = null;
     config.resolvedAt = null;
+
+    const restorePreviousResolved = () => {
+      if (config.selectionMode !== 'default') {
+        return;
+      }
+      if (previousResolved.baseUrl != null && previousResolved.baseUrl !== '') {
+        config.baseUrl = previousResolved.baseUrl;
+      }
+      if (previousResolved.sharedSecret != null) {
+        config.sharedSecret = previousResolved.sharedSecret;
+      }
+      config.resolvedGatewayId = previousResolved.resolvedGatewayId || null;
+      config.resolvedSecretVersion = previousResolved.resolvedSecretVersion || null;
+      config.resolvedSharedSecretHash = previousResolved.resolvedSharedSecretHash || null;
+      config.resolvedDisplayName = previousResolved.resolvedDisplayName || null;
+      config.resolvedRegion = previousResolved.resolvedRegion || null;
+      config.resolvedWsUrl = previousResolved.resolvedWsUrl || null;
+      config.resolvedAt = previousResolved.resolvedAt || null;
+      config.resolvedFallback = !!previousResolved.resolvedFallback;
+      config.resolvedFromDiscovery = !!previousResolved.resolvedFromDiscovery;
+    };
 
     if (!config.enabled) {
       config.baseUrl = '';
@@ -402,7 +435,7 @@ export class GatewayService extends EventEmitter {
       await this.#ensureDiscoveryClient();
     } catch (error) {
       config.disabledReason = error?.message || 'Gateway discovery unavailable';
-      config.sharedSecret = '';
+      restorePreviousResolved();
       return config;
     }
 
@@ -472,7 +505,7 @@ export class GatewayService extends EventEmitter {
 
       if (!resolvedEntry || !resolvedEntry.sharedSecret) {
         config.disabledReason = 'No open public gateways available';
-        config.sharedSecret = '';
+        restorePreviousResolved();
         return config;
       }
     }
