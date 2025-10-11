@@ -13,6 +13,36 @@ import MembersList from './MembersList.js';
 import { AvatarModal } from './AvatarModal.js';
 
 const relayReadinessTracker = new Map(); // Track relay readiness state
+const pendingRelayRegistrations = new Map();
+
+function registerPendingRelayKeys(entry, keys = []) {
+    keys.forEach((key) => {
+        if (!key) return;
+        if (!entry.keys.includes(key)) {
+            entry.keys.push(key);
+        }
+        pendingRelayRegistrations.set(key, entry);
+    });
+}
+
+function resolvePendingRegistration(entry, resolver, payload) {
+    if (!entry || entry.settled) return;
+    entry.settled = true;
+    clearTimeout(entry.timeoutId);
+    entry.keys.forEach((key) => pendingRelayRegistrations.delete(key));
+    resolver(payload);
+}
+
+function getRegistrationStateForKeys(keys = []) {
+    for (const key of keys) {
+        if (!key) continue;
+        const state = relayReadinessTracker.get(key);
+        if (state?.registered) {
+            return state;
+        }
+    }
+    return null;
+}
 const electronAPI = window.electronAPI || null;
 const isElectron = !!electronAPI;
 const ELECTRON_CONFIG_PATH = 'electron-storage/relay-config.json';
@@ -107,6 +137,82 @@ function integrateNostrRelays(App) {
         feedback: null,
         statusDot: null,
         headerCopyBtn: null
+    };
+
+    App.waitForRelayRegistration = function(relayKey = null, publicIdentifier = null, timeoutMs = 60000) {
+        const keys = [relayKey, publicIdentifier].filter(Boolean);
+        if (!keys.length) return Promise.resolve();
+
+        const readyState = getRegistrationStateForKeys(keys);
+        if (readyState) {
+            return Promise.resolve(readyState);
+        }
+
+        return new Promise((resolve, reject) => {
+            const entry = {
+                keys: [...keys],
+                settled: false,
+                timeoutId: null,
+                resolve: null,
+                reject: null
+            };
+
+            entry.resolve = (payload) => {
+                resolvePendingRegistration(entry, resolve, payload);
+            };
+
+            entry.reject = (error) => {
+                const normalized = error instanceof Error ? error : new Error(error || 'Gateway registration failed');
+                resolvePendingRegistration(entry, reject, normalized);
+            };
+
+            entry.timeoutId = setTimeout(() => {
+                entry.reject(new Error('Gateway registration timed out'));
+            }, Math.max(5000, timeoutMs));
+
+            registerPendingRelayKeys(entry, keys);
+        });
+    };
+
+    App.linkRelayRegistrationKey = function(primaryKey, aliasKey) {
+        if (!aliasKey) return;
+
+        const entry = pendingRelayRegistrations.get(primaryKey);
+        if (!entry) {
+            const readyState = relayReadinessTracker.get(aliasKey);
+            if (readyState?.registered) {
+                this.resolveRelayRegistration(aliasKey, readyState);
+            }
+            return;
+        }
+
+        if (entry.keys.includes(aliasKey)) {
+            return;
+        }
+
+        const readyState = relayReadinessTracker.get(aliasKey);
+        if (readyState?.registered) {
+            entry.resolve(readyState);
+            return;
+        }
+
+        registerPendingRelayKeys(entry, [aliasKey]);
+    };
+
+    App.resolveRelayRegistration = function(identifier, payload = {}) {
+        if (!identifier) return false;
+        const entry = pendingRelayRegistrations.get(identifier);
+        if (!entry) return false;
+        entry.resolve(payload);
+        return true;
+    };
+
+    App.rejectRelayRegistration = function(identifier, error) {
+        if (!identifier) return false;
+        const entry = pendingRelayRegistrations.get(identifier);
+        if (!entry) return false;
+        entry.reject(error);
+        return true;
     };
     App.relayGatewayLastToken = null;
     App.currentGroupIsMember = false;
@@ -3269,8 +3375,17 @@ App.syncHypertunaConfigToFile = async function() {
 
             if (relayKey && relayKey.authToken) {
                 await this.showAuthSuccess(relayKey, isPublic);
+                const successMessageEl = document.getElementById('auth-success-message');
+                if (successMessageEl) {
+                    successMessageEl.textContent = 'Relay token issued. Finalizing gateway registration...';
+                }
             } else {
                 this.closeJoinAuthModal();
+            }
+
+            let registrationWait = null;
+            if (relayKey) {
+                registrationWait = this.waitForRelayRegistration(relayKey.relayKey || null, relayKey.publicIdentifier || null);
             }
 
             const eventsCollection = await this.nostr.createGroup(
@@ -3286,6 +3401,27 @@ App.syncHypertunaConfigToFile = async function() {
                 fileSharing,
                 { avatar: this.pendingCreateRelayAvatar }
             );
+
+            if (registrationWait) {
+                const registrationKey = relayKey?.relayKey || null;
+                const registrationPublic = relayKey?.publicIdentifier || null;
+                const finalIdentifier = eventsCollection?.groupId || null;
+
+                if (registrationKey && finalIdentifier) {
+                    this.linkRelayRegistrationKey(registrationKey, finalIdentifier);
+                }
+                if (registrationPublic && finalIdentifier && registrationPublic !== finalIdentifier) {
+                    this.linkRelayRegistrationKey(registrationPublic, finalIdentifier);
+                }
+
+                try {
+                    await registrationWait;
+                } catch (registrationError) {
+                    console.error('Gateway registration failed:', registrationError);
+                    this.showAuthError(`Gateway registration failed: ${registrationError.message}`);
+                    throw registrationError;
+                }
+            }
 
             console.log(`Group created successfully with public ID: ${eventsCollection.groupId}`);
             console.log(`Internal relay key: ${eventsCollection.internalRelayKey}`);
@@ -4866,9 +5002,51 @@ App.setupFollowingModalListeners = function() {
             });
         }
 
+        if (data.relayKey) {
+            this.resolveRelayRegistration(data.relayKey, data);
+        }
+        if (data.publicIdentifier) {
+            this.resolveRelayRegistration(data.publicIdentifier, data);
+        }
+
+        const successMessageEl = document.getElementById('auth-success-message');
+        if (successMessageEl) {
+            successMessageEl.textContent = 'Gateway registration confirmed!';
+        }
+
         if (typeof this.refreshRelayGatewayCard === 'function') {
             this.refreshRelayGatewayCard();
         }
+    };
+
+    App.handleRelayRegistrationFailed = function(data) {
+        console.warn('[App] Relay registration failed:', data);
+
+        const identifier = data.publicIdentifier || data.relayKey;
+        if (identifier) {
+            if (!relayReadinessTracker.has(identifier)) {
+                relayReadinessTracker.set(identifier, {
+                    initialized: false,
+                    registered: false,
+                    initCount: 0,
+                    regCount: 0,
+                    lastUrl: null
+                });
+            }
+            const state = relayReadinessTracker.get(identifier);
+            state.registered = false;
+            state.registrationError = data.error || 'Gateway registration failed';
+        }
+
+        const errorMessage = data.error || 'Gateway registration failed';
+        if (data.relayKey) {
+            this.rejectRelayRegistration(data.relayKey, new Error(errorMessage));
+        }
+        if (data.publicIdentifier) {
+            this.rejectRelayRegistration(data.publicIdentifier, new Error(errorMessage));
+        }
+
+        this.showAuthError(`Gateway registration failed: ${errorMessage}`);
     };
 
     // Process any queued worker messages that arrived before handlers were ready

@@ -2140,6 +2140,37 @@ async function registerWithGateway(relayProfileInfo = null, options = {}) {
         type: 'gateway-registered',
         data: ack || { statusCode: response.statusCode }
       });
+
+      if (relayProfileInfo) {
+        try {
+          let userAuthToken = null;
+          if (relayProfileInfo.auth_config?.requiresAuth && config.nostr_pubkey_hex) {
+            const authorizedUsers = calculateAuthorizedUsers(
+              relayProfileInfo.auth_config.auth_adds || [],
+              relayProfileInfo.auth_config.auth_removes || []
+            );
+            const userAuth = authorizedUsers.find(u => u.pubkey === config.nostr_pubkey_hex);
+            userAuthToken = userAuth?.token || null;
+          }
+
+          const identifierPath = relayProfileInfo.public_identifier
+            ? relayProfileInfo.public_identifier.replace(':', '/')
+            : relayProfileInfo.relay_key;
+          const baseUrl = `${buildGatewayWebsocketBase(config)}/${identifierPath}`;
+          const connectionUrl = userAuthToken ? `${baseUrl}?token=${userAuthToken}` : baseUrl;
+
+          global.sendMessage({
+            type: 'relay-registration-complete',
+            relayKey: relayProfileInfo.relay_key || null,
+            publicIdentifier: relayProfileInfo.public_identifier || null,
+            gatewayUrl: connectionUrl,
+            authToken: userAuthToken,
+            requiresAuth: relayProfileInfo.auth_config?.requiresAuth || false
+          });
+        } catch (notifyError) {
+          console.warn('[RelayServer] Failed to emit relay-registration-complete message:', notifyError?.message || notifyError);
+        }
+      }
     }
 
     console.log('[RelayServer] Registration SUCCESSFUL');
@@ -2150,6 +2181,18 @@ async function registerWithGateway(relayProfileInfo = null, options = {}) {
     if (!skipQueue) {
       pendingRegistrations.push(relayProfileInfo || null);
       console.log('[RelayServer] Registration re-queued due to failure');
+    }
+    try {
+      if (global.sendMessage && relayProfileInfo) {
+        global.sendMessage({
+          type: 'relay-registration-failed',
+          relayKey: relayProfileInfo.relay_key || null,
+          publicIdentifier: relayProfileInfo.public_identifier || null,
+          error: error.message
+        });
+      }
+    } catch (notifyError) {
+      console.warn('[RelayServer] Failed to notify renderer about registration failure:', notifyError?.message || notifyError);
     }
     console.log('[RelayServer] ========================================');
     throw error;

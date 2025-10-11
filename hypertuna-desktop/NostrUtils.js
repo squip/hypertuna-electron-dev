@@ -6,6 +6,7 @@
 
 // Import from local module if available, otherwise try window object
 import { nobleSecp256k1, browserifyCipher, bech32 } from './crypto-libraries.js';
+import { encryptPayload, decryptPayload } from './WorkerCrypto.js';
 
 export class NostrUtils {
     /**
@@ -146,23 +147,32 @@ export class NostrUtils {
      * @param {string} text - Plain text message
      * @returns {string} - Encrypted message with IV
      */
-    static encrypt(privkey, pubkey, text) {
-        // Access libraries from either the import or window globals
+    static async encrypt(privkey, pubkey, text) {
         const secp = nobleSecp256k1 || window.nobleSecp256k1;
-        const cipher = browserifyCipher || window.browserifyCipher;
-        
-        if (!secp || !cipher) {
-            throw new Error('Encryption libraries not available');
+        if (!secp) {
+            throw new Error('Noble Secp256k1 library not available');
         }
-        
-        var key = secp.getSharedSecret(privkey, '02' + pubkey, true).substring(2);
-        var iv = window.crypto.getRandomValues(new Uint8Array(16));
-        var cipherObj = cipher.createCipheriv('aes-256-cbc', this.hexToBytes(key), iv);
-        var encryptedMessage = cipherObj.update(text, "utf8", "base64");
-        var emsg = encryptedMessage + cipherObj.final("base64");
-        var uint8View = new Uint8Array(iv.buffer);
-        var decoder = new TextDecoder();
-        return emsg + "?iv=" + btoa(String.fromCharCode.apply(null, uint8View));
+
+        const targetPubkey = pubkey || this.getPublicKey(privkey);
+
+        try {
+            return await encryptPayload(privkey, targetPubkey, text);
+        } catch (err) {
+            const cipher = browserifyCipher || window.browserifyCipher;
+            if (!cipher || typeof window === 'undefined' || !window.crypto?.getRandomValues) {
+                throw err;
+            }
+
+            console.warn('[NostrUtils] Falling back to renderer AES implementation:', err?.message || err);
+
+            const sharedSecret = secp.getSharedSecret(privkey, '02' + targetPubkey, true).substring(2);
+            const iv = window.crypto.getRandomValues(new Uint8Array(16));
+            const cipherObj = cipher.createCipheriv('aes-256-cbc', this.hexToBytes(sharedSecret), iv);
+            const encryptedMessage = cipherObj.update(text, 'utf8', 'base64');
+            const emsg = encryptedMessage + cipherObj.final('base64');
+            const uint8View = new Uint8Array(iv.buffer);
+            return emsg + '?iv=' + btoa(String.fromCharCode.apply(null, uint8View));
+        }
     }
     
     /**
@@ -172,25 +182,36 @@ export class NostrUtils {
      * @param {string} ciphertext - Encrypted message with IV
      * @returns {string} - Decrypted message
      */
-    static decrypt(privkey, pubkey, ciphertext) {
-        // Access libraries from either the import or window globals
+    static async decrypt(privkey, pubkey, ciphertext) {
         const secp = nobleSecp256k1 || window.nobleSecp256k1;
-        const cipher = browserifyCipher || window.browserifyCipher;
-        
-        if (!secp || !cipher) {
-            throw new Error('Encryption libraries not available');
+        if (!secp) {
+            throw new Error('Noble Secp256k1 library not available');
         }
-        
-        var [emsg, iv] = ciphertext.split("?iv=");
-        var key = secp.getSharedSecret(privkey, '02' + pubkey, true).substring(2);
-        var decipher = cipher.createDecipheriv(
-            'aes-256-cbc',
-            this.hexToBytes(key),
-            this.hexToBytes(this.base64ToHex(iv))
-        );
-        var decryptedMessage = decipher.update(emsg, "base64");
-        var dmsg = decryptedMessage + decipher.final("utf8");
-        return dmsg;
+
+        try {
+            return await decryptPayload(privkey, pubkey, ciphertext);
+        } catch (err) {
+            const cipher = browserifyCipher || window.browserifyCipher;
+            if (!cipher) {
+                throw err;
+            }
+
+            console.warn('[NostrUtils] Falling back to renderer AES implementation:', err?.message || err);
+
+            const [emsg, iv] = ciphertext.split('?iv=');
+            if (!emsg || !iv) {
+                throw err;
+            }
+
+            const key = secp.getSharedSecret(privkey, '02' + pubkey, true).substring(2);
+            const decipher = cipher.createDecipheriv(
+                'aes-256-cbc',
+                this.hexToBytes(key),
+                this.hexToBytes(this.base64ToHex(iv))
+            );
+            const decryptedMessage = decipher.update(emsg, 'base64');
+            return decryptedMessage + decipher.final('utf8');
+        }
     }
     
     /**

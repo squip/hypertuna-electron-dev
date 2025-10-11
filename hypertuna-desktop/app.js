@@ -1995,6 +1995,16 @@ async function handleWorkerMessage(message) {
         }
       }
       break
+
+    case 'relay-registration-failed':
+      if (message.relayKey) {
+        console.warn(`[App] Relay registration failed for ${message.relayKey}: ${message.error || 'unknown error'}`)
+        addLog(`Relay registration failed for ${message.relayKey}: ${message.error || 'unknown error'}`, 'error')
+      }
+      if (window.App && typeof window.App.handleRelayRegistrationFailed === 'function') {
+        window.App.handleRelayRegistrationFailed(message)
+      }
+      break
       
     case 'all-relays-initialized':
       // When all stored relays have been initialized
@@ -2393,7 +2403,15 @@ function clearRelayCache() {
 function renderRelayListContent(relayData = [], { showEmpty = true } = {}) {
   if (!relayList) return
 
-  if (!Array.isArray(relayData) || relayData.length === 0) {
+  const visibleRelays = Array.isArray(relayData)
+    ? relayData.filter((relay) => {
+        if (!relay) return false
+        if (!relay.registrationStatus) return true
+        return relay.registrationStatus === 'success'
+      })
+    : []
+
+  if (!visibleRelays.length) {
     if (showEmpty) {
       relayList.innerHTML = '<p style="color: var(--text-secondary); font-size: 12px;">No active relays</p>'
     }
@@ -2402,7 +2420,7 @@ function renderRelayListContent(relayData = [], { showEmpty = true } = {}) {
 
   relayList.innerHTML = ''
 
-  relayData.forEach((relay) => {
+  visibleRelays.forEach((relay) => {
     if (window.App && window.App.nostr && relay.relayKey && relay.publicIdentifier) {
       window.App.nostr.registerRelayMapping(relay.relayKey, relay.publicIdentifier)
     }

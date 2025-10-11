@@ -280,3 +280,59 @@ export function getChallengeManager() {
   }
   return managerInstance;
 }
+
+function deriveSharedKey(senderPrivkeyHex, recipientPubkeyHex) {
+  if (!senderPrivkeyHex || !recipientPubkeyHex) {
+    throw new Error('Missing keys for shared secret derivation');
+  }
+
+  let sharedSecret = nobleSecp256k1.getSharedSecret(
+    senderPrivkeyHex,
+    `02${recipientPubkeyHex}`,
+    true
+  );
+
+  if (sharedSecret.length === 33) {
+    sharedSecret = sharedSecret.slice(1);
+  }
+
+  return b4a.from(sharedSecret);
+}
+
+export function encryptWithSharedSecret(senderPrivkeyHex, recipientPubkeyHex, plaintext) {
+  const keyBuffer = deriveSharedKey(senderPrivkeyHex, recipientPubkeyHex);
+  const iv = crypto.randomBytes(16);
+  const payload = b4a.from(String(plaintext ?? ''), 'utf8');
+  const ciphertext = nobleSecp256k1.aes.encrypt(payload, keyBuffer, iv);
+
+  return {
+    ciphertext: b4a.toString(ciphertext, 'base64'),
+    iv: iv.toString('base64')
+  };
+}
+
+export function decryptWithSharedSecret(senderPrivkeyHex, recipientPubkeyHex, ciphertextBase64, ivBase64) {
+  const keyBuffer = deriveSharedKey(senderPrivkeyHex, recipientPubkeyHex);
+  const iv = b4a.from(ivBase64, 'base64');
+  const cipherBuffer = b4a.from(ciphertextBase64, 'base64');
+  const decrypted = nobleSecp256k1.aes.decrypt(cipherBuffer, keyBuffer, iv);
+  return b4a.toString(decrypted, 'utf8');
+}
+
+export function encryptSharedSecretToString(senderPrivkeyHex, recipientPubkeyHex, plaintext) {
+  const { ciphertext, iv } = encryptWithSharedSecret(senderPrivkeyHex, recipientPubkeyHex, plaintext);
+  return `${ciphertext}?iv=${iv}`;
+}
+
+export function decryptSharedSecretFromString(senderPrivkeyHex, recipientPubkeyHex, payload) {
+  if (typeof payload !== 'string') {
+    throw new Error('Ciphertext payload must be a string');
+  }
+
+  const [ciphertext, iv] = payload.split('?iv=');
+  if (!ciphertext || !iv) {
+    throw new Error('Ciphertext payload missing IV segment');
+  }
+
+  return decryptWithSharedSecret(senderPrivkeyHex, recipientPubkeyHex, ciphertext, iv);
+}

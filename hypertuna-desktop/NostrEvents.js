@@ -661,7 +661,7 @@ class NostrEvents {
         if (Array.isArray(contentArray) && contentArray.length > 0) {
             const json = JSON.stringify(contentArray);
             const pubkey = NostrUtils.getPublicKey(privateKey);
-            content = NostrUtils.encrypt(privateKey, pubkey, json);
+            content = await NostrUtils.encrypt(privateKey, pubkey, json);
         }
         return this.createEvent(
             this.KIND_USER_RELAY_LIST,

@@ -409,10 +409,10 @@ class NostrGroupClient {
         // Subscribe to user's relay list updates
         this.relayManager.subscribeWithRouting('user-relaylist-discovery', [
             { kinds: [NostrEvents.KIND_USER_RELAY_LIST], authors: [this.user.pubkey], limit: 1 }
-        ], (event) => {
+        ], async (event) => {
             this.userRelayListEvent = event;
-            this._parseRelayListEvent(event);
-            this._connectToUserRelays(); // Auto-connect to user's relays
+            await this._parseRelayListEvent(event);
+            await this._connectToUserRelays(); // Auto-connect to user's relays
         }, { targetRelays: discoveryRelays });
         
         // Subscribe to group metadata for discovery
@@ -430,8 +430,8 @@ class NostrGroupClient {
         // Subscribe to invites addressed to this user
         this.relayManager.subscribeWithRouting('relay-invites', [
             { kinds: [NostrEvents.KIND_GROUP_INVITE_CREATE], '#p': [this.user.pubkey], '#i': ['hypertuna'] }
-        ], (event) => {
-            this._processInviteEvent(event);
+        ], async (event) => {
+            await this._processInviteEvent(event);
         }, { targetRelays: discoveryRelays });
     }
 
@@ -467,7 +467,7 @@ class NostrGroupClient {
         // Parse private relays from content
         if (this.userRelayListEvent.content) {
             try {
-                const decrypted = NostrUtils.decrypt(
+                const decrypted = await NostrUtils.decrypt(
                     this.user.privateKey,
                     this.user.pubkey,
                     this.userRelayListEvent.content
@@ -1452,18 +1452,18 @@ async fetchMultipleProfiles(pubkeys) {
     
             this.relayManager.subscribe(subId, [
                 { kinds: [NostrEvents.KIND_USER_RELAY_LIST], authors: [this.user.pubkey], limit: 1 }
-            ], (event) => {
+            ], async (event) => {
                 received = true;
                 clearTimeout(timeoutId);
                 this.relayManager.unsubscribe(subId);
                 this.userRelayListEvent = event;
-                this._parseRelayListEvent(event);
+                await this._parseRelayListEvent(event);
                 resolve();
             });
         });
     }
 
-    _parseRelayListEvent(event) {
+    async _parseRelayListEvent(event) {
         this.userRelayIds.clear();
         if (!event) return;
         
@@ -1482,7 +1482,7 @@ async fetchMultipleProfiles(pubkeys) {
     
         let decoded = null;
         try {
-            decoded = NostrUtils.decrypt(this.user.privateKey, this.user.pubkey, event.content);
+            decoded = await NostrUtils.decrypt(this.user.privateKey, this.user.pubkey, event.content);
         } catch (e) {
             try {
                 decoded = event.content;
@@ -1524,7 +1524,7 @@ async fetchMultipleProfiles(pubkeys) {
         let contentArr = [];
         if (this.userRelayListEvent.content) {
             try {
-                const dec = NostrUtils.decrypt(this.user.privateKey, this.user.pubkey, this.userRelayListEvent.content);
+                const dec = await NostrUtils.decrypt(this.user.privateKey, this.user.pubkey, this.userRelayListEvent.content);
                 contentArr = JSON.parse(dec);
             } catch (e) {
                 try { contentArr = JSON.parse(this.userRelayListEvent.content); } catch { contentArr = []; }
@@ -1731,9 +1731,9 @@ async fetchMultipleProfiles(pubkeys) {
         // Subscribe to user's relay list (kind 10009)
         const relayListSub = this.relayManager.subscribe('user-relaylist', [
             { kinds: [NostrEvents.KIND_USER_RELAY_LIST], authors: [this.user.pubkey], limit: 1 }
-        ], (event) => {
+        ], async (event) => {
             this.userRelayListEvent = event;
-            this._parseRelayListEvent(event);
+            await this._parseRelayListEvent(event);
         });
         this.activeSubscriptions.add(relayListSub);
         
@@ -1928,7 +1928,9 @@ async fetchMultipleProfiles(pubkeys) {
 
             case NostrEvents.KIND_USER_RELAY_LIST:
                 this.userRelayListEvent = event;
-                this._parseRelayListEvent(event);
+                this._parseRelayListEvent(event).catch((err) => {
+                    console.error('Failed to parse relay list event', err);
+                });
                 break;
         }
         
@@ -2109,12 +2111,12 @@ async fetchMultipleProfiles(pubkeys) {
      * @param {Object} event - Invite event (kind 9009)
      * @private
      */
-    _processInviteEvent(event) {
+    async _processInviteEvent(event) {
         const groupId = NostrEvents._getTagValue(event, 'h');
         if (!groupId) return;
 
         try {
-            const dec = NostrUtils.decrypt(this.user.privateKey, event.pubkey, event.content);
+            const dec = await NostrUtils.decrypt(this.user.privateKey, event.pubkey, event.content);
             const data = JSON.parse(dec);
             const invite = {
                 id: event.id,
@@ -3021,7 +3023,7 @@ async fetchMultipleProfiles(pubkeys) {
         
         if (this.userRelayListEvent.content) {
             try {
-                const dec = NostrUtils.decrypt(this.user.privateKey, this.user.pubkey, this.userRelayListEvent.content);
+                const dec = await NostrUtils.decrypt(this.user.privateKey, this.user.pubkey, this.userRelayListEvent.content);
                 contentArr = JSON.parse(dec);
             } catch {
                 contentArr = [];
@@ -3502,7 +3504,7 @@ async fetchMultipleProfiles(pubkeys) {
         const relayKey = this.publicToInternalMap.get(groupId) || null;
         const isPublic = this.groups.get(groupId)?.isPublic || false;
         const payload = { relayUrl, token, relayKey, isPublic };
-        const encrypted = NostrUtils.encrypt(this.user.privateKey, pubkey, JSON.stringify(payload));
+        const encrypted = await NostrUtils.encrypt(this.user.privateKey, pubkey, JSON.stringify(payload));
 
         const group = this.groups.get(groupId) || {};
         const tags = [
@@ -3583,7 +3585,7 @@ async fetchMultipleProfiles(pubkeys) {
             const relayKey = this.publicToInternalMap.get(groupId) || null;
             const isPublic = this.groups.get(groupId)?.isPublic || false;
             const payload = { relayUrl, token, relayKey, isPublic };
-            const encrypted = NostrUtils.encrypt(
+            const encrypted = await NostrUtils.encrypt(
                 this.user.privateKey,
                 pubkey,
                 JSON.stringify(payload)

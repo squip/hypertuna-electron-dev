@@ -51,6 +51,10 @@ import {
   updatePublicGatewaySettings,
   getCachedPublicGatewaySettings
 } from '../shared/config/PublicGatewaySettings.mjs'
+import {
+  encryptSharedSecretToString,
+  decryptSharedSecretFromString
+} from './challenge-manager.mjs'
 
 const pearRuntime = globalThis?.Pear
 const __dirname = process.env.APP_DIR || pearRuntime?.config?.dir || process.cwd()
@@ -244,6 +248,7 @@ let isShuttingDown = false
 const relayMembers = new Map()
 const relayMemberAdds = new Map()
 const relayMemberRemoves = new Map()
+const relayRegistrationStatus = new Map()
 const seenFileHashes = new Map()
 let config = null
 let configPath = null
@@ -451,8 +456,38 @@ if (pearRuntime?.worker?.pipe) {
 console.log('[Worker] IPC channel:', workerPipe ? 'pear-pipe' : (typeof process.send === 'function' ? 'node-ipc' : 'none'))
 
 // Helper function to send messages with newline delimiter (Pear) or Node IPC events
+function trackRegistrationStatus(message) {
+  if (!message || typeof message !== 'object') return
+
+  if (message.type === 'relay-created' && message.data) {
+    const { relayKey, publicIdentifier, gatewayRegistration, registrationError } = message.data
+    if (relayKey) {
+      relayRegistrationStatus.set(relayKey, {
+        status: gatewayRegistration || 'unknown',
+        error: registrationError || null
+      })
+    }
+    if (publicIdentifier) {
+      relayRegistrationStatus.set(publicIdentifier, {
+        status: gatewayRegistration || 'unknown',
+        error: registrationError || null
+      })
+    }
+  } else if (message.type === 'relay-registration-complete') {
+    const entry = { status: 'success', error: null }
+    if (message.relayKey) relayRegistrationStatus.set(message.relayKey, entry)
+    if (message.publicIdentifier) relayRegistrationStatus.set(message.publicIdentifier, entry)
+  } else if (message.type === 'relay-registration-failed') {
+    const entry = { status: 'failed', error: message.error || null }
+    if (message.relayKey) relayRegistrationStatus.set(message.relayKey, entry)
+    if (message.publicIdentifier) relayRegistrationStatus.set(message.publicIdentifier, entry)
+  }
+}
+
 const sendMessage = (message) => {
   if (isShuttingDown) return
+
+  trackRegistrationStatus(message)
 
   if (workerPipe) {
     const messageStr = JSON.stringify(message) + '\n'
@@ -584,12 +619,18 @@ async function addAuthInfoToRelays(relays) {
       const baseUrl = `${buildGatewayWebsocketBase(config)}/${identifierPath}`
       const connectionUrl = token ? `${baseUrl}?token=${token}` : baseUrl
 
+      const statusEntry = relayRegistrationStatus.get(r.relayKey)
+        || (profile.public_identifier ? relayRegistrationStatus.get(profile.public_identifier) : null)
+        || null
+
       return {
         ...r,
         publicIdentifier: profile.public_identifier || null,
         connectionUrl,
         userAuthToken: token,
-        requiresAuth: profile.auth_config?.requiresAuth || false
+        requiresAuth: profile.auth_config?.requiresAuth || false,
+        registrationStatus: statusEntry?.status || 'unknown',
+        registrationError: statusEntry?.error || null
       }
     })
   } catch (err) {
@@ -1113,6 +1154,43 @@ async function handleMessageObject(message) {
       break
     }
 
+    case 'crypto-encrypt': {
+      const { requestId, privkey, pubkey, plaintext } = message || {}
+      try {
+        if (!requestId) throw new Error('Missing requestId')
+        if (!privkey || !pubkey) throw new Error('Missing keys for encryption')
+        const result = encryptSharedSecretToString(privkey, pubkey, plaintext)
+        sendMessage({ type: 'crypto-response', requestId, success: true, result })
+      } catch (err) {
+        sendMessage({
+          type: 'crypto-response',
+          requestId: message?.requestId || null,
+          success: false,
+          error: err?.message || String(err)
+        })
+      }
+      break
+    }
+
+    case 'crypto-decrypt': {
+      const { requestId, privkey, pubkey, ciphertext } = message || {}
+      try {
+        if (!requestId) throw new Error('Missing requestId')
+        if (!privkey || !pubkey) throw new Error('Missing keys for decryption')
+        if (typeof ciphertext !== 'string') throw new Error('Missing ciphertext payload')
+        const result = decryptSharedSecretFromString(privkey, pubkey, ciphertext)
+        sendMessage({ type: 'crypto-response', requestId, success: true, result })
+      } catch (err) {
+        sendMessage({
+          type: 'crypto-response',
+          requestId: message?.requestId || null,
+          success: false,
+          error: err?.message || String(err)
+        })
+      }
+      break
+    }
+
     case 'shutdown':
       console.log('[Worker] Shutdown requested')
       isShuttingDown = true
@@ -1144,6 +1222,15 @@ async function handleMessageObject(message) {
               members: relayMembers.get(result.relayKey) || []
             }
           })
+
+          if (result.gatewayRegistration === 'failed') {
+            sendMessage({
+              type: 'relay-registration-failed',
+              relayKey: result.relayKey,
+              publicIdentifier: result.publicIdentifier || null,
+              error: result.registrationError || 'Gateway registration failed'
+            })
+          }
 
           const relays = await relayServer.getActiveRelays()
           const relaysAuth = await addAuthInfoToRelays(relays)
