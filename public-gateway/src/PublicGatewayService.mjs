@@ -1,6 +1,7 @@
 import http from 'node:http';
 import https from 'node:https';
 import { randomBytes } from 'node:crypto';
+import { resolve } from 'node:path';
 import express from 'express';
 import WebSocket, { WebSocketServer } from 'ws';
 import helmet from 'helmet';
@@ -17,10 +18,34 @@ import {
   verifySignature,
   verifyClientToken
 } from '../../shared/auth/PublicGatewayTokens.mjs';
-import { metricsMiddleware, sessionGauge, peerGauge, requestCounter } from './metrics.mjs';
+import {
+  metricsMiddleware,
+  sessionGauge,
+  peerGauge,
+  requestCounter,
+  relayEventCounter,
+  relayReqCounter,
+  relayErrorCounter,
+  relayTokenIssueCounter,
+  relayTokenRefreshCounter,
+  relayTokenRevocationCounter
+} from './metrics.mjs';
 import MemoryRegistrationStore from './stores/MemoryRegistrationStore.mjs';
 import MessageQueue from './utils/MessageQueue.mjs';
 import GatewayAdvertiser from './discovery/GatewayAdvertiser.mjs';
+import HyperbeeRelayHost from './relay/HyperbeeRelayHost.mjs';
+import RelayWebsocketController from './relay/RelayWebsocketController.mjs';
+import RelayDispatcherService from './relay/RelayDispatcherService.mjs';
+import RelayTokenService from './relay/RelayTokenService.mjs';
+
+function safeString(value) {
+  if (typeof value === 'string') return value;
+  try {
+    return JSON.stringify(value);
+  } catch (_) {
+    return null;
+  }
+}
 
 class PublicGatewayService {
   constructor({ config, logger, tlsOptions = null, registrationStore }) {
@@ -41,6 +66,7 @@ class PublicGatewayService {
         discoveryConfig: this.discoveryConfig,
         getSharedSecret: async () => this.sharedSecret,
         getSharedSecretVersion: async () => this.#getSharedSecretVersion(),
+        getRelayInfo: async () => this.#getRelayHostInfo(),
         publicUrl: this.config.publicBaseUrl,
         wsUrl: this.wsBaseUrl
       });
@@ -51,10 +77,29 @@ class PublicGatewayService {
     this.app = express();
     this.server = null;
     this.wss = null;
+    this.featureFlags = {
+      hyperbeeRelayEnabled: !!config?.features?.hyperbeeRelayEnabled,
+      dispatcherEnabled: !!config?.features?.dispatcherEnabled,
+      tokenEnforcementEnabled: !!config?.features?.tokenEnforcementEnabled
+    };
+    this.relayConfig = this.#normalizeRelayConfig(config?.relay);
+    this.relayHost = null;
+    this.relayTelemetryUnsub = null;
+    this.relayWebsocketController = null;
+    this.dispatcher = this.featureFlags.dispatcherEnabled
+      ? new RelayDispatcherService({ logger: this.logger, policy: this.config.dispatcher })
+      : null;
+    this.tokenService = null;
+    this.tokenMetrics = {
+      issueCounter: relayTokenIssueCounter,
+      refreshCounter: relayTokenRefreshCounter,
+      revokeCounter: relayTokenRevocationCounter
+    };
     this.connectionPool = new EnhancedHyperswarmPool({
       logger: this.logger,
       onProtocol: this.#onProtocolCreated.bind(this),
-      onHandshake: this.#onProtocolHandshake.bind(this)
+      onHandshake: this.#onProtocolHandshake.bind(this),
+      onTelemetry: this.#handlePeerTelemetry.bind(this)
     });
 
     this.sessions = new Map();
@@ -67,6 +112,20 @@ class PublicGatewayService {
   async init() {
     this.#setupHttpServer();
     await this.connectionPool.initialize();
+    if (this.featureFlags.tokenEnforcementEnabled && this.sharedSecret) {
+      this.tokenService = new RelayTokenService({
+        registrationStore: this.registrationStore,
+        sharedSecret: this.sharedSecret,
+        logger: this.logger,
+        defaultTtlSeconds: this.config.registration?.defaultTokenTtl,
+        refreshWindowSeconds: this.config.registration?.tokenRefreshWindowSeconds
+      });
+    } else if (this.featureFlags.tokenEnforcementEnabled && !this.sharedSecret) {
+      this.logger?.warn?.('Token enforcement enabled but shared secret missing; token service disabled');
+    }
+    if (this.#isHyperbeeRelayEnabled()) {
+      await this.#ensureRelayHost();
+    }
     this.logger.info('PublicGatewayService initialized');
   }
 
@@ -129,6 +188,20 @@ class PublicGatewayService {
 
     if (this.gatewayAdvertiser) {
       await this.gatewayAdvertiser.stop();
+    }
+
+    if (this.relayHost) {
+      try {
+        await this.relayHost.stop();
+      } catch (error) {
+        this.logger?.error?.('Failed to stop Hyperbee relay host', { error: error?.message });
+      }
+      if (this.relayTelemetryUnsub) {
+        this.relayTelemetryUnsub();
+        this.relayTelemetryUnsub = null;
+      }
+      this.relayHost = null;
+      this.relayWebsocketController = null;
     }
 
     await this.connectionPool.destroy();
@@ -227,11 +300,91 @@ class PublicGatewayService {
     app.post('/api/relays', (req, res) => this.#handleRelayRegistration(req, res));
     app.delete('/api/relays/:relayKey', (req, res) => this.#handleRelayDeletion(req, res));
 
+    app.post('/api/relay-tokens/issue', (req, res) => this.#handleTokenIssue(req, res));
+    app.post('/api/relay-tokens/refresh', (req, res) => this.#handleTokenRefresh(req, res));
+    app.post('/api/relay-tokens/revoke', (req, res) => this.#handleTokenRevoke(req, res));
+
     const serverFactory = this.tlsOptions ? https.createServer : http.createServer;
     this.server = serverFactory(this.tlsOptions || {}, app);
 
     this.wss = new WebSocketServer({ server: this.server });
     this.wss.on('connection', (ws, req) => this.#handleWebSocket(ws, req));
+  }
+
+  #normalizeRelayConfig(raw = {}) {
+    const baseDir = raw?.storageDir
+      || process.env.GATEWAY_RELAY_STORAGE
+      || resolve(process.env.STORAGE_DIR || process.cwd(), 'gateway-relay');
+    const statsIntervalMs = Number(raw?.statsIntervalMs);
+    return {
+      storageDir: baseDir,
+      datasetNamespace: raw?.datasetNamespace || 'public-gateway-relay',
+      adminPublicKey: raw?.adminPublicKey || process.env.GATEWAY_RELAY_ADMIN_PUBLIC_KEY || null,
+      adminSecretKey: raw?.adminSecretKey || process.env.GATEWAY_RELAY_ADMIN_SECRET_KEY || null,
+      statsIntervalMs: Number.isFinite(statsIntervalMs) && statsIntervalMs > 0 ? statsIntervalMs : undefined,
+      replicationTopic: raw?.replicationTopic || null
+    };
+  }
+
+  #isHyperbeeRelayEnabled() {
+    return this.featureFlags.hyperbeeRelayEnabled;
+  }
+
+  async #ensureRelayHost() {
+    if (this.relayHost) return;
+    if (!this.relayConfig.adminPublicKey || !this.relayConfig.adminSecretKey) {
+      this.logger?.warn?.('Hyperbee relay feature enabled but admin key pair missing');
+      return;
+    }
+
+    const host = new HyperbeeRelayHost({
+      logger: this.logger,
+      telemetryIntervalMs: this.relayConfig.statsIntervalMs
+    });
+
+    await host.initialize({
+      storageDir: this.relayConfig.storageDir,
+      datasetNamespace: this.relayConfig.datasetNamespace,
+      adminKeyPair: {
+        publicKey: this.relayConfig.adminPublicKey,
+        secretKey: this.relayConfig.adminSecretKey
+      },
+      statsIntervalMs: this.relayConfig.statsIntervalMs,
+      replicationTopic: this.relayConfig.replicationTopic
+    });
+
+    this.relayTelemetryUnsub = host.registerTelemetrySink((event) => {
+      this.logger?.debug?.('[HyperbeeRelayHost] Telemetry', event);
+    });
+
+    try {
+      await host.start();
+    } catch (error) {
+      this.logger?.error?.('Failed to start Hyperbee relay host', { error: error?.message });
+      if (this.relayTelemetryUnsub) {
+        this.relayTelemetryUnsub();
+        this.relayTelemetryUnsub = null;
+      }
+      throw error;
+    }
+
+    this.relayHost = host;
+    this.logger?.info?.('Hyperbee relay host ready', {
+      relayKey: host.getPublicKey()
+    });
+
+    this.relayWebsocketController = new RelayWebsocketController({
+      relayHost: host,
+      dispatcher: this.dispatcher,
+      logger: this.logger,
+      featureFlags: this.featureFlags,
+      metrics: {
+        eventCounter: relayEventCounter,
+        reqCounter: relayReqCounter,
+        errorCounter: relayErrorCounter
+      },
+      legacyForward: (session, message, preferredPeer) => this.#forwardLegacyMessage(session, message, preferredPeer)
+    });
   }
 
   #computeWsBase(baseUrl) {
@@ -423,7 +576,9 @@ class PublicGatewayService {
       peers,
       peerIndex,
       messageQueue: new MessageQueue(),
-      openedAt: Date.now()
+      openedAt: Date.now(),
+      subscriptionPeers: new Map(),
+      assignPeer: (assignedPeer, subscriptionId) => this.#assignPeerForSubscription(session, assignedPeer, subscriptionId)
     };
 
     this.sessions.set(connectionKey, session);
@@ -453,34 +608,14 @@ class PublicGatewayService {
         return;
       }
 
-      try {
-        const responses = await this.#withPeer(session, async (peerKey) => {
-          requestCounter.inc({ relay: session.relayKey });
-          return forwardMessageToPeerHyperswarm(
-            peerKey,
-            session.relayKey,
-            msg,
-            session.connectionKey,
-            this.connectionPool,
-            session.relayAuthToken
-          );
-        });
+      const useRelayController = this.#isHyperbeeRelayEnabled() && this.relayWebsocketController;
 
-        if (!Array.isArray(responses)) return;
-        for (const response of responses) {
-          if (!response) continue;
-          if (session.ws.readyState === WebSocket.OPEN) {
-            session.ws.send(JSON.stringify(response));
-          }
-        }
-      } catch (error) {
-        this.logger.warn?.('Forwarding message failed', { relayKey: session.relayKey, error: error.message });
-        if (session.ws.readyState === WebSocket.OPEN) {
-          session.ws.send(JSON.stringify(['NOTICE', `Error: ${error.message}`]));
-        } else {
-          this.#cleanupSession(session.connectionKey);
-        }
+      if (useRelayController) {
+        const handled = await this.relayWebsocketController.handleMessage(session, msg);
+        if (handled) return;
       }
+
+      await this.#forwardLegacyMessage(session, msg);
     });
   }
 
@@ -495,11 +630,50 @@ class PublicGatewayService {
       this.eventCheckTimers.delete(connectionKey);
     }
 
+    this.relayWebsocketController?.removeSession(connectionKey);
+
     if (session.ws && session.ws.readyState === WebSocket.OPEN) {
       try { session.ws.close(); } catch (_) {}
     }
 
     sessionGauge.set(this.sessions.size);
+  }
+
+  async #forwardLegacyMessage(session, msg, preferredPeer = null) {
+    const serialized = typeof msg === 'string' ? msg : safeString(msg);
+    if (!serialized) {
+      this.logger.warn?.('Failed to serialize legacy message', { relayKey: session.relayKey });
+      return;
+    }
+
+    try {
+      const responses = await this.#withPeer(session, async (peerKey) => {
+        requestCounter.inc({ relay: session.relayKey });
+        return forwardMessageToPeerHyperswarm(
+          peerKey,
+          session.relayKey,
+          serialized,
+          session.connectionKey,
+          this.connectionPool,
+          session.relayAuthToken
+        );
+      }, { preferredPeer });
+
+      if (!Array.isArray(responses)) return;
+      for (const response of responses) {
+        if (!response) continue;
+        if (session.ws.readyState === WebSocket.OPEN) {
+          session.ws.send(JSON.stringify(response));
+        }
+      }
+    } catch (error) {
+      this.logger.warn?.('Forwarding message failed', { relayKey: session.relayKey, error: error.message });
+      if (session.ws.readyState === WebSocket.OPEN) {
+        session.ws.send(JSON.stringify(['NOTICE', `Error: ${error.message}`]));
+      } else {
+        this.#cleanupSession(session.connectionKey);
+      }
+    }
   }
 
   #startEventChecking(session) {
@@ -752,13 +926,19 @@ class PublicGatewayService {
     return normalized;
   }
 
-  async #withPeer(session, handler) {
+  async #withPeer(session, handler, options = {}) {
     if (!session.peers?.length) {
       throw new Error('No peers registered for relay');
     }
 
     let attempts = 0;
     let lastError = null;
+
+    const preferredPeer = options.preferredPeer;
+    if (preferredPeer && session.peers.includes(preferredPeer)) {
+      session.peerIndex = session.peers.indexOf(preferredPeer);
+      session.peerKey = preferredPeer;
+    }
 
     while (attempts < session.peers.length) {
       const peerKey = this.#currentPeer(session);
@@ -794,6 +974,182 @@ class PublicGatewayService {
     throw new Error('No peers available for relay');
   }
 
+  #assignPeerForSubscription(session, peerKey, subscriptionId) {
+    if (!peerKey) return;
+    if (!Array.isArray(session.peers)) {
+      session.peers = [];
+    }
+    if (!session.peers.includes(peerKey)) {
+      session.peers.push(peerKey);
+    }
+    session.subscriptionPeers?.set?.(subscriptionId, peerKey);
+    session.peerIndex = session.peers.indexOf(peerKey);
+    session.peerKey = peerKey;
+  }
+
+  #handlePeerTelemetry({ publicKey, payload }) {
+    if (!this.dispatcher || !payload) return;
+    const metrics = {
+      peerId: publicKey,
+      latencyMs: Number(payload.latencyMs) || 0,
+      inFlightJobs: Number(payload.inFlightJobs) || 0,
+      failureRate: Number(payload.failureRate) || 0,
+      hyperbeeVersion: payload.hyperbeeVersion,
+      hyperbeeLag: payload.hyperbeeLag,
+      queueDepth: payload.queueDepth,
+      reportedAt: Number(payload.reportedAt) || Date.now(),
+      tokenExpiresAt: payload.tokenExpiresAt
+    };
+    this.dispatcher.reportPeerMetrics(publicKey, metrics);
+  }
+
+  #getRelayHostInfo() {
+    if (!this.relayHost) {
+      return null;
+    }
+    return {
+      hyperbeeKey: this.relayHost.getPublicKey(),
+      discoveryKey: this.relayHost.getDiscoveryKey(),
+      replicationTopic: this.relayConfig?.replicationTopic || null
+    };
+  }
+
+  #verifySignedPayload(payload, signature) {
+    if (!this.sharedSecret) return false;
+    if (!payload || typeof payload !== 'object' || !signature) return false;
+    try {
+      return verifySignature(payload, signature, this.sharedSecret);
+    } catch (error) {
+      this.logger?.warn?.('Signed payload verification failed', { error: error?.message || error });
+      return false;
+    }
+  }
+
+  async #handleTokenIssue(req, res) {
+    if (!this.tokenService) {
+      return res.status(503).json({ error: 'Token service disabled' });
+    }
+    const { payload, signature } = req.body || {};
+    if (!this.#verifySignedPayload(payload, signature)) {
+      return res.status(401).json({ error: 'Invalid signature' });
+    }
+
+    const relayKey = payload?.relayKey;
+    const relayAuthToken = payload?.relayAuthToken;
+    if (!relayKey || !relayAuthToken) {
+      return res.status(400).json({ error: 'relayKey and relayAuthToken are required' });
+    }
+
+    try {
+      const result = await this.tokenService.issueToken(relayKey, {
+        relayAuthToken,
+        pubkey: payload?.pubkey || null,
+        scope: payload?.scope,
+        ttlSeconds: payload?.ttlSeconds
+      });
+      this.tokenMetrics.issueCounter.inc({ result: 'success' });
+      return res.json(result);
+    } catch (error) {
+      this.logger?.error?.('Failed to issue relay token', {
+        relayKey,
+        error: error?.message || error
+      });
+      this.tokenMetrics.issueCounter.inc({ result: 'error' });
+      return res.status(400).json({ error: error?.message || 'Failed to issue token' });
+    }
+  }
+
+  async #handleTokenRefresh(req, res) {
+    if (!this.tokenService) {
+      return res.status(503).json({ error: 'Token service disabled' });
+    }
+    const { payload, signature } = req.body || {};
+    if (!this.#verifySignedPayload(payload, signature)) {
+      return res.status(401).json({ error: 'Invalid signature' });
+    }
+
+    const relayKey = payload?.relayKey;
+    const token = payload?.token;
+    if (!relayKey || !token) {
+      return res.status(400).json({ error: 'relayKey and token are required' });
+    }
+
+    try {
+      const result = await this.tokenService.refreshToken(relayKey, {
+        token,
+        ttlSeconds: payload?.ttlSeconds
+      });
+      this.tokenMetrics.refreshCounter.inc({ result: 'success' });
+      return res.json(result);
+    } catch (error) {
+      this.logger?.warn?.('Failed to refresh relay token', {
+        relayKey,
+        error: error?.message || error
+      });
+      this.tokenMetrics.refreshCounter.inc({ result: 'error' });
+      return res.status(400).json({ error: error?.message || 'Failed to refresh token' });
+    }
+  }
+
+  async #handleTokenRevoke(req, res) {
+    if (!this.tokenService) {
+      return res.status(503).json({ error: 'Token service disabled' });
+    }
+    const { payload, signature } = req.body || {};
+    if (!this.#verifySignedPayload(payload, signature)) {
+      return res.status(401).json({ error: 'Invalid signature' });
+    }
+
+    const relayKey = payload?.relayKey;
+    if (!relayKey) {
+      return res.status(400).json({ error: 'relayKey is required' });
+    }
+
+    try {
+      const result = await this.tokenService.revokeToken(relayKey, { reason: payload?.reason });
+      this.tokenMetrics.revokeCounter.inc({ result: 'success' });
+      const disconnected = this.#broadcastTokenRevocation(relayKey, {
+        reason: payload?.reason || null,
+        sequence: result?.sequence || null
+      });
+      return res.json({ status: 'revoked', disconnected, sequence: result?.sequence || null });
+    } catch (error) {
+      this.logger?.warn?.('Failed to revoke relay token', {
+        relayKey,
+        error: error?.message || error
+      });
+      this.tokenMetrics.revokeCounter.inc({ result: 'error' });
+      return res.status(400).json({ error: error?.message || 'Failed to revoke token' });
+    }
+  }
+
+  #broadcastTokenRevocation(relayKey, { reason, sequence } = {}) {
+    let disconnected = 0;
+    for (const [connectionKey, session] of this.sessions.entries()) {
+      if (session.relayKey !== relayKey) continue;
+      disconnected += 1;
+      if (session.ws?.readyState === WebSocket.OPEN) {
+        const controlFrame = ['TOKEN', 'REVOKED', {
+          reason: reason || 'revoked',
+          sequence: sequence || null
+        }];
+        try {
+          session.ws.send(JSON.stringify(controlFrame));
+        } catch (error) {
+          this.logger?.debug?.('Failed to send token revocation control frame', {
+            relayKey,
+            error: error?.message || error
+          });
+        }
+        try {
+          session.ws.close(4403, 'Token revoked');
+        } catch (_) {}
+      }
+      this.#cleanupSession(connectionKey);
+    }
+    return disconnected;
+  }
+
   async #handleRelayRegistration(req, res) {
     if (!this.sharedSecret) {
       return res.status(503).json({ error: 'Registration disabled' });
@@ -816,7 +1172,11 @@ class PublicGatewayService {
     try {
       await this.registrationStore.upsertRelay(registration.relayKey, registration);
       this.logger.info?.('Relay registration accepted', { relayKey: registration.relayKey });
-      return res.json({ status: 'ok' });
+      const hyperbeeInfo = this.#getRelayHostInfo();
+      return res.json({
+        status: 'ok',
+        hyperbee: hyperbeeInfo
+      });
     } catch (error) {
       this.logger.error?.('Failed to persist relay registration', { relayKey: registration.relayKey, error: error.message });
       return res.status(500).json({ error: 'Failed to persist registration' });
@@ -863,6 +1223,18 @@ class PublicGatewayService {
   }
 
   #validateToken(token, relayKey) {
+    if (this.tokenService) {
+      try {
+        return this.tokenService.verifyToken(token, relayKey);
+      } catch (error) {
+        this.logger.warn?.('Token verification failed', {
+          relayKey,
+          error: error?.message || error
+        });
+        return null;
+      }
+    }
+
     const payload = verifyClientToken(token, this.sharedSecret);
     if (!payload) {
       this.logger.warn?.('Token verification failed - signature mismatch', { relayKey });
@@ -889,38 +1261,6 @@ class PublicGatewayService {
       this.logger.warn?.('Token verification failed - missing relay auth token', { relayKey });
       return null;
     }
-
-    const metadata = {
-      pubkey: payload.pubkey || null,
-      scope: payload.scope || null,
-      issuedAt: payload.issuedAt || null,
-      expiresAt: payload.expiresAt || null,
-      lastValidatedAt: Date.now()
-    };
-
-    try {
-      const maybePromise = this.registrationStore?.storeTokenMetadata?.(relayKey, metadata);
-      if (typeof maybePromise?.catch === 'function') {
-        maybePromise.catch((error) => {
-          this.logger.debug?.('Failed to persist token metadata', {
-            relayKey,
-            error: error?.message || error
-          });
-        });
-      }
-    } catch (error) {
-      this.logger.debug?.('Token metadata persistence threw synchronously', {
-        relayKey,
-        error: error?.message || error
-      });
-    }
-
-    this.logger.info?.('Token validated for relay session', {
-      relayKey,
-      scope: payload.scope || null,
-      pubkey: payload.pubkey ? `${payload.pubkey.slice(0, 16)}...` : null,
-      expiresAt: payload.expiresAt || null
-    });
 
     return {
       payload,

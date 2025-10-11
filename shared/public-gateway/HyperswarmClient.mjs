@@ -256,6 +256,14 @@ class HyperswarmConnection {
     this.lastUsed = Date.now();
     return this.protocol.sendHealthCheck();
   }
+
+  async sendTelemetry(payload) {
+    if (!this.connected) {
+      await this.connect();
+    }
+    this.lastUsed = Date.now();
+    return this.protocol.sendTelemetry(payload);
+  }
   
   destroy() {
     this.logger?.info?.('Destroying hyperswarm connection', {
@@ -293,15 +301,20 @@ class RelayProtocolWithGateway extends RelayProtocol {
     this.channel.addMessage({ encoding: c.json, onmessage: this._onwsframe.bind(this) });
     this.channel.addMessage({ encoding: c.json, onmessage: this._onhealthcheck.bind(this) });
     this.channel.addMessage({ encoding: c.json, onmessage: this._onhealthresponse.bind(this) });
+    this.channel.addMessage({ encoding: c.json, onmessage: this._ontelemetry.bind(this) });
 
     const handshake = {
       version: '2.0',
       isServer: this.isServer,
       isGateway: true,
       role: 'gateway',
-      capabilities: ['http', 'websocket', 'health']
+      capabilities: ['http', 'websocket', 'health', 'telemetry']
     };
     this.channel.open(handshake);
+  }
+
+  _ontelemetry(message) {
+    this.emit('telemetry', message);
   }
 }
 
@@ -427,6 +440,17 @@ class EnhancedHyperswarmPool {
         console.warn('[EnhancedHyperswarmPool] onProtocol handler error:', err);
       }
     }
+
+    protocol.on('telemetry', (payload) => {
+      if (this.options.onTelemetry) {
+        try {
+          this.options.onTelemetry({ publicKey, payload, context });
+        } catch (err) {
+          // eslint-disable-next-line no-console
+          console.warn('[EnhancedHyperswarmPool] onTelemetry handler error:', err);
+        }
+      }
+    });
 
     if (this.options.onHandshake) {
       const onOpen = (handshake) => {

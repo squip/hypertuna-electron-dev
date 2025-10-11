@@ -18,6 +18,7 @@ class GatewayAdvertiser {
     discoveryConfig,
     getSharedSecret,
     getSharedSecretVersion,
+    getRelayInfo,
     publicUrl,
     wsUrl
   }) {
@@ -27,6 +28,7 @@ class GatewayAdvertiser {
     this.getSharedSecretVersion = typeof getSharedSecretVersion === 'function'
       ? getSharedSecretVersion
       : async () => null;
+    this.getRelayInfo = typeof getRelayInfo === 'function' ? getRelayInfo : async () => null;
     this.publicUrl = publicUrl || null;
     this.wsUrl = wsUrl || null;
     this.keyPair = null;
@@ -165,6 +167,7 @@ class GatewayAdvertiser {
   async #buildAnnouncement() {
     const sharedSecret = await this.getSharedSecret();
     const sharedSecretVersion = await this.getSharedSecretVersion();
+    const relayInfo = await this.getRelayInfo?.();
     const timestamp = Date.now();
     const displayName = this.config.displayName || null;
     const region = this.config.region || null;
@@ -185,7 +188,10 @@ class GatewayAdvertiser {
       displayName: displayName || '',
       region: region || '',
       protocolVersion,
-      signatureKey: Buffer.from(this.keyPair.publicKey).toString('hex')
+      signatureKey: Buffer.from(this.keyPair.publicKey).toString('hex'),
+      relayKey: relayInfo?.hyperbeeKey || null,
+      relayDiscoveryKey: relayInfo?.discoveryKey || null,
+      relayReplicationTopic: relayInfo?.replicationTopic || null
     };
 
     payload.signature = signAnnouncement(payload, this.keyPair.secretKey);

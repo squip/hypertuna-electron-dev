@@ -8,6 +8,14 @@ const DEFAULT_SETTINGS = Object.freeze({
   baseUrl: 'https://hypertuna.com',
   sharedSecret: '',
   defaultTokenTtl: 3600,
+  tokenRefreshWindowSeconds: 300,
+  dispatcherMaxConcurrent: 3,
+  dispatcherInFlightWeight: 25,
+  dispatcherLatencyWeight: 1,
+  dispatcherFailureWeight: 500,
+  dispatcherReassignLagBlocks: 500,
+  dispatcherCircuitBreakerThreshold: 5,
+  dispatcherCircuitBreakerTimeoutMs: 60_000,
   resolvedGatewayId: null,
   resolvedSecretVersion: null,
   resolvedAt: null,
@@ -69,6 +77,40 @@ function normalizeSettings(raw = {}) {
     const ttl = Number(raw.defaultTokenTtl);
     if (Number.isFinite(ttl) && ttl > 0) {
       normalized.defaultTokenTtl = Math.round(ttl);
+    }
+  }
+
+  if (raw.tokenRefreshWindowSeconds != null) {
+    const value = Number(raw.tokenRefreshWindowSeconds);
+    if (Number.isFinite(value) && value > 0) {
+      normalized.tokenRefreshWindowSeconds = Math.round(value);
+    }
+  }
+
+  const dispatcherNumber = (candidate, min = 0) => {
+    const num = Number(candidate);
+    if (Number.isFinite(num) && num > min) return num;
+    return null;
+  };
+
+  const dispatcherFields = {
+    dispatcherMaxConcurrent: 0,
+    dispatcherInFlightWeight: 0,
+    dispatcherLatencyWeight: 0,
+    dispatcherFailureWeight: 0,
+    dispatcherReassignLagBlocks: -1,
+    dispatcherCircuitBreakerThreshold: 0,
+    dispatcherCircuitBreakerTimeoutMs: 0
+  };
+
+  for (const field of Object.keys(dispatcherFields)) {
+    if (raw[field] != null) {
+      const value = dispatcherNumber(raw[field], dispatcherFields[field]);
+      if (value !== null) {
+        normalized[field] = field === 'dispatcherCircuitBreakerThreshold'
+          ? Math.round(value)
+          : Math.round(value);
+      }
     }
   }
 
@@ -165,6 +207,24 @@ function withDefaults(raw = {}) {
   if (!Number.isFinite(merged.defaultTokenTtl) || merged.defaultTokenTtl <= 0) {
     merged.defaultTokenTtl = DEFAULT_SETTINGS.defaultTokenTtl;
   }
+  if (!Number.isFinite(merged.tokenRefreshWindowSeconds) || merged.tokenRefreshWindowSeconds <= 0) {
+    merged.tokenRefreshWindowSeconds = DEFAULT_SETTINGS.tokenRefreshWindowSeconds;
+  }
+
+  const ensurePositive = (field, fallback) => {
+    if (!Number.isFinite(merged[field]) || merged[field] <= 0) {
+      merged[field] = fallback;
+    }
+  };
+
+  ensurePositive('dispatcherMaxConcurrent', DEFAULT_SETTINGS.dispatcherMaxConcurrent);
+  ensurePositive('dispatcherInFlightWeight', DEFAULT_SETTINGS.dispatcherInFlightWeight);
+  ensurePositive('dispatcherLatencyWeight', DEFAULT_SETTINGS.dispatcherLatencyWeight);
+  ensurePositive('dispatcherFailureWeight', DEFAULT_SETTINGS.dispatcherFailureWeight);
+  ensurePositive('dispatcherReassignLagBlocks', DEFAULT_SETTINGS.dispatcherReassignLagBlocks);
+  ensurePositive('dispatcherCircuitBreakerThreshold', DEFAULT_SETTINGS.dispatcherCircuitBreakerThreshold);
+  ensurePositive('dispatcherCircuitBreakerTimeoutMs', DEFAULT_SETTINGS.dispatcherCircuitBreakerTimeoutMs);
+
   return merged;
 }
 

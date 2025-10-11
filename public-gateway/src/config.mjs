@@ -19,7 +19,8 @@ const DEFAULT_CONFIG = {
     redisUrl: process.env.GATEWAY_REGISTRATION_REDIS || null,
     redisPrefix: process.env.GATEWAY_REGISTRATION_REDIS_PREFIX || 'gateway:registrations:',
     cacheTtlSeconds: Number(process.env.GATEWAY_REGISTRATION_TTL || 300),
-    defaultTokenTtl: Number(process.env.GATEWAY_DEFAULT_TOKEN_TTL || 3600)
+    defaultTokenTtl: Number(process.env.GATEWAY_DEFAULT_TOKEN_TTL || 3600),
+    tokenRefreshWindowSeconds: Number(process.env.GATEWAY_TOKEN_REFRESH_WINDOW || 300)
   },
   rateLimit: {
     enabled: process.env.GATEWAY_RATELIMIT_ENABLED === 'true',
@@ -37,6 +38,28 @@ const DEFAULT_CONFIG = {
     secretPath: process.env.GATEWAY_DISCOVERY_SECRET_PATH || '/.well-known/hypertuna-gateway-secret',
     sharedSecretVersion: process.env.GATEWAY_DISCOVERY_SECRET_VERSION || '',
     protocolVersion: Number(process.env.GATEWAY_DISCOVERY_PROTOCOL_VERSION || 1)
+  },
+  relay: {
+    storageDir: process.env.GATEWAY_RELAY_STORAGE || null,
+    datasetNamespace: process.env.GATEWAY_RELAY_NAMESPACE || 'public-gateway-relay',
+    adminPublicKey: process.env.GATEWAY_RELAY_ADMIN_PUBLIC_KEY || null,
+    adminSecretKey: process.env.GATEWAY_RELAY_ADMIN_SECRET_KEY || null,
+    statsIntervalMs: Number(process.env.GATEWAY_RELAY_STATS_INTERVAL_MS || 15000),
+    replicationTopic: process.env.GATEWAY_RELAY_REPLICATION_TOPIC || null
+  },
+  features: {
+    hyperbeeRelayEnabled: process.env.GATEWAY_FEATURE_HYPERBEE_RELAY === 'true',
+    dispatcherEnabled: process.env.GATEWAY_FEATURE_RELAY_DISPATCHER === 'true',
+    tokenEnforcementEnabled: process.env.GATEWAY_FEATURE_RELAY_TOKEN_ENFORCEMENT === 'true'
+  },
+  dispatcher: {
+    maxConcurrentJobsPerPeer: Number(process.env.GATEWAY_DISPATCHER_MAX_CONCURRENT || 3),
+    inFlightWeight: Number(process.env.GATEWAY_DISPATCHER_INFLIGHT_WEIGHT || 25),
+    latencyWeight: Number(process.env.GATEWAY_DISPATCHER_LATENCY_WEIGHT || 1),
+    failureWeight: Number(process.env.GATEWAY_DISPATCHER_FAILURE_WEIGHT || 500),
+    reassignOnLagBlocks: Number(process.env.GATEWAY_DISPATCHER_REASSIGN_LAG || 500),
+    circuitBreakerThreshold: Number(process.env.GATEWAY_DISPATCHER_CB_THRESHOLD || 5),
+    circuitBreakerDurationMs: Number(process.env.GATEWAY_DISPATCHER_CB_TIMEOUT_MS || 60000)
   }
 };
 
@@ -77,6 +100,18 @@ function loadConfig(overrides = {}) {
     discovery: {
       ...DEFAULT_CONFIG.discovery,
       ...(overrides.discovery || {})
+    },
+    relay: {
+      ...DEFAULT_CONFIG.relay,
+      ...(overrides.relay || {})
+    },
+    features: {
+      ...DEFAULT_CONFIG.features,
+      ...(overrides.features || {})
+    },
+    dispatcher: {
+      ...DEFAULT_CONFIG.dispatcher,
+      ...(overrides.dispatcher || {})
     }
   };
 

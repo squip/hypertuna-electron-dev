@@ -21,6 +21,9 @@ const announcementEncoding = {
     c.uint.preencode(state, value.protocolVersion || 1);
     c.string.preencode(state, value.signature || '');
     c.string.preencode(state, value.signatureKey || '');
+    c.string.preencode(state, value.relayKey || '');
+    c.string.preencode(state, value.relayDiscoveryKey || '');
+    c.string.preencode(state, value.relayReplicationTopic || '');
   },
   encode(state, value) {
     c.string.encode(state, value.gatewayId || '');
@@ -37,9 +40,12 @@ const announcementEncoding = {
     c.uint.encode(state, value.protocolVersion || 1);
     c.string.encode(state, value.signature || '');
     c.string.encode(state, value.signatureKey || '');
+    c.string.encode(state, value.relayKey || '');
+    c.string.encode(state, value.relayDiscoveryKey || '');
+    c.string.encode(state, value.relayReplicationTopic || '');
   },
   decode(state) {
-    return {
+    const announcement = {
       gatewayId: c.string.decode(state),
       timestamp: c.uint.decode(state),
       ttl: c.uint.decode(state),
@@ -55,6 +61,12 @@ const announcementEncoding = {
       signature: c.string.decode(state),
       signatureKey: c.string.decode(state)
     };
+
+    announcement.relayKey = state.start < state.end ? c.string.decode(state) : '';
+    announcement.relayDiscoveryKey = state.start < state.end ? c.string.decode(state) : '';
+    announcement.relayReplicationTopic = state.start < state.end ? c.string.decode(state) : '';
+
+    return announcement;
   }
 };
 
@@ -85,6 +97,9 @@ function canonicalizeAnnouncement(announcement) {
     region: announcement.region || '',
     protocolVersion: announcement.protocolVersion || 1
   };
+  if (announcement.relayKey) payload.relayKey = announcement.relayKey;
+  if (announcement.relayDiscoveryKey) payload.relayDiscoveryKey = announcement.relayDiscoveryKey;
+  if (announcement.relayReplicationTopic) payload.relayReplicationTopic = announcement.relayReplicationTopic;
   const json = JSON.stringify(payload);
   return Buffer.from(json, 'utf8');
 }

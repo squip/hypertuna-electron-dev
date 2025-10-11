@@ -210,7 +210,10 @@ class PublicGatewayDiscoveryClient extends EventEmitter {
       secretFetchedAt: needsSecretRefresh ? 0 : existing.secretFetchedAt || 0,
       secretFetchError: needsSecretRefresh ? null : existing.secretFetchError || null,
       secretHashVerified: needsSecretRefresh ? false : existing.secretHashVerified || false,
-      fetchPromise: existing.fetchPromise || null
+      fetchPromise: existing.fetchPromise || null,
+      relayHyperbeeKey: announcement.relayKey || existing.relayHyperbeeKey || '',
+      relayDiscoveryKey: announcement.relayDiscoveryKey || existing.relayDiscoveryKey || '',
+      relayReplicationTopic: announcement.relayReplicationTopic || existing.relayReplicationTopic || ''
     };
 
     this.gateways.set(entry.gatewayId, entry);
@@ -323,6 +326,9 @@ class PublicGatewayDiscoveryClient extends EventEmitter {
       ttl: entry.ttl || 60,
       signatureKey: entry.signatureKey || null,
       openAccess: true,
+      relayHyperbeeKey: entry.relayHyperbeeKey || null,
+      relayDiscoveryKey: entry.relayDiscoveryKey || null,
+      relayReplicationTopic: entry.relayReplicationTopic || null,
       isExpired: expired
     };
   }

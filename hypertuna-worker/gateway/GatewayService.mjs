@@ -173,7 +173,8 @@ export class GatewayService extends EventEmitter {
     this.gatewayServer = null;
     this.connectionPool = new EnhancedHyperswarmPool({
       onProtocol: this._onProtocolCreated.bind(this),
-      onHandshake: this._onProtocolHandshake.bind(this)
+      onHandshake: this._onProtocolHandshake.bind(this),
+      onTelemetry: this._onPeerTelemetry.bind(this)
     });
     this.peerHealthManager = new PeerHealthManager();
     this.activePeers = [];
@@ -212,6 +213,8 @@ export class GatewayService extends EventEmitter {
     this.publicGatewayRelayState = new Map();
     this.publicGatewayRelayTokens = new Map();
     this.publicGatewayRelayTokenTimers = new Map();
+    this.gatewayTelemetryTimers = new Map();
+    this.publicGatewayRelayClient = new PublicGatewayRelayClient();
     this.publicGatewayWsBase = null;
     this.publicGatewayStatusUpdatedAt = null;
     this.discoveredGateways = [];
@@ -237,6 +240,12 @@ export class GatewayService extends EventEmitter {
     const ttlNumber = Number(ttlCandidate);
     const defaultTokenTtl = Number.isFinite(ttlNumber) && ttlNumber > 0 ? Math.round(ttlNumber) : 3600;
 
+    const refreshCandidate = rawConfig?.tokenRefreshWindowSeconds ?? Number(process.env.PUBLIC_GATEWAY_TOKEN_REFRESH_WINDOW);
+    const refreshNumber = Number(refreshCandidate);
+    const tokenRefreshWindowSeconds = Number.isFinite(refreshNumber) && refreshNumber > 0
+      ? Math.round(refreshNumber)
+      : 300;
+
     const selectionRaw = typeof rawConfig?.selectionMode === 'string'
       ? rawConfig.selectionMode.trim().toLowerCase()
       : '';
@@ -256,6 +265,7 @@ export class GatewayService extends EventEmitter {
         ? rawConfig.preferredBaseUrl.trim()
         : '',
       defaultTokenTtl,
+      tokenRefreshWindowSeconds,
       resolvedGatewayId: rawConfig?.resolvedGatewayId || null,
       resolvedSecretVersion: rawConfig?.resolvedSecretVersion || null,
       resolvedSharedSecretHash: rawConfig?.resolvedSharedSecretHash || null,
@@ -265,7 +275,14 @@ export class GatewayService extends EventEmitter {
       resolvedAt: Number(rawConfig?.resolvedAt) || null,
       resolvedFallback: !!rawConfig?.resolvedFallback,
       resolvedFromDiscovery: !!rawConfig?.resolvedFromDiscovery,
-      disabledReason: rawConfig?.disabledReason || null
+      disabledReason: rawConfig?.disabledReason || null,
+      dispatcherMaxConcurrent: this.#parsePositiveNumber(rawConfig?.dispatcherMaxConcurrent, 3),
+      dispatcherInFlightWeight: this.#parsePositiveNumber(rawConfig?.dispatcherInFlightWeight, 25),
+      dispatcherLatencyWeight: this.#parsePositiveNumber(rawConfig?.dispatcherLatencyWeight, 1),
+      dispatcherFailureWeight: this.#parsePositiveNumber(rawConfig?.dispatcherFailureWeight, 500),
+      dispatcherReassignLagBlocks: this.#parsePositiveNumber(rawConfig?.dispatcherReassignLagBlocks, 500),
+      dispatcherCircuitBreakerThreshold: this.#parsePositiveNumber(rawConfig?.dispatcherCircuitBreakerThreshold, 5),
+      dispatcherCircuitBreakerTimeoutMs: this.#parsePositiveNumber(rawConfig?.dispatcherCircuitBreakerTimeoutMs, 60000)
     };
 
     if (!config.selectionMode) {
@@ -299,6 +316,12 @@ export class GatewayService extends EventEmitter {
 
     config.enabled = !!config.enabled;
     return config;
+  }
+
+  #parsePositiveNumber(value, fallback) {
+    const num = Number(value);
+    if (Number.isFinite(num) && num > 0) return Math.round(num);
+    return fallback;
   }
 
   #configurePublicGateway() {
@@ -433,21 +456,22 @@ export class GatewayService extends EventEmitter {
     this.publicGatewayRelayTokenTimers.set(relayKey, handle);
   }
 
-  #scheduleRelayTokenRefresh(relayKey, expiresAt) {
+  #scheduleRelayTokenRefresh(relayKey, targetTime, fallbackExpiresAt = null) {
     if (!relayKey) return;
-    if (!Number.isFinite(expiresAt)) return;
+    if (!Number.isFinite(targetTime)) return;
     const existing = this.publicGatewayRelayTokenTimers.get(relayKey);
     if (existing) {
       clearTimeout(existing);
       this.publicGatewayRelayTokenTimers.delete(relayKey);
     }
     const now = Date.now();
-    let delay = expiresAt - now - 60_000;
+    let delay = targetTime - now;
     if (!Number.isFinite(delay)) {
       delay = 30_000;
     }
     if (delay <= 0) {
-      delay = expiresAt > now ? Math.max(5_000, expiresAt - now - 5_000) : 5_000;
+      const fallback = Number.isFinite(fallbackExpiresAt) ? fallbackExpiresAt : targetTime;
+      delay = fallback > now ? Math.max(5_000, fallback - now - 5_000) : 5_000;
     }
     const handle = setTimeout(() => {
       this.publicGatewayRelayTokenTimers.delete(relayKey);
@@ -496,8 +520,11 @@ export class GatewayService extends EventEmitter {
     if (!relayKey || !info) return;
     const storedInfo = { ...info };
     this.publicGatewayRelayTokens.set(relayKey, storedInfo);
-    if (schedule && storedInfo.expiresAt) {
-      this.#scheduleRelayTokenRefresh(relayKey, storedInfo.expiresAt);
+    if (schedule) {
+      const targetTime = storedInfo.refreshAfter || storedInfo.expiresAt;
+      if (Number.isFinite(targetTime)) {
+        this.#scheduleRelayTokenRefresh(relayKey, targetTime, storedInfo.expiresAt);
+      }
     }
     const current = this.publicGatewayRelayState.get(relayKey);
     if (current) {
@@ -545,14 +572,17 @@ export class GatewayService extends EventEmitter {
     const existing = this.publicGatewayRelayTokens.get(relayKey);
     const now = Date.now();
     const tokenMismatch = !existing?.relayAuthToken || existing.relayAuthToken !== authToken;
+    const ttlSeconds = this.publicGatewaySettings?.defaultTokenTtl || 3600;
 
     if (existing) {
       existing.relayAuthToken = authToken;
       this.publicGatewayRelayTokens.set(relayKey, { ...existing });
     }
 
-    if (!force && existing?.expiresAt && (existing.expiresAt - now) > 120_000 && !tokenMismatch) {
-      this.#scheduleRelayTokenRefresh(relayKey, existing.expiresAt);
+    const refreshAfter = existing?.refreshAfter || existing?.expiresAt || null;
+
+    if (!force && refreshAfter && (refreshAfter - now) > 30_000 && !tokenMismatch) {
+      this.#scheduleRelayTokenRefresh(relayKey, refreshAfter, existing?.expiresAt);
       const next = {
         ...state,
         token: existing.token,
@@ -571,7 +601,41 @@ export class GatewayService extends EventEmitter {
     }
 
     try {
-      this.issuePublicGatewayToken(relayKey);
+      if (existing?.token && !tokenMismatch) {
+        const refreshed = await this.publicGatewayRegistrar.refreshGatewayToken(relayKey, {
+          token: existing.token,
+          ttlSeconds
+        });
+        const expiresAt = Number(refreshed?.expiresAt) || (now + ttlSeconds * 1000);
+        const refreshAfterResult = Number(refreshed?.refreshAfter) || null;
+        const sequence = refreshed?.sequence || existing?.sequence || null;
+
+        const metadata = this.activeRelays.get(relayKey)?.metadata || {};
+        let gatewayPath = metadata.gatewayPath || null;
+        if (!gatewayPath) {
+          gatewayPath = this._normalizeGatewayPath(relayKey, metadata.gatewayPath, metadata.connectionUrl);
+        }
+        if (!gatewayPath) {
+          gatewayPath = relayKey.includes(':') ? relayKey.replace(':', '/') : relayKey;
+        }
+        const connectionUrl = `${this.publicGatewayWsBase}/${gatewayPath}?token=${encodeURIComponent(refreshed.token)}`;
+
+        this.#recordRelayToken(relayKey, {
+          token: refreshed.token,
+          expiresAt,
+          ttlSeconds,
+          connectionUrl,
+          baseUrl: this.publicGatewaySettings.baseUrl,
+          issuedForPubkey: requestingPubkey,
+          issuedAt: now,
+          relayAuthToken: authToken,
+          refreshAfter: refreshAfterResult,
+          sequence
+        }, { schedule: true });
+        return;
+      }
+
+      await this.issuePublicGatewayToken(relayKey, { ttlSeconds });
     } catch (error) {
       this.log('warn', `[PublicGateway] Failed to refresh relay token for ${relayKey}: ${error.message}`);
       this.#scheduleRelayTokenRetry(relayKey);
@@ -902,7 +966,29 @@ export class GatewayService extends EventEmitter {
     };
 
     try {
-      await this.publicGatewayRegistrar.registerRelay(relayKey, payload);
+      const registrationResult = await this.publicGatewayRegistrar.registerRelay(relayKey, payload);
+      if (!registrationResult?.success) {
+        throw new Error(registrationResult?.error || 'Registration rejected by gateway');
+      }
+      if (registrationResult.hyperbee?.hyperbeeKey) {
+        try {
+          await this.publicGatewayRelayClient.configure({
+            hyperbeeKey: registrationResult.hyperbee.hyperbeeKey,
+            discoveryKey: registrationResult.hyperbee.discoveryKey
+          });
+          metadataCopy.gatewayRelay = {
+            hyperbeeKey: registrationResult.hyperbee.hyperbeeKey,
+            discoveryKey: registrationResult.hyperbee.discoveryKey,
+            replicationTopic: registrationResult.hyperbee.replicationTopic || null
+          };
+          relayData.metadata = {
+            ...metadata,
+            gatewayRelay: metadataCopy.gatewayRelay
+          };
+        } catch (error) {
+          this.log('warn', `[PublicGateway] Failed to configure Hyperbee relay client: ${error.message}`);
+        }
+      }
       const tokenInfo = this.publicGatewayRelayTokens.get(relayKey) || null;
       this.publicGatewayRelayState.set(relayKey, {
         relayKey,
@@ -1047,7 +1133,7 @@ export class GatewayService extends EventEmitter {
     });
   }
 
-  _onProtocolHandshake({ publicKey, handshake, context = {} }) {
+  _onProtocolHandshake({ publicKey, protocol, handshake, context = {} }) {
     if (!handshake) return;
     this.peerHandshakes.set(publicKey, handshake);
 
@@ -1056,6 +1142,25 @@ export class GatewayService extends EventEmitter {
       this.healthState.services.protocolStatus = 'connected';
       this.emit('status', this.getStatus());
     }
+
+    if (handshake.isGateway) {
+      this.publicGatewayRelayClient?.attachProtocol(protocol);
+      this.#startGatewayTelemetry(publicKey, protocol);
+    }
+  }
+
+  _onPeerTelemetry({ publicKey, payload }) {
+    if (!publicKey || !payload) return;
+    this.dispatcher?.reportPeerMetrics(publicKey, {
+      peerId: publicKey,
+      latencyMs: Number(payload.latencyMs) || 0,
+      inFlightJobs: Number(payload.inFlightJobs) || 0,
+      failureRate: Number(payload.failureRate) || 0,
+      hyperbeeVersion: payload.hyperbeeVersion,
+      hyperbeeLag: payload.hyperbeeLag,
+      queueDepth: payload.queueDepth,
+      reportedAt: Number(payload.reportedAt) || Date.now()
+    });
   }
 
   log(level, message) {
@@ -1146,6 +1251,15 @@ export class GatewayService extends EventEmitter {
       try { ws.close(); } catch (_) {}
     }
     this.wsConnections.clear();
+
+    for (const cleanup of this.gatewayTelemetryTimers.values()) {
+      try {
+        cleanup();
+      } catch (_) {}
+    }
+    this.gatewayTelemetryTimers.clear();
+
+    await this.publicGatewayRelayClient?.close?.();
 
     await this.connectionPool.destroy();
 
@@ -1255,7 +1369,7 @@ export class GatewayService extends EventEmitter {
     this.#emitPublicGatewayStatus();
   }
 
-  issuePublicGatewayToken(relayKey, options = {}) {
+  async issuePublicGatewayToken(relayKey, options = {}) {
     if (!relayKey) {
       throw new Error('relayKey is required');
     }
@@ -1288,13 +1402,21 @@ export class GatewayService extends EventEmitter {
 
     const issuedAt = Date.now();
 
-    const token = this.publicGatewayRegistrar.issueClientToken(relayKey, {
+    const tokenResponse = await this.publicGatewayRegistrar.issueGatewayToken(relayKey, {
       ttlSeconds,
       relayAuthToken,
       pubkey: requestingPubkey,
       scope: options.scope || 'relay-access'
     });
-    const expiresAt = issuedAt + ttlSeconds * 1000;
+
+    const token = tokenResponse?.token;
+    if (!token) {
+      throw new Error('Gateway did not return token');
+    }
+
+    const expiresAt = Number(tokenResponse.expiresAt) || (issuedAt + ttlSeconds * 1000);
+    const refreshAfter = Number(tokenResponse.refreshAfter) || null;
+    const sequence = tokenResponse.sequence || null;
     const metadata = relayData.metadata || {};
     let gatewayPath = metadata.gatewayPath || null;
     if (!gatewayPath) {
@@ -1327,7 +1449,9 @@ export class GatewayService extends EventEmitter {
       baseUrl: this.publicGatewaySettings.baseUrl,
       issuedForPubkey: requestingPubkey,
       issuedAt,
-      relayAuthToken
+      relayAuthToken,
+      refreshAfter,
+      sequence
     }, { schedule: true });
 
     return {
@@ -1338,7 +1462,72 @@ export class GatewayService extends EventEmitter {
       ttlSeconds,
       gatewayPath,
       baseUrl: this.publicGatewaySettings.baseUrl,
-      issuedForPubkey: requestingPubkey
+      issuedForPubkey: requestingPubkey,
+      refreshAfter,
+      sequence
+    };
+  }
+
+  #startGatewayTelemetry(publicKey, protocol) {
+    if (!protocol || this.gatewayTelemetryTimers.has(publicKey)) return;
+
+    const sendTelemetry = async () => {
+      try {
+        const payload = await this.#collectTelemetrySnapshot();
+        payload.peerId = payload.peerId || publicKey;
+        protocol.sendTelemetry(payload);
+      } catch (error) {
+        this.log('debug', `[PublicGateway] Failed to send telemetry for ${publicKey}: ${error.message}`);
+      }
+    };
+
+    sendTelemetry();
+    const interval = setInterval(sendTelemetry, 15000);
+    interval.unref?.();
+
+    const cleanup = () => {
+      clearInterval(interval);
+      this.gatewayTelemetryTimers.delete(publicKey);
+    };
+
+    this.gatewayTelemetryTimers.set(publicKey, cleanup);
+    protocol.once('close', cleanup);
+    protocol.once('destroy', cleanup);
+    protocol.mux?.stream?.once('close', cleanup);
+  }
+
+  async #collectTelemetrySnapshot() {
+    const queueDepth = Array.from(this.messageQueues.values()).reduce((total, queue) => {
+      if (!queue || !Array.isArray(queue.queue)) return total;
+      return total + queue.queue.length;
+    }, 0);
+
+    const metrics = this.peerHealthManager?.metrics || {};
+    const failureRate = metrics.totalChecks
+      ? Math.min(1, metrics.failedChecks / metrics.totalChecks)
+      : 0;
+
+    let hyperbeeVersion = 0;
+    let hyperbeeLag = 0;
+    if (this.publicGatewayRelayClient) {
+      try {
+        const telemetry = await this.publicGatewayRelayClient.getTelemetry();
+        hyperbeeVersion = telemetry?.hyperbeeVersion || 0;
+        hyperbeeLag = telemetry?.hyperbeeLag || 0;
+      } catch (error) {
+        this.log('debug', `[PublicGateway] Hyperbee telemetry error: ${error.message}`);
+      }
+    }
+
+    return {
+      peerId: this.getCurrentPubkey?.() || null,
+      latencyMs: 0,
+      inFlightJobs: queueDepth,
+      failureRate,
+      hyperbeeVersion,
+      hyperbeeLag,
+      queueDepth,
+      reportedAt: Date.now()
     };
   }
 

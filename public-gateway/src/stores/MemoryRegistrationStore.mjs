@@ -60,6 +60,10 @@ class MemoryRegistrationStore {
     }
     return record;
   }
+
+  async clearTokenMetadata(relayKey) {
+    this.tokenMetadata.delete(relayKey);
+  }
 }
 
 export default MemoryRegistrationStore;

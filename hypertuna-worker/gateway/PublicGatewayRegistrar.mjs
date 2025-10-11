@@ -2,8 +2,7 @@ import { URL } from 'node:url';
 
 import {
   createRelayRegistration,
-  createSignature,
-  issueClientToken
+  createSignature
 } from '../../shared/auth/PublicGatewayTokens.mjs';
 
 class PublicGatewayRegistrar {
@@ -20,7 +19,7 @@ class PublicGatewayRegistrar {
   }
 
   async registerRelay(relayKey, payload = {}) {
-    if (!this.isEnabled()) return false;
+    if (!this.isEnabled()) return { success: false };
     if (!relayKey) throw new Error('relayKey is required');
 
     const registration = createRelayRegistration(relayKey, payload);
@@ -44,14 +43,21 @@ class PublicGatewayRegistrar {
         if (text) {
           this.logger.debug?.('Public gateway error response', { body: text, relayKey });
         }
-        return false;
+        return { success: false, status: response.status };
+      }
+
+      let data = null;
+      try {
+        data = await response.json();
+      } catch (_) {
+        data = null;
       }
 
       this.logger.info?.('Relay registered with public gateway', { relayKey });
-      return true;
+      return { success: true, ...data };
     } catch (error) {
       this.logger.error?.('Failed to register relay with public gateway', { relayKey, error: error.message });
-      return false;
+      return { success: false, error: error.message };
     }
   }
 
@@ -79,19 +85,46 @@ class PublicGatewayRegistrar {
     }
   }
 
-  issueClientToken(relayKey, options = {}) {
-    if (!this.isEnabled()) throw new Error('Public gateway registrar not configured');
-    if (!options?.relayAuthToken) {
-      throw new Error('relayAuthToken is required to issue a public gateway token');
+  async issueGatewayToken(relayKey, payload = {}) {
+    const body = await this.#signedPayload({ relayKey, ...payload });
+    return this.#postJson('/api/relay-tokens/issue', body);
+  }
+
+  async refreshGatewayToken(relayKey, payload = {}) {
+    const body = await this.#signedPayload({ relayKey, ...payload });
+    return this.#postJson('/api/relay-tokens/refresh', body);
+  }
+
+  async revokeGatewayToken(relayKey, payload = {}) {
+    const body = await this.#signedPayload({ relayKey, ...payload });
+    return this.#postJson('/api/relay-tokens/revoke', body);
+  }
+
+  async #postJson(path, body) {
+    if (!this.isEnabled()) {
+      throw new Error('Public gateway registrar not configured');
     }
-    const payload = {
-      relayKey,
-      relayAuthToken: options.relayAuthToken,
-      pubkey: options.pubkey || null,
-      scope: options.scope || 'relay-access',
-      expiresAt: options.expiresAt || Date.now() + (options.ttlSeconds || 3600) * 1000
-    };
-    return issueClientToken(payload, this.sharedSecret);
+    const url = new URL(path, this.baseUrl).toString();
+    const response = await this.fetch(url, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body)
+    });
+    if (!response.ok) {
+      const text = await response.text();
+      throw new Error(text || `Gateway responded with status ${response.status}`);
+    }
+    try {
+      return await response.json();
+    } catch (error) {
+      throw new Error(`Failed to parse gateway response: ${error.message}`);
+    }
+  }
+
+  async #signedPayload(payload) {
+    if (!this.sharedSecret) throw new Error('Shared secret not configured');
+    const signature = createSignature(payload, this.sharedSecret);
+    return { payload, signature };
   }
 }
 

@@ -19,9 +19,51 @@ const requestCounter = new client.Counter({
   labelNames: ['relay']
 });
 
+const relayEventCounter = new client.Counter({
+  name: 'gateway_relay_events_total',
+  help: 'Count of EVENT frames processed by the gateway relay host',
+  labelNames: ['result']
+});
+
+const relayReqCounter = new client.Counter({
+  name: 'gateway_relay_requests_total',
+  help: 'Count of REQ frames processed by the gateway relay pipeline',
+  labelNames: ['path']
+});
+
+const relayErrorCounter = new client.Counter({
+  name: 'gateway_relay_websocket_errors_total',
+  help: 'Count of errors encountered while handling relay websocket messages',
+  labelNames: ['stage']
+});
+
+const relayTokenIssueCounter = new client.Counter({
+  name: 'gateway_relay_token_issues_total',
+  help: 'Count of relay tokens issued by the gateway',
+  labelNames: ['result']
+});
+
+const relayTokenRefreshCounter = new client.Counter({
+  name: 'gateway_relay_token_refresh_total',
+  help: 'Count of relay token refresh operations',
+  labelNames: ['result']
+});
+
+const relayTokenRevocationCounter = new client.Counter({
+  name: 'gateway_relay_token_revocations_total',
+  help: 'Count of relay token revocations initiated by the gateway',
+  labelNames: ['result']
+});
+
 register.registerMetric(sessionGauge);
 register.registerMetric(peerGauge);
 register.registerMetric(requestCounter);
+register.registerMetric(relayEventCounter);
+register.registerMetric(relayReqCounter);
+register.registerMetric(relayErrorCounter);
+register.registerMetric(relayTokenIssueCounter);
+register.registerMetric(relayTokenRefreshCounter);
+register.registerMetric(relayTokenRevocationCounter);
 
 function metricsMiddleware(path = '/metrics') {
   return async (req, res, next) => {
@@ -40,5 +82,11 @@ export {
   sessionGauge,
   peerGauge,
   requestCounter,
+  relayEventCounter,
+  relayReqCounter,
+  relayErrorCounter,
+  relayTokenIssueCounter,
+  relayTokenRefreshCounter,
+  relayTokenRevocationCounter,
   metricsMiddleware
 };

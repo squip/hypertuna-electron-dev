@@ -94,6 +94,11 @@ class RedisRegistrationStore {
       return null;
     }
   }
+
+  async clearTokenMetadata(relayKey) {
+    await this.#ensureConnected();
+    await this.client.del(this.#tokenKey(relayKey));
+  }
 }
 
 export default RedisRegistrationStore;
