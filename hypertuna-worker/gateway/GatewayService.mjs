@@ -1943,17 +1943,31 @@ export class GatewayService extends EventEmitter {
   }
 
   handleGatewayWebSocketConnection(ws, req) {
-    const pathname = url.parse(req.url).pathname || '';
-    const parts = pathname.split('/').filter(Boolean);
-    const identifier = parts.length >= 2 ? `${parts[0]}:${parts[1]}` : parts[0];
     const parsedUrl = url.parse(req.url, true);
-    const authToken = parsedUrl.query.token || null;
+    const pathname = parsedUrl.pathname || '';
 
-    if (this.activeRelays.has(identifier)) {
-      this.handleWebSocket(ws, identifier, authToken);
-    } else {
-      ws.close(1008, 'Invalid relay key');
+    const strippedPath = pathname.replace(/^\/+/, '');
+    const normalizedIdentifier = this._normalizeRelayIdentifier(strippedPath);
+
+    const rawParts = strippedPath.split('/').filter(Boolean);
+    let fallbackIdentifier = null;
+    if (rawParts.length >= 2) {
+      fallbackIdentifier = `${rawParts[0]}:${rawParts.slice(1).join('/')}`;
+    } else if (rawParts.length === 1) {
+      fallbackIdentifier = rawParts[0];
     }
+
+    const candidateIdentifiers = [normalizedIdentifier, fallbackIdentifier].filter(Boolean);
+    const matchedIdentifier = candidateIdentifiers.find(id => this.activeRelays.has(id));
+
+    const authToken = parsedUrl.query?.token || null;
+
+    if (matchedIdentifier) {
+      this.handleWebSocket(ws, matchedIdentifier, authToken);
+      return;
+    }
+
+    ws.close(1008, 'Invalid relay key');
   }
 
   handleWebSocket(ws, identifier, authToken = null) {
