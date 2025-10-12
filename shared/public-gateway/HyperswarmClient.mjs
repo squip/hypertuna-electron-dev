@@ -485,6 +485,13 @@ class EnhancedHyperswarmPool {
     this.logger?.info?.('Hyperswarm pool destroyed');
     this.initialized = false;
   }
+
+  getPublicKey() {
+    if (this.swarmKeyPair?.publicKey) {
+      return Buffer.from(this.swarmKeyPair.publicKey).toString('hex');
+    }
+    return null;
+  }
 }
 
 async function checkPeerHealthWithHyperswarm(peer, connectionPool) {

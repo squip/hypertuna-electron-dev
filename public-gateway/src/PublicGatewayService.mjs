@@ -500,23 +500,6 @@ class PublicGatewayService {
       return;
     }
 
-    if (!token) {
-      this.logger.warn?.('WebSocket rejected: token missing', { relayKey });
-      ws.close(4403, 'Token required');
-      ws.terminate();
-      return;
-    }
-
-    const tokenValidation = await this.#validateToken(token, relayKey);
-    if (!tokenValidation) {
-      this.logger.warn?.('WebSocket rejected: token validation failed', { relayKey });
-      ws.close(4403, 'Invalid token');
-      ws.terminate();
-      return;
-    }
-
-    const { payload: tokenPayload, relayAuthToken, pubkey: tokenPubkey, scope: tokenScope } = tokenValidation;
-
     const registration = await this.registrationStore.getRelay(relayKey);
     if (!registration) {
       this.logger.warn?.('WebSocket rejected: relay not registered', { relayKey });
@@ -524,6 +507,28 @@ class PublicGatewayService {
       ws.terminate();
       return;
     }
+
+    const requiresAuth = registration?.metadata?.requiresAuth !== false;
+
+    let tokenValidation = null;
+    if (requiresAuth) {
+      if (!token) {
+        this.logger.warn?.('WebSocket rejected: token missing', { relayKey });
+        ws.close(4403, 'Token required');
+        ws.terminate();
+        return;
+      }
+
+      tokenValidation = await this.#validateToken(token, relayKey);
+      if (!tokenValidation) {
+        this.logger.warn?.('WebSocket rejected: token validation failed', { relayKey });
+        ws.close(4403, 'Invalid token');
+        ws.terminate();
+        return;
+      }
+    }
+
+    const { payload: tokenPayload, relayAuthToken, pubkey: tokenPubkey, scope: tokenScope } = tokenValidation || {};
 
     const availablePeers = this.#getPeersFromRegistration(registration);
     this.logger.info?.('Initializing websocket session - relay registration fetched', {
@@ -567,7 +572,7 @@ class PublicGatewayService {
       connectionKey,
       relayKey,
       ws,
-      clientToken: token,
+      clientToken: token || null,
       tokenPayload,
       relayAuthToken,
       clientPubkey: tokenPubkey || null,

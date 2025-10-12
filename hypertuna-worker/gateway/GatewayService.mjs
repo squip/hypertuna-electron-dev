@@ -25,6 +25,8 @@ import { updatePublicGatewaySettings } from '../../shared/config/PublicGatewaySe
 
 const MAX_LOG_ENTRIES = 500;
 const DEFAULT_PORT = 8443;
+const PUBLIC_GATEWAY_RELAY_KEY = 'public-gateway:hyperbee';
+const PUBLIC_GATEWAY_RELAY_PATH = 'public-gateway/hyperbee';
 
 class MessageQueue {
   constructor() {
@@ -375,6 +377,8 @@ export class GatewayService extends EventEmitter {
     if (config.disabledReason) {
       this.discoveryWarning = null;
     }
+
+    this.#ensurePublicGatewayRelayEntry();
   }
 
   async #ensureDiscoveryClient() {
@@ -968,6 +972,10 @@ export class GatewayService extends EventEmitter {
       return;
     }
 
+    if (this.#isPublicGatewayRelayKey(relayKey)) {
+      this.#ensurePublicGatewayRelayEntry();
+    }
+
     const relayData = this.activeRelays.get(relayKey);
     if (!relayData) {
       this.publicGatewayRelayState.delete(relayKey);
@@ -979,6 +987,33 @@ export class GatewayService extends EventEmitter {
     const peers = Array.from(relayData.peers || []);
     const metadata = relayData.metadata || {};
     const metadataCopy = metadata ? { ...metadata } : {};
+
+    if (this.#isPublicGatewayRelayKey(relayKey)) {
+      metadataCopy.identifier = metadataCopy.identifier || relayKey;
+      metadataCopy.name = metadataCopy.name || this.publicGatewaySettings?.resolvedDisplayName || 'Public Gateway Relay';
+      metadataCopy.description = metadataCopy.description || 'Replicated public gateway relay dataset';
+      metadataCopy.gatewayPath = this.#getPublicGatewayRelayPath();
+      metadataCopy.isPublic = true;
+      if (metadataCopy.requiresAuth === undefined) {
+        metadataCopy.requiresAuth = false;
+      }
+      if (!metadataCopy.gatewayRelay && this.publicGatewaySettings?.resolvedGatewayRelay) {
+        const gatewayRelay = this.publicGatewaySettings.resolvedGatewayRelay;
+        metadataCopy.gatewayRelay = {
+          hyperbeeKey: gatewayRelay.hyperbeeKey || null,
+          discoveryKey: gatewayRelay.discoveryKey || null,
+          replicationTopic: gatewayRelay.replicationTopic || null,
+          defaultTokenTtl: gatewayRelay.defaultTokenTtl ?? null,
+          tokenRefreshWindowSeconds: gatewayRelay.tokenRefreshWindowSeconds ?? null,
+          dispatcher: gatewayRelay.dispatcher || null
+        };
+      }
+      relayData.metadata = {
+        ...metadata,
+        ...metadataCopy
+      };
+    }
+
     const now = Date.now();
 
     if (!peers.length) {
@@ -991,7 +1026,11 @@ export class GatewayService extends EventEmitter {
           lastSyncedAt: now,
           message: 'No peers connected',
           metadata: metadataCopy,
-          peers: []
+          peers: [],
+          localConnectionUrl: this.#isPublicGatewayRelayKey(relayKey)
+            ? `${(this.config?.urls?.hostname || this.gatewayServer?.getServerUrls()?.hostname || 'ws://127.0.0.1:8443').replace(/\/$/, '')}/${this.#getPublicGatewayRelayPath()}`
+            : null,
+          requiresAuth: this.#isPublicGatewayRelayKey(relayKey) ? false : metadataCopy?.requiresAuth ?? true
         });
       } catch (error) {
         this.publicGatewayRelayState.set(relayKey, {
@@ -1001,7 +1040,11 @@ export class GatewayService extends EventEmitter {
           lastSyncedAt: now,
           message: error.message,
           metadata: metadataCopy,
-          peers: []
+          peers: [],
+          localConnectionUrl: this.#isPublicGatewayRelayKey(relayKey)
+            ? `${(this.config?.urls?.hostname || this.gatewayServer?.getServerUrls()?.hostname || 'ws://127.0.0.1:8443').replace(/\/$/, '')}/${this.#getPublicGatewayRelayPath()}`
+            : null,
+          requiresAuth: this.#isPublicGatewayRelayKey(relayKey) ? false : metadataCopy?.requiresAuth ?? true
         });
         this.log('warn', `[PublicGateway] Failed to unregister relay ${relayKey}: ${error.message}`);
       }
@@ -1042,11 +1085,18 @@ export class GatewayService extends EventEmitter {
             ...metadata,
             gatewayRelay: metadataCopy.gatewayRelay
           };
+          if (this.#isPublicGatewayRelayKey(relayKey)) {
+            this.#ensurePublicGatewayRelayEntry({ hyperbee: registrationResult.hyperbee });
+          }
         } catch (error) {
           this.log('warn', `[PublicGateway] Failed to configure Hyperbee relay client: ${error.message}`);
         }
       }
       const tokenInfo = this.publicGatewayRelayTokens.get(relayKey) || null;
+      const localBase = this.config?.urls?.hostname || this.gatewayServer?.getServerUrls()?.hostname || 'ws://127.0.0.1:8443';
+      const localConnectionUrl = this.#isPublicGatewayRelayKey(relayKey)
+        ? `${localBase.replace(/\/$/, '')}/${this.#getPublicGatewayRelayPath()}`
+        : null;
       this.publicGatewayRelayState.set(relayKey, {
         relayKey,
         status: 'registered',
@@ -1062,11 +1112,24 @@ export class GatewayService extends EventEmitter {
         tokenIssuedAt: tokenInfo?.issuedAt || null,
         defaultTokenTtl: registrationResult.hyperbee?.defaultTokenTtl ?? null,
         tokenRefreshWindowSeconds: registrationResult.hyperbee?.tokenRefreshWindowSeconds ?? null,
-        dispatcher: registrationResult.hyperbee?.dispatcher || null
+        dispatcher: registrationResult.hyperbee?.dispatcher || null,
+        localConnectionUrl: localConnectionUrl || tokenInfo?.localConnectionUrl || null,
+        requiresAuth: this.#isPublicGatewayRelayKey(relayKey) ? false : metadataCopy?.requiresAuth ?? true
       });
-      await this.#refreshRelayToken(relayKey, {
-        force: forceTokenRefresh || !tokenInfo
-      });
+      if (this.#isPublicGatewayRelayKey(relayKey)) {
+        this.log('info', '[PublicGateway] Public gateway relay bridge ready', {
+          relayKey,
+          localUrl: localConnectionUrl,
+          remoteUrl: tokenInfo?.connectionUrl || null
+        });
+      }
+      if (!(this.#isPublicGatewayRelayKey(relayKey) && metadataCopy.requiresAuth === false)) {
+        await this.#refreshRelayToken(relayKey, {
+          force: forceTokenRefresh || !tokenInfo
+        });
+      } else {
+        this.#emitPublicGatewayStatus();
+      }
     } catch (error) {
       this.publicGatewayRelayState.set(relayKey, {
         relayKey,
@@ -1402,7 +1465,19 @@ export class GatewayService extends EventEmitter {
       return;
     }
 
+    const gatewayRelayKey = this.#getPublicGatewayRelayKey();
+    if (gatewayRelayKey && this.publicGatewaySettings?.resolvedGatewayRelay?.hyperbeeKey) {
+      this.#ensurePublicGatewayRelayEntry();
+      try {
+        // eslint-disable-next-line no-await-in-loop
+        await this.#syncPublicGatewayRelay(gatewayRelayKey, { forceTokenRefresh: true });
+      } catch (error) {
+        this.log('warn', `[PublicGateway] Failed to sync gateway relay replica: ${error.message}`);
+      }
+    }
+
     for (const key of this.activeRelays.keys()) {
+      if (this.#isPublicGatewayRelayKey(key)) continue;
       // Sequential resync to avoid saturating registrar
       // eslint-disable-next-line no-await-in-loop
       await this.#syncPublicGatewayRelay(key, { forceTokenRefresh: true });
@@ -2191,6 +2266,118 @@ export class GatewayService extends EventEmitter {
     }
 
     return normalized;
+  }
+
+  #getPublicGatewayRelayKey() {
+    if (!this.publicGatewaySettings?.enabled) return null;
+    return PUBLIC_GATEWAY_RELAY_KEY;
+  }
+
+  #getPublicGatewayRelayPath() {
+    return PUBLIC_GATEWAY_RELAY_PATH;
+  }
+
+  #isPublicGatewayRelayKey(relayKey) {
+    if (!relayKey) return false;
+    return relayKey === PUBLIC_GATEWAY_RELAY_KEY;
+  }
+
+  #ensurePublicGatewayRelayEntry({ hyperbee } = {}) {
+    const relayKey = this.#getPublicGatewayRelayKey();
+    const resolvedRelay = this.publicGatewaySettings?.resolvedGatewayRelay;
+    if (!relayKey || !resolvedRelay?.hyperbeeKey) {
+      return;
+    }
+
+    let relayData = this.activeRelays.get(relayKey);
+    if (!relayData) {
+      relayData = {
+        peers: new Set(),
+        status: 'active',
+        createdAt: Date.now(),
+        lastActive: Date.now(),
+        metadata: {}
+      };
+      this.activeRelays.set(relayKey, relayData);
+    }
+
+    relayData.lastActive = Date.now();
+    if (!relayData.peers) {
+      relayData.peers = new Set();
+    }
+    if (this.ownPeerPublicKey) {
+      relayData.peers.add(this.ownPeerPublicKey);
+    }
+    const poolPublicKey = this.connectionPool?.getPublicKey?.();
+    if (!this.ownPeerPublicKey && poolPublicKey) {
+      relayData.peers.add(poolPublicKey);
+    }
+
+    const metadata = { ...(relayData.metadata || {}) };
+    metadata.identifier = metadata.identifier || relayKey;
+    if (!metadata.name) {
+      metadata.name = this.publicGatewaySettings?.resolvedDisplayName || 'Public Gateway Relay';
+    }
+    if (!metadata.description) {
+      metadata.description = 'Replicated public gateway relay dataset';
+    }
+    metadata.gatewayPath = this.#getPublicGatewayRelayPath();
+    metadata.isPublic = true;
+    metadata.isGatewayReplica = true;
+
+    const relayInfo = hyperbee || resolvedRelay || metadata.gatewayRelay || null;
+    if (relayInfo) {
+      metadata.gatewayRelay = {
+        hyperbeeKey: relayInfo.hyperbeeKey || null,
+        discoveryKey: relayInfo.discoveryKey || null,
+        replicationTopic: relayInfo.replicationTopic || null,
+        defaultTokenTtl: relayInfo.defaultTokenTtl ?? null,
+        tokenRefreshWindowSeconds: relayInfo.tokenRefreshWindowSeconds ?? null,
+        dispatcher: relayInfo.dispatcher || null
+      };
+    }
+
+    relayData.metadata = metadata;
+
+    const peerList = Array.from(relayData.peers || []);
+    const localBase = this.config?.urls?.hostname || this.gatewayServer?.getServerUrls()?.hostname || 'ws://127.0.0.1:8443';
+    const localConnectionUrl = `${localBase.replace(/\/$/, '')}/${this.#getPublicGatewayRelayPath()}`;
+
+    const existingState = this.publicGatewayRelayState.get(relayKey);
+    const nextState = existingState
+      ? {
+          ...existingState,
+          metadata,
+          peerCount: peerList.length,
+          peers: peerList,
+          defaultTokenTtl: this.publicGatewaySettings?.defaultTokenTtl ?? existingState.defaultTokenTtl ?? null,
+          tokenRefreshWindowSeconds: this.publicGatewaySettings?.resolvedTokenRefreshWindowSeconds ?? existingState.tokenRefreshWindowSeconds ?? null,
+          dispatcher: this.publicGatewaySettings?.resolvedDispatcher || existingState.dispatcher || null,
+          localConnectionUrl,
+          requiresAuth: false
+        }
+      : {
+          relayKey,
+          status: 'pending',
+          peerCount: peerList.length,
+          lastSyncedAt: null,
+          message: null,
+          metadata,
+          peers: peerList,
+          token: null,
+          connectionUrl: null,
+          expiresAt: null,
+          ttlSeconds: null,
+          tokenIssuedAt: null,
+          defaultTokenTtl: this.publicGatewaySettings?.defaultTokenTtl ?? null,
+          tokenRefreshWindowSeconds: this.publicGatewaySettings?.resolvedTokenRefreshWindowSeconds ?? null,
+          dispatcher: this.publicGatewaySettings?.resolvedDispatcher || null,
+          localConnectionUrl,
+          requiresAuth: false
+        };
+
+    this.publicGatewayRelayState.set(relayKey, nextState);
+    this.#emitPublicGatewayStatus();
   }
 
   _ensureRelayAvatarUrl(url, identifier) {
