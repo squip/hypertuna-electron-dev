@@ -18,6 +18,8 @@ import {
 } from './HyperswarmClient.mjs';
 import PublicGatewayRegistrar from './PublicGatewayRegistrar.mjs';
 import PublicGatewayDiscoveryClient from './PublicGatewayDiscoveryClient.mjs';
+import PublicGatewayRelayClient from './PublicGatewayRelayClient.mjs';
+import PublicGatewayHyperbeeAdapter from './PublicGatewayHyperbeeAdapter.mjs';
 import { getRelayAuthStore } from '../relay-auth-store.mjs';
 import { updatePublicGatewaySettings } from '../../shared/config/PublicGatewaySettings.mjs';
 
@@ -214,7 +216,24 @@ export class GatewayService extends EventEmitter {
     this.publicGatewayRelayTokens = new Map();
     this.publicGatewayRelayTokenTimers = new Map();
     this.gatewayTelemetryTimers = new Map();
-    this.publicGatewayRelayClient = new PublicGatewayRelayClient();
+    this.publicGatewayRelayClient = new PublicGatewayRelayClient({ logger: this.#createExternalLogger?.() || console });
+    this.hyperbeeAdapter = new PublicGatewayHyperbeeAdapter({
+      relayClient: this.publicGatewayRelayClient,
+      logger: this.loggerBridge || console
+    });
+    this.hyperbeeQueryStats = {
+      totalServed: 0,
+      totalEvents: 0,
+      totalFallbacks: 0,
+      totalErrors: 0,
+      lastServedAt: null,
+      lastFallbackAt: null,
+      lastErrorAt: null,
+      lastErrorMessage: null
+    };
+    this.ownPeerPublicKey = typeof options.getOwnPeerPublicKey === 'function'
+      ? options.getOwnPeerPublicKey()
+      : (options.ownPeerPublicKey || null);
     this.publicGatewayWsBase = null;
     this.publicGatewayStatusUpdatedAt = null;
     this.discoveredGateways = [];
@@ -329,6 +348,14 @@ export class GatewayService extends EventEmitter {
 
     if (!this.loggerBridge) {
       this.loggerBridge = this.#createExternalLogger();
+    }
+
+    if (this.publicGatewayRelayClient) {
+      this.publicGatewayRelayClient.logger = this.loggerBridge;
+    }
+
+    if (this.hyperbeeAdapter) {
+      this.hyperbeeAdapter.logger = this.loggerBridge;
     }
 
     if (config.enabled && config.baseUrl && config.sharedSecret) {
@@ -976,6 +1003,7 @@ export class GatewayService extends EventEmitter {
             hyperbeeKey: registrationResult.hyperbee.hyperbeeKey,
             discoveryKey: registrationResult.hyperbee.discoveryKey
           });
+          this.hyperbeeAdapter?.setRelayClient(this.publicGatewayRelayClient);
           metadataCopy.gatewayRelay = {
             hyperbeeKey: registrationResult.hyperbee.hyperbeeKey,
             discoveryKey: registrationResult.hyperbee.discoveryKey,
@@ -1519,15 +1547,24 @@ export class GatewayService extends EventEmitter {
       }
     }
 
+    const peerId = this.ownPeerPublicKey || this.getCurrentPubkey?.() || null;
+
     return {
-      peerId: this.getCurrentPubkey?.() || null,
+      peerId,
       latencyMs: 0,
       inFlightJobs: queueDepth,
       failureRate,
       hyperbeeVersion,
       hyperbeeLag,
       queueDepth,
-      reportedAt: Date.now()
+      reportedAt: Date.now(),
+      hyperbeeServed: this.hyperbeeQueryStats?.totalServed || 0,
+      hyperbeeServedEvents: this.hyperbeeQueryStats?.totalEvents || 0,
+      hyperbeeFallbacks: this.hyperbeeQueryStats?.totalFallbacks || 0,
+      hyperbeeErrors: this.hyperbeeQueryStats?.totalErrors || 0,
+      hyperbeeLastServedAt: this.hyperbeeQueryStats?.lastServedAt || null,
+      hyperbeeLastFallbackAt: this.hyperbeeQueryStats?.lastFallbackAt || null,
+      hyperbeeLastFallbackReason: this.hyperbeeQueryStats?.lastFallbackReason || null
     };
   }
 
@@ -1571,6 +1608,16 @@ export class GatewayService extends EventEmitter {
       peerDetails,
       publicGateway: this.getPublicGatewayState()
     };
+  }
+
+  getOwnPeerPublicKey() {
+    return this.ownPeerPublicKey || null;
+  }
+
+  setOwnPeerPublicKey(peerKey) {
+    if (typeof peerKey === 'string' && peerKey.trim()) {
+      this.ownPeerPublicKey = peerKey.trim();
+    }
   }
 
   getDiagnostics() {
@@ -2164,7 +2211,8 @@ export class GatewayService extends EventEmitter {
     this.wsConnections.set(connectionKey, {
       ws,
       relayKey: identifier,
-      authToken
+      authToken,
+      connectionKey
     });
 
     const messageQueue = new MessageQueue();
@@ -2177,6 +2225,11 @@ export class GatewayService extends EventEmitter {
           if (ws.readyState === WebSocket.OPEN) {
             ws.send(JSON.stringify(['NOTICE', 'Internal server error: connection data missing']));
           }
+          return;
+        }
+
+        const handledLocally = await this.#maybeHandleReqLocally(connData, msg);
+        if (handledLocally) {
           return;
         }
 
@@ -2228,6 +2281,130 @@ export class GatewayService extends EventEmitter {
     });
 
     this.startEventChecking(connectionKey);
+  }
+
+  async #maybeHandleReqLocally(connData, rawMessage) {
+    if (!this.hyperbeeAdapter?.hasReplica()) {
+      return false;
+    }
+
+    const { ws, relayKey } = connData || {};
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      return false;
+    }
+
+    if (!this.#canServeRelayLocally(relayKey)) {
+      return false;
+    }
+
+    let frame;
+    let textPayload;
+    try {
+      textPayload = typeof rawMessage === 'string' ? rawMessage : rawMessage.toString();
+      frame = JSON.parse(textPayload);
+    } catch (error) {
+      return false;
+    }
+
+    if (!Array.isArray(frame) || frame[0] !== 'REQ') {
+      return false;
+    }
+
+    const subscriptionId = frame[1];
+    if (!subscriptionId) {
+      return false;
+    }
+
+    const filters = frame.slice(2);
+    const replicaStats = await this.hyperbeeAdapter.getReplicaStats();
+    const lagThreshold = Number(this.publicGatewaySettings?.dispatcherReassignLagBlocks) || 0;
+    if (lagThreshold > 0 && replicaStats.lag > lagThreshold) {
+      this.#recordHyperbeeFallback('lag', relayKey, { lag: replicaStats.lag, lagThreshold });
+      return false;
+    }
+
+    let queryResult;
+    try {
+      queryResult = await this.hyperbeeAdapter.query(filters);
+    } catch (error) {
+      this.#recordHyperbeeError(error, relayKey);
+      return false;
+    }
+
+    if (!queryResult?.stats?.served) {
+      this.#recordHyperbeeFallback('not-served', relayKey);
+      return false;
+    }
+
+    const events = Array.isArray(queryResult.events) ? queryResult.events : [];
+    if (events.length === 0 && this.#shouldFallbackOnEmpty(filters)) {
+      this.#recordHyperbeeFallback('empty', relayKey);
+      return false;
+    }
+
+    try {
+      for (const event of events) {
+        ws.send(JSON.stringify(['EVENT', subscriptionId, event]));
+      }
+      ws.send(JSON.stringify(['EOSE', subscriptionId]));
+    } catch (error) {
+      this.#recordHyperbeeError(error, relayKey);
+      return false;
+    }
+
+    this.#recordHyperbeeServed(relayKey, {
+      events: events.length,
+      truncated: !!queryResult?.stats?.truncated,
+      lag: replicaStats.lag
+    });
+
+    return true;
+  }
+
+  #canServeRelayLocally(relayKey) {
+    if (!relayKey) return false;
+    if (!this.hyperbeeAdapter?.hasReplica()) return false;
+    const relayState = this.publicGatewayRelayState.get(relayKey);
+    const gatewayRelay = relayState?.metadata?.gatewayRelay;
+    if (!gatewayRelay?.hyperbeeKey) return false;
+    const currentKey = this.publicGatewayRelayClient?.getHyperbeeKey?.();
+    if (currentKey && currentKey !== gatewayRelay.hyperbeeKey) {
+      return false;
+    }
+    return true;
+  }
+
+  #shouldFallbackOnEmpty(filters) {
+    if (!Array.isArray(filters) || filters.length === 0) return false;
+    return filters.some((filter) => Array.isArray(filter?.ids) && filter.ids.length);
+  }
+
+  #recordHyperbeeServed(relayKey, { events = 0, truncated = false, lag = 0 } = {}) {
+    if (!this.hyperbeeQueryStats) return;
+    this.hyperbeeQueryStats.totalServed += 1;
+    this.hyperbeeQueryStats.totalEvents += events;
+    this.hyperbeeQueryStats.lastServedAt = Date.now();
+    this.hyperbeeQueryStats.lastServedLag = lag;
+    this.hyperbeeQueryStats.lastServedRelay = relayKey || null;
+    this.hyperbeeQueryStats.lastServedTruncated = !!truncated;
+  }
+
+  #recordHyperbeeFallback(reason, relayKey, extra = {}) {
+    if (!this.hyperbeeQueryStats) return;
+    this.hyperbeeQueryStats.totalFallbacks += 1;
+    this.hyperbeeQueryStats.lastFallbackAt = Date.now();
+    this.hyperbeeQueryStats.lastFallbackReason = reason || 'unknown';
+    this.hyperbeeQueryStats.lastFallbackRelay = relayKey || null;
+    this.hyperbeeQueryStats.lastFallbackMeta = extra || {};
+  }
+
+  #recordHyperbeeError(error, relayKey) {
+    if (!this.hyperbeeQueryStats) return;
+    this.hyperbeeQueryStats.totalErrors += 1;
+    this.hyperbeeQueryStats.lastErrorAt = Date.now();
+    this.hyperbeeQueryStats.lastErrorMessage = error?.message || String(error);
+    this.hyperbeeQueryStats.lastErrorRelay = relayKey || null;
+    this.log('debug', `[PublicGateway] Hyperbee query error: ${this.hyperbeeQueryStats.lastErrorMessage}`);
   }
 
   cleanupConnection(connectionKey) {

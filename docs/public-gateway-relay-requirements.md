@@ -39,15 +39,15 @@
 **Worker & Peer Work**
 
 - Create a gateway-relay client module in the worker that opens the Hyperbee using the key delivered at registration, handling sparse sync and local storage reuse.
-- Update relay coordination to treat the gateway relay as read-only: disable Autobase writer paths when relayKey === gatewayRelayKey and route publish attempts over the websocket (hypertuna-worker/hypertuna-relay-manager-bare.mjs:101 initialises relays today).
-- Build subscription distribution logic so workers receiving REQs from the gateway can query their local Hyperbee snapshot and stream results back over Hyperswarm.
-- Adjust publish flows so peers send EVENT messages to the gateway websocket instead of writing directly, and reconcile ACK/NACK semantics with Nostr expectations.
+- Introduce a dedicated Hyperbee reader that reuses the existing peer relay index scheme (no migrations), exposes read-only query helpers for Nostr filters, and reports query diagnostics.
+- Update relay coordination to treat the gateway relay as read-only: disable Autobase writer paths when relayKey === gatewayRelayKey, route publish attempts over the websocket, and guard the reader from issuing mutating operations.
+- Build subscription distribution logic so workers receiving REQs from the gateway can query their local Hyperbee snapshot and stream results back over Hyperswarm, preferring local execution when the dispatcher assigns the worker’s Hyperswarm public key.
 - Enhance peer startup to fetch the Hyperbee key from registration payloads (public-gateway/src/stores/MemoryRegistrationStore.mjs:1 stores relay metadata) and initialise replication before declaring the relay usable.
 - Provide recovery paths for peers to resync the Hyperbee when out of date, including version detection and resubscription.
-- Report load metrics (recent REQ count, active query streams, median response latency) back to the gateway via heartbeat or dispatcher acknowledgements so the scheduler can make informed assignments.
+- Report load metrics (recent REQ count, active query streams, median response latency, replica lag) back to the gateway via heartbeat or dispatcher acknowledgements so the scheduler can make informed assignments.
 - Enforce per-peer token TTLs locally; treat gateway revocation frames or failed refresh responses as hard disconnect signals and tear down replication/websocket sessions accordingly.
 - Implement configurable back-off and retry strategies for websocket publish attempts, Hyperbee replication rejoin, and dispatcher acknowledgements so intermittent connectivity issues do not overwhelm the network.
-- Update peer health reporting to include Hyperbee sync progress (latest version, percentage synced) to inform dispatcher decisions and operator dashboards.
+- Update peer health reporting to include Hyperbee sync progress (latest version, percentage synced) and local query outcome summaries to inform dispatcher decisions and operator dashboards.
 
 **Shared Modules**
 
@@ -97,7 +97,7 @@
 
 - Subscription dispatcher will use a hybrid load-aware strategy built on PeerHealthManager metrics with per-peer concurrency caps.
 - Rotating access tokens are scoped per peer with explicit refresh and revocation flows; no global tokens will be issued.
-- The gateway relay reuses the worker schema and only adds indexes; no backward-incompatible schema migrations are planned.
+- The gateway relay reuses the existing peer relay index scheme; no schema migration or additional index manifests are required.
 - Public gateway relays are new, so no historical data requires migration.
 
 **Implementation Plan**
@@ -131,9 +131,11 @@
   - Update logging/audit trails and exposure of token metrics. Ensure revoked tokens propagate immediately and peers disconnect.
 
 - **Phase 5 – Worker/Peer Integration**
-  - Introduce worker-side Hyperbee client module to mirror gateway schema, manage sparse replication, and expose query APIs used by subscription handlers.
+  - Introduce worker-side Hyperbee client module to mirror gateway schema, manage sparse replication, and expose read-only query APIs used by subscription handlers.
+  - Build a dedicated Hyperbee reader abstraction (shared as needed) that reuses existing peer relay index helpers, supports sparse range scans, and reports query metrics for dispatcher feedback.
   - Update registration flow to capture gateway relay metadata, bootstrap replication, and initiate websocket connection with token negotiation.
-  - Implement dispatcher telemetry reporting, token refresh handling, and failover logic reacting to reassignment and revocation frames.
+  - Expose the worker Hyperswarm public key to `GatewayService`, route dispatcher-assigned REQs through the local reader when the assignment matches, and fall back to Hyperswarm forwarding on staleness or errors while preserving legacy behaviour behind feature flags.
+  - Implement dispatcher telemetry reporting (local query hits/misses, replica lag, fallback counts), token refresh handling, and failover logic reacting to reassignment and revocation frames.
   - Provide configuration and CLI for operators to inspect worker peer status and reconcile issues.
 
 - **Phase 6 – Shared Module Enhancements**

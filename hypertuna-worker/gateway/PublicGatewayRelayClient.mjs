@@ -52,6 +52,22 @@ class PublicGatewayRelayClient extends EventEmitter {
     });
   }
 
+  getHyperbee() {
+    return this.db;
+  }
+
+  getCore() {
+    return this.core;
+  }
+
+  getHyperbeeKey() {
+    return this.hyperbeeKey;
+  }
+
+  hasReplica() {
+    return !!(this.core && this.db);
+  }
+
   attachProtocol(protocol) {
     if (!this.core || !protocol?.mux?.stream) {
       return;

@@ -165,6 +165,13 @@ export async function initializeRelayServer(customConfig = {}) {
   // Start Hyperswarm server
   await startHyperswarmServer();
 
+  if (customConfig && typeof customConfig === 'object') {
+    customConfig.swarmPublicKey = config.swarmPublicKey;
+    customConfig.proxy_seed = config.proxy_seed;
+    customConfig.proxy_privateKey = config.proxy_privateKey;
+    customConfig.proxy_publicKey = config.proxy_publicKey;
+  }
+
   // Initialize challenge manager with relay private key
   console.log('[RelayServer] Initializing challenge manager...');
   initializeChallengeManager(config.nostr_nsec_hex);

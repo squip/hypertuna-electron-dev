@@ -6,7 +6,8 @@
 import process from 'node:process'
 import { promises as fs } from 'node:fs'
 import { join } from 'node:path'
-import crypto from 'node:crypto'
+import nodeCrypto from 'node:crypto'
+import swarmCrypto from 'hypercore-crypto'
 import b4a from 'b4a'
 import GatewayService from './gateway/GatewayService.mjs'
 import {
@@ -119,7 +120,8 @@ async function startGatewayService(options = {}) {
   if (!gatewayService) {
     gatewayService = new GatewayService({
       publicGateway: publicGatewaySettings,
-      getCurrentPubkey: () => config?.nostr_pubkey_hex || null
+      getCurrentPubkey: () => config?.nostr_pubkey_hex || null,
+      getOwnPeerPublicKey: () => config?.swarmPublicKey || deriveSwarmPublicKey(config)
     })
     gatewayService.on('log', (entry) => {
       sendMessage({ type: 'gateway-log', entry })
@@ -363,7 +365,7 @@ function getUserKey(config) {
     
     // Otherwise, generate from nostr_nsec_hex
     if (config.nostr_nsec_hex) {
-      return crypto.createHash('sha256')
+      return nodeCrypto.createHash('sha256')
         .update(config.nostr_nsec_hex)
         .digest('hex');
     }
@@ -371,6 +373,22 @@ function getUserKey(config) {
     throw new Error('Unable to determine user key from config');
   }
   
+function deriveSwarmPublicKey(cfg = {}) {
+  if (cfg.swarmPublicKey && typeof cfg.swarmPublicKey === 'string') {
+    return cfg.swarmPublicKey;
+  }
+  if (cfg.proxy_seed && typeof cfg.proxy_seed === 'string') {
+    try {
+      const keyPair = swarmCrypto.keyPair(b4a.from(cfg.proxy_seed, 'hex'));
+      const key = keyPair?.publicKey?.toString('hex');
+      if (key) return key;
+    } catch (error) {
+      console.warn('[Worker] Failed to derive swarm public key from seed:', error?.message || error);
+    }
+  }
+  return null;
+}
+
 // Load or create configuration
 async function loadOrCreateConfig(customDir = null) {
   const configDir = customDir || defaultStorageDir
@@ -1603,6 +1621,12 @@ async function main() {
           userKey: config.userKey
         });
 
+        const derivedSwarmKey = deriveSwarmPublicKey(config)
+        if (derivedSwarmKey) {
+          config.swarmPublicKey = derivedSwarmKey
+          gatewayService?.setOwnPeerPublicKey(derivedSwarmKey)
+        }
+
         // Set global user config for profile manager
         global.userConfig = {
             userKey: config.userKey,
@@ -1669,6 +1693,12 @@ async function main() {
       await relayServer.initializeRelayServer(config)
       
       console.log('[Worker] Relay server base initialization complete')
+
+      const derivedSwarmKey = deriveSwarmPublicKey(config)
+      if (derivedSwarmKey) {
+        config.swarmPublicKey = derivedSwarmKey
+        gatewayService?.setOwnPeerPublicKey(derivedSwarmKey)
+      }
 
       const gatewayReadyPromise = (async () => {
         try {
