@@ -25,6 +25,7 @@ import { normalizeRelayIdentifier } from './relay-identifier-utils.mjs';
 
 // Store active relay managers
 const activeRelays = new Map();
+const virtualRelayKeys = new Set();
 
 // Store relay members keyed by relay key or public identifier
 const relayMembers = new Map();
@@ -143,6 +144,97 @@ export function setRelayMembers(relayKey, members = [], adds = null, removes = n
     relayMembers.set(relayKey, members);
     if (adds) relayMemberAdds.set(relayKey, adds);
     if (removes) relayMemberRemoves.set(relayKey, removes);
+}
+
+export function registerVirtualRelay(relayKey, manager, options = {}) {
+    if (!relayKey) {
+        throw new Error('relayKey is required to register a virtual relay');
+    }
+    if (!manager || typeof manager.handleMessage !== 'function') {
+        throw new Error('manager with handleMessage implementation is required for virtual relay');
+    }
+
+    const {
+        publicIdentifier = relayKey,
+        members = [],
+        metadata = {},
+        logger = console
+    } = options;
+
+    const existing = activeRelays.get(relayKey);
+    if (existing && existing !== manager) {
+        try {
+            existing.close?.();
+        } catch (error) {
+            logger?.warn?.('[RelayAdapter][VirtualRelay] Failed to close existing manager', {
+                relayKey,
+                error: error?.message
+            });
+        }
+    }
+
+    activeRelays.set(relayKey, manager);
+    virtualRelayKeys.add(relayKey);
+
+    setRelayMapping(relayKey, publicIdentifier);
+    setRelayMembers(relayKey, members);
+    relayMemberAdds.set(relayKey, []);
+    relayMemberRemoves.set(relayKey, []);
+    if (publicIdentifier && publicIdentifier !== relayKey) {
+        setRelayMembers(publicIdentifier, members);
+        relayMemberAdds.set(publicIdentifier, []);
+        relayMemberRemoves.set(publicIdentifier, []);
+    }
+
+    logger?.info?.('[RelayAdapter][VirtualRelay] Registered virtual relay', {
+        relayKey,
+        publicIdentifier,
+        metadata
+    });
+
+    return {
+        relayKey,
+        publicIdentifier,
+        metadata
+    };
+}
+
+export async function unregisterVirtualRelay(relayKey, options = {}) {
+    if (!relayKey) return;
+
+    const { publicIdentifier = keyToPublic.get(relayKey), logger = console } = options;
+
+    const manager = activeRelays.get(relayKey);
+    if (manager) {
+        try {
+            await manager.close?.();
+        } catch (error) {
+            logger?.warn?.('[RelayAdapter][VirtualRelay] Failed to close virtual relay manager', {
+                relayKey,
+                error: error?.message
+            });
+        }
+        activeRelays.delete(relayKey);
+    }
+
+    if (virtualRelayKeys.has(relayKey)) {
+        virtualRelayKeys.delete(relayKey);
+    }
+
+    removeRelayMapping(relayKey, publicIdentifier);
+    relayMembers.delete(relayKey);
+    relayMemberAdds.delete(relayKey);
+    relayMemberRemoves.delete(relayKey);
+    if (publicIdentifier) {
+        relayMembers.delete(publicIdentifier);
+        relayMemberAdds.delete(publicIdentifier);
+        relayMemberRemoves.delete(publicIdentifier);
+    }
+
+    logger?.info?.('[RelayAdapter][VirtualRelay] Unregistered virtual relay', {
+        relayKey,
+        publicIdentifier
+    });
 }
 
 // Store config reference
@@ -1040,5 +1132,6 @@ export {
     relayMemberAdds,
     relayMemberRemoves,
     publicToKey,
-    keyToPublic
+    keyToPublic,
+    virtualRelayKeys
 };

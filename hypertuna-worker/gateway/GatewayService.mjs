@@ -20,6 +20,11 @@ import PublicGatewayRegistrar from './PublicGatewayRegistrar.mjs';
 import PublicGatewayDiscoveryClient from './PublicGatewayDiscoveryClient.mjs';
 import PublicGatewayRelayClient from './PublicGatewayRelayClient.mjs';
 import PublicGatewayHyperbeeAdapter from './PublicGatewayHyperbeeAdapter.mjs';
+import PublicGatewayVirtualRelayManager from './PublicGatewayVirtualRelayManager.mjs';
+import {
+  registerVirtualRelay,
+  unregisterVirtualRelay
+} from '../hypertuna-relay-manager-adapter.mjs';
 import { getRelayAuthStore } from '../relay-auth-store.mjs';
 import { updatePublicGatewaySettings } from '../../shared/config/PublicGatewaySettings.mjs';
 
@@ -224,6 +229,7 @@ export class GatewayService extends EventEmitter {
       relayClient: this.publicGatewayRelayClient,
       logger: this.loggerBridge || console
     });
+    this.publicGatewayVirtualRelayManager = null;
     this.hyperbeeQueryStats = {
       totalServed: 0,
       totalEvents: 0,
@@ -968,6 +974,7 @@ export class GatewayService extends EventEmitter {
     if (!enabled) {
       this.publicGatewayRelayState.delete(relayKey);
       this.#clearRelayToken(relayKey);
+      await this.#unregisterPublicGatewayVirtualRelay(relayKey);
       this.#emitPublicGatewayStatus();
       return;
     }
@@ -980,6 +987,7 @@ export class GatewayService extends EventEmitter {
     if (!relayData) {
       this.publicGatewayRelayState.delete(relayKey);
       this.#clearRelayToken(relayKey);
+      await this.#unregisterPublicGatewayVirtualRelay(relayKey);
       this.#emitPublicGatewayStatus();
       return;
     }
@@ -1070,6 +1078,9 @@ export class GatewayService extends EventEmitter {
             discoveryKey: registrationResult.hyperbee.discoveryKey
           });
           this.hyperbeeAdapter?.setRelayClient(this.publicGatewayRelayClient);
+          if (this.publicGatewayVirtualRelayManager) {
+            this.publicGatewayVirtualRelayManager.setHyperbeeAdapter(this.hyperbeeAdapter);
+          }
           for (const protocol of this.gatewayProtocols.values()) {
             this.publicGatewayRelayClient.attachProtocol(protocol);
           }
@@ -1091,6 +1102,10 @@ export class GatewayService extends EventEmitter {
         } catch (error) {
           this.log('warn', `[PublicGateway] Failed to configure Hyperbee relay client: ${error.message}`);
         }
+      }
+
+      if (this.#isPublicGatewayRelayKey(relayKey)) {
+        await this.#registerPublicGatewayVirtualRelay(metadataCopy);
       }
       const tokenInfo = this.publicGatewayRelayTokens.get(relayKey) || null;
       const localBase = this.config?.urls?.hostname || this.gatewayServer?.getServerUrls()?.hostname || 'ws://127.0.0.1:8443';
@@ -1393,6 +1408,7 @@ export class GatewayService extends EventEmitter {
     this.gatewayTelemetryTimers.clear();
 
     await this.publicGatewayRelayClient?.close?.();
+    await this.#unregisterPublicGatewayVirtualRelay();
 
     await this.connectionPool.destroy();
 
@@ -2378,6 +2394,51 @@ export class GatewayService extends EventEmitter {
 
     this.publicGatewayRelayState.set(relayKey, nextState);
     this.#emitPublicGatewayStatus();
+  }
+
+  async #registerPublicGatewayVirtualRelay(metadata = {}) {
+    const relayKey = this.#getPublicGatewayRelayKey();
+    if (!relayKey) return;
+
+    if (!this.publicGatewayVirtualRelayManager) {
+      this.publicGatewayVirtualRelayManager = new PublicGatewayVirtualRelayManager({
+        identifier: relayKey,
+        hyperbeeAdapter: this.hyperbeeAdapter,
+        logger: this.loggerBridge || console
+      });
+    } else {
+      this.publicGatewayVirtualRelayManager.setHyperbeeAdapter(this.hyperbeeAdapter);
+      if (this.loggerBridge) {
+        this.publicGatewayVirtualRelayManager.logger = this.loggerBridge;
+      }
+    }
+
+    registerVirtualRelay(relayKey, this.publicGatewayVirtualRelayManager, {
+      publicIdentifier: relayKey,
+      metadata,
+      logger: this.loggerBridge || console
+    });
+
+    try {
+      const stats = await this.publicGatewayVirtualRelayManager.getReplicaStats();
+      this.log('info', `[PublicGateway] Virtual relay registered for ${relayKey} (lag=${stats.lag}, downloaded=${stats.downloaded})`);
+    } catch (error) {
+      this.log('debug', `[PublicGateway] Virtual relay stats unavailable for ${relayKey}: ${error.message}`);
+    }
+  }
+
+  async #unregisterPublicGatewayVirtualRelay(relayKey = PUBLIC_GATEWAY_RELAY_KEY) {
+    if (!relayKey) return;
+
+    await unregisterVirtualRelay(relayKey, {
+      publicIdentifier: relayKey,
+      logger: this.loggerBridge || console
+    });
+
+    if (this.publicGatewayVirtualRelayManager) {
+      this.publicGatewayVirtualRelayManager = null;
+      this.log('info', `[PublicGateway] Virtual relay unregistered for ${relayKey}`);
+    }
   }
 
   _ensureRelayAvatarUrl(url, identifier) {

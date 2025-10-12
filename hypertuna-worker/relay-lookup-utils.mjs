@@ -1,5 +1,9 @@
 // hypertuna-worker/relay-lookup-utils.mjs
-import { activeRelays, getRelayProfiles } from './hypertuna-relay-manager-adapter.mjs';
+import {
+    activeRelays,
+    getRelayProfiles,
+    publicToKey
+} from './hypertuna-relay-manager-adapter.mjs';
 import { normalizeRelayIdentifier } from './relay-identifier-utils.mjs';
 
 export { normalizeRelayIdentifier } from './relay-identifier-utils.mjs';
@@ -11,6 +15,23 @@ export { normalizeRelayIdentifier } from './relay-identifier-utils.mjs';
  */
 export async function findRelayByPublicIdentifier(publicIdentifier) {
     const normalized = normalizeRelayIdentifier(publicIdentifier);
+    if (!normalized) return null;
+
+    const mappedKey = publicToKey.get(normalized);
+    if (mappedKey) {
+        const manager = activeRelays.get(mappedKey);
+        const metadata = typeof manager?.getMetadata === 'function'
+            ? manager.getMetadata()
+            : null;
+
+        return {
+            relay_key: mappedKey,
+            public_identifier: normalized,
+            metadata,
+            is_virtual: true
+        };
+    }
+
     const profiles = await getRelayProfiles();
     return profiles.find(p => p.public_identifier === normalized) || null;
 }

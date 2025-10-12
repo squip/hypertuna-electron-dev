@@ -1475,16 +1475,28 @@ function setupProtocolHandlers(protocol) {
     try {
         // Resolve public identifier to relay key if needed
         let relayKey = await getRelayKeyFromPublicIdentifier(identifier) || identifier;
+        const relayKeyPreview = typeof relayKey === 'string' && relayKey.length > 8
+          ? `${relayKey.substring(0, 8)}...`
+          : relayKey;
+
+        let virtualRelay = false;
         if (relayKey !== identifier) {
-            console.log(`[RelayServer] Resolved public identifier ${identifier} to relay key ${relayKey.substring(0, 8)}...`);
-        } else if (!/^[a-f0-9]{64}$/i.test(relayKey)) {
-            console.error(`[RelayServer] No relay found for public identifier: ${identifier}`);
-            updateMetrics(false);
-            return {
-                statusCode: 404,
-                headers: { 'content-type': 'application/json' },
-                body: b4a.from(JSON.stringify(['NOTICE', 'Relay not found']))
-            };
+            console.log(`[RelayServer] Resolved public identifier ${identifier} to relay key ${relayKeyPreview}`);
+        }
+
+        if (!/^[a-f0-9]{64}$/i.test(relayKey)) {
+            const isActive = await isRelayActiveByPublicIdentifier(identifier);
+            if (!isActive) {
+                console.error(`[RelayServer] No relay found for public identifier: ${identifier}`);
+                updateMetrics(false);
+                return {
+                    statusCode: 404,
+                    headers: { 'content-type': 'application/json' },
+                    body: b4a.from(JSON.stringify(['NOTICE', 'Relay not found']))
+                };
+            }
+            virtualRelay = true;
+            console.log(`[RelayServer] Handling virtual relay ${identifier} (resolved key: ${relayKey})`);
         }
 
         // Get auth store and check if relay is protected
@@ -1501,7 +1513,7 @@ function setupProtocolHandlers(protocol) {
                           profile?.auth_config?.requiresAuth ||
                           false;
 
-      console.log(`[RelayServer] Relay ${identifier} requires auth for read: ${requiresAuth}`);
+      console.log(`[RelayServer] Relay ${identifier} requires auth for read: ${requiresAuth}${virtualRelay ? ' (virtual relay)' : ''}`);
       console.log(`[RelayServer] Authorized pubkeys count: ${authorizedPubkeys.length}`);
 
       // Handle authentication for protected relays
@@ -1555,7 +1567,7 @@ function setupProtocolHandlers(protocol) {
             };
         }
   
-        console.log(`[RelayServer] Found ${events.length} events for connectionKey: ${connectionKey}`);
+        console.log(`[RelayServer] Found ${events.length} events for connectionKey: ${connectionKey}${virtualRelay ? ' [virtual relay]' : ''}`);
         
         // Update subscriptions if needed
         if (activeSubscriptionsUpdated) {
