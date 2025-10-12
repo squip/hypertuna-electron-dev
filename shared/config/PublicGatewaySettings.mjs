@@ -22,7 +22,11 @@ const DEFAULT_SETTINGS = Object.freeze({
   resolvedSharedSecretHash: null,
   resolvedDisplayName: null,
   resolvedRegion: null,
-  resolvedWsUrl: null
+  resolvedWsUrl: null,
+  resolvedGatewayRelay: null,
+  resolvedDefaultTokenTtl: null,
+  resolvedTokenRefreshWindowSeconds: null,
+  resolvedDispatcher: null
 });
 
 const LOCAL_STORAGE_KEY = 'hypertuna_public_gateway_settings';
@@ -84,6 +88,20 @@ function normalizeSettings(raw = {}) {
     const value = Number(raw.tokenRefreshWindowSeconds);
     if (Number.isFinite(value) && value > 0) {
       normalized.tokenRefreshWindowSeconds = Math.round(value);
+    }
+  }
+
+  if (raw.resolvedDefaultTokenTtl != null) {
+    const ttl = Number(raw.resolvedDefaultTokenTtl);
+    if (Number.isFinite(ttl) && ttl > 0) {
+      normalized.resolvedDefaultTokenTtl = Math.round(ttl);
+    }
+  }
+
+  if (raw.resolvedTokenRefreshWindowSeconds != null) {
+    const value = Number(raw.resolvedTokenRefreshWindowSeconds);
+    if (Number.isFinite(value) && value > 0) {
+      normalized.resolvedTokenRefreshWindowSeconds = Math.round(value);
     }
   }
 
@@ -151,6 +169,54 @@ function normalizeSettings(raw = {}) {
     normalized.resolvedWsUrl = value || null;
   }
 
+  if (raw.resolvedGatewayRelay && typeof raw.resolvedGatewayRelay === 'object') {
+    const source = raw.resolvedGatewayRelay;
+    const relay = {};
+    if (typeof source.hyperbeeKey === 'string') relay.hyperbeeKey = source.hyperbeeKey.trim() || null;
+    if (typeof source.discoveryKey === 'string') relay.discoveryKey = source.discoveryKey.trim() || null;
+    if (typeof source.replicationTopic === 'string') relay.replicationTopic = source.replicationTopic.trim() || null;
+    if (source.defaultTokenTtl != null) {
+      const ttl = Number(source.defaultTokenTtl);
+      if (Number.isFinite(ttl) && ttl > 0) relay.defaultTokenTtl = Math.round(ttl);
+    }
+    if (source.tokenRefreshWindowSeconds != null) {
+      const refresh = Number(source.tokenRefreshWindowSeconds);
+      if (Number.isFinite(refresh) && refresh > 0) relay.tokenRefreshWindowSeconds = Math.round(refresh);
+    }
+    if (source.dispatcher && typeof source.dispatcher === 'object') {
+      const dispatcher = {};
+      const assign = (key) => {
+        const num = Number(source.dispatcher[key]);
+        if (Number.isFinite(num) && num > 0) dispatcher[key] = Math.round(num);
+      };
+      assign('maxConcurrentJobsPerPeer');
+      assign('inFlightWeight');
+      assign('latencyWeight');
+      assign('failureWeight');
+      assign('reassignOnLagBlocks');
+      assign('circuitBreakerThreshold');
+      assign('circuitBreakerDurationMs');
+      if (Object.keys(dispatcher).length) relay.dispatcher = dispatcher;
+    }
+    normalized.resolvedGatewayRelay = Object.keys(relay).length ? relay : null;
+  }
+
+  if (raw.resolvedDispatcher && typeof raw.resolvedDispatcher === 'object') {
+    const dispatcher = {};
+    const assign = (key) => {
+      const num = Number(raw.resolvedDispatcher[key]);
+      if (Number.isFinite(num) && num > 0) dispatcher[key] = Math.round(num);
+    };
+    assign('maxConcurrentJobsPerPeer');
+    assign('inFlightWeight');
+    assign('latencyWeight');
+    assign('failureWeight');
+    assign('reassignOnLagBlocks');
+    assign('circuitBreakerThreshold');
+    assign('circuitBreakerDurationMs');
+    normalized.resolvedDispatcher = Object.keys(dispatcher).length ? dispatcher : null;
+  }
+
   if (!normalized.selectedGatewayId && typeof raw.gatewayId === 'string') {
     const value = raw.gatewayId.trim();
     normalized.selectedGatewayId = value || null;
@@ -200,6 +266,10 @@ function withDefaults(raw = {}) {
     merged.resolvedRegion = null;
     merged.resolvedWsUrl = null;
     merged.resolvedAt = null;
+    merged.resolvedGatewayRelay = null;
+    merged.resolvedDefaultTokenTtl = null;
+    merged.resolvedTokenRefreshWindowSeconds = null;
+    merged.resolvedDispatcher = null;
   }
 
   if (!merged.baseUrl) merged.baseUrl = DEFAULT_SETTINGS.baseUrl;
@@ -224,6 +294,33 @@ function withDefaults(raw = {}) {
   ensurePositive('dispatcherReassignLagBlocks', DEFAULT_SETTINGS.dispatcherReassignLagBlocks);
   ensurePositive('dispatcherCircuitBreakerThreshold', DEFAULT_SETTINGS.dispatcherCircuitBreakerThreshold);
   ensurePositive('dispatcherCircuitBreakerTimeoutMs', DEFAULT_SETTINGS.dispatcherCircuitBreakerTimeoutMs);
+
+  if (!merged.resolvedGatewayRelay) {
+    merged.resolvedGatewayRelay = null;
+  }
+  if (!Number.isFinite(merged.resolvedDefaultTokenTtl) || merged.resolvedDefaultTokenTtl <= 0) {
+    merged.resolvedDefaultTokenTtl = null;
+  }
+  if (!Number.isFinite(merged.resolvedTokenRefreshWindowSeconds) || merged.resolvedTokenRefreshWindowSeconds <= 0) {
+    merged.resolvedTokenRefreshWindowSeconds = null;
+  }
+  if (merged.resolvedDispatcher && typeof merged.resolvedDispatcher === 'object') {
+    const dispatcher = {};
+    const assign = (key) => {
+      const num = Number(merged.resolvedDispatcher[key]);
+      if (Number.isFinite(num) && num > 0) dispatcher[key] = Math.round(num);
+    };
+    assign('maxConcurrentJobsPerPeer');
+    assign('inFlightWeight');
+    assign('latencyWeight');
+    assign('failureWeight');
+    assign('reassignOnLagBlocks');
+    assign('circuitBreakerThreshold');
+    assign('circuitBreakerDurationMs');
+    merged.resolvedDispatcher = Object.keys(dispatcher).length ? dispatcher : null;
+  } else {
+    merged.resolvedDispatcher = null;
+  }
 
   return merged;
 }

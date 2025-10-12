@@ -683,7 +683,11 @@ export class GatewayService extends EventEmitter {
       resolvedWsUrl: config.resolvedWsUrl,
       resolvedAt: config.resolvedAt,
       resolvedFallback: config.resolvedFallback,
-      resolvedFromDiscovery: config.resolvedFromDiscovery
+      resolvedFromDiscovery: config.resolvedFromDiscovery,
+      resolvedGatewayRelay: config.resolvedGatewayRelay,
+      resolvedDefaultTokenTtl: config.resolvedDefaultTokenTtl,
+      resolvedTokenRefreshWindowSeconds: config.resolvedTokenRefreshWindowSeconds,
+      resolvedDispatcher: config.resolvedDispatcher
     };
     config.resolvedFromDiscovery = false;
     config.resolvedFallback = false;
@@ -695,6 +699,10 @@ export class GatewayService extends EventEmitter {
     config.resolvedRegion = null;
     config.resolvedWsUrl = null;
     config.resolvedAt = null;
+    config.resolvedGatewayRelay = null;
+    config.resolvedDefaultTokenTtl = null;
+    config.resolvedTokenRefreshWindowSeconds = null;
+    config.resolvedDispatcher = null;
 
     const restorePreviousResolved = () => {
       if (config.selectionMode !== 'default') {
@@ -715,6 +723,10 @@ export class GatewayService extends EventEmitter {
       config.resolvedAt = previousResolved.resolvedAt || null;
       config.resolvedFallback = !!previousResolved.resolvedFallback;
       config.resolvedFromDiscovery = !!previousResolved.resolvedFromDiscovery;
+      config.resolvedGatewayRelay = previousResolved.resolvedGatewayRelay || null;
+      config.resolvedDefaultTokenTtl = previousResolved.resolvedDefaultTokenTtl || null;
+      config.resolvedTokenRefreshWindowSeconds = previousResolved.resolvedTokenRefreshWindowSeconds || null;
+      config.resolvedDispatcher = previousResolved.resolvedDispatcher || null;
     };
 
     if (!config.enabled) {
@@ -823,6 +835,16 @@ export class GatewayService extends EventEmitter {
     config.resolvedWsUrl = resolvedEntry.wsUrl || null;
     config.resolvedAt = Date.now();
     config.resolvedFromDiscovery = config.selectionMode !== 'manual';
+    config.resolvedGatewayRelay = resolvedEntry.relayHyperbeeKey || resolvedEntry.relayDiscoveryKey || resolvedEntry.relayReplicationTopic
+      ? {
+        hyperbeeKey: resolvedEntry.relayHyperbeeKey || null,
+        discoveryKey: resolvedEntry.relayDiscoveryKey || null,
+        replicationTopic: resolvedEntry.relayReplicationTopic || null
+      }
+      : null;
+    config.resolvedDefaultTokenTtl = resolvedEntry.defaultTokenTtl || null;
+    config.resolvedTokenRefreshWindowSeconds = resolvedEntry.tokenRefreshWindowSeconds || null;
+    config.resolvedDispatcher = resolvedEntry.dispatcherPolicy || null;
     config.disabledReason = null;
 
     return config;
@@ -1007,7 +1029,10 @@ export class GatewayService extends EventEmitter {
           metadataCopy.gatewayRelay = {
             hyperbeeKey: registrationResult.hyperbee.hyperbeeKey,
             discoveryKey: registrationResult.hyperbee.discoveryKey,
-            replicationTopic: registrationResult.hyperbee.replicationTopic || null
+            replicationTopic: registrationResult.hyperbee.replicationTopic || null,
+            defaultTokenTtl: registrationResult.hyperbee.defaultTokenTtl ?? null,
+            tokenRefreshWindowSeconds: registrationResult.hyperbee.tokenRefreshWindowSeconds ?? null,
+            dispatcher: registrationResult.hyperbee.dispatcher || null
           };
           relayData.metadata = {
             ...metadata,
@@ -1030,7 +1055,10 @@ export class GatewayService extends EventEmitter {
         expiresAt: tokenInfo?.expiresAt || null,
         ttlSeconds: tokenInfo?.ttlSeconds || null,
         connectionUrl: tokenInfo?.connectionUrl || null,
-        tokenIssuedAt: tokenInfo?.issuedAt || null
+        tokenIssuedAt: tokenInfo?.issuedAt || null,
+        defaultTokenTtl: registrationResult.hyperbee?.defaultTokenTtl ?? null,
+        tokenRefreshWindowSeconds: registrationResult.hyperbee?.tokenRefreshWindowSeconds ?? null,
+        dispatcher: registrationResult.hyperbee?.dispatcher || null
       });
       await this.#refreshRelayToken(relayKey, {
         force: forceTokenRefresh || !tokenInfo
@@ -1332,6 +1360,10 @@ export class GatewayService extends EventEmitter {
       resolvedFallback: !!config.resolvedFallback,
       resolvedFromDiscovery: !!config.resolvedFromDiscovery,
       resolvedAt: config.resolvedAt || null,
+      resolvedGatewayRelay: config.resolvedGatewayRelay || null,
+      resolvedDefaultTokenTtl: config.resolvedDefaultTokenTtl || null,
+      resolvedTokenRefreshWindowSeconds: config.resolvedTokenRefreshWindowSeconds || null,
+      resolvedDispatcher: config.resolvedDispatcher || null,
       defaultTokenTtl: config.defaultTokenTtl || 3600,
       wsBase: enabled ? (config.resolvedWsUrl || this.publicGatewayWsBase) : null,
       lastUpdatedAt: this.publicGatewayStatusUpdatedAt,

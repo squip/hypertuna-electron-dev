@@ -1007,10 +1007,31 @@ class PublicGatewayService {
     if (!this.relayHost) {
       return null;
     }
+    const registrationConfig = this.config.registration || {};
+    const dispatcherConfig = this.config.dispatcher || {};
+    const sanitizePositive = (value) => {
+      const num = Number(value);
+      if (!Number.isFinite(num) || num <= 0) return null;
+      return Math.round(num);
+    };
+    const dispatcherInfo = {
+      maxConcurrentJobsPerPeer: sanitizePositive(dispatcherConfig.maxConcurrentJobsPerPeer),
+      inFlightWeight: sanitizePositive(dispatcherConfig.inFlightWeight),
+      latencyWeight: sanitizePositive(dispatcherConfig.latencyWeight),
+      failureWeight: sanitizePositive(dispatcherConfig.failureWeight),
+      reassignOnLagBlocks: sanitizePositive(dispatcherConfig.reassignOnLagBlocks),
+      circuitBreakerThreshold: sanitizePositive(dispatcherConfig.circuitBreakerThreshold),
+      circuitBreakerDurationMs: sanitizePositive(dispatcherConfig.circuitBreakerDurationMs)
+    };
+    const hasDispatcher = Object.values(dispatcherInfo).some((value) => value !== null);
+
     return {
       hyperbeeKey: this.relayHost.getPublicKey(),
       discoveryKey: this.relayHost.getDiscoveryKey(),
-      replicationTopic: this.relayConfig?.replicationTopic || null
+      replicationTopic: this.relayConfig?.replicationTopic || null,
+      defaultTokenTtl: sanitizePositive(registrationConfig.defaultTokenTtl),
+      tokenRefreshWindowSeconds: sanitizePositive(registrationConfig.tokenRefreshWindowSeconds),
+      dispatcher: hasDispatcher ? dispatcherInfo : null
     };
   }
 

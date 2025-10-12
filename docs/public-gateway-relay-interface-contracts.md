@@ -69,8 +69,8 @@ export interface RelayTokenService {
 
 ## Knowledge Sharing & Coordination
 
-- **Registration payloads**: Public gateway relay registrations now reply with Hyperbee metadata (`hyperbeeKey`, `discoveryKey`, `replicationTopic`). Consumers should persist these values and seed replication before marking the relay available.
-- **Discovery announcements**: Gateway discovery broadcasts include the relay metadata above. Downstream clients MUST tolerate older gateways that omit these fields (treat missing values as null).
+- **Registration payloads**: Public gateway relay registrations now reply with Hyperbee metadata (`hyperbeeKey`, `discoveryKey`, `replicationTopic`) plus operational hints (`defaultTokenTtl`, `tokenRefreshWindowSeconds`, dispatcher policy weights). Consumers should persist these values and seed replication before marking the relay available.
+- **Discovery announcements**: Gateway discovery broadcasts include the relay metadata and policy hints above. Downstream clients MUST tolerate older gateways that omit these fields (treat missing values as null) and should fall back to sane defaults when numbers are absent.
 - **Settings schema**: `PublicGatewaySettings` exposes dispatcher and token refresh tuning knobs (`dispatcherMaxConcurrent`, `dispatcherFailureWeight`, `tokenRefreshWindowSeconds`, etc.). Validation should clamp non-positive values back to defaults.
 
 - **Architecture review**: Present the Phase 0 outputs to gateway + worker leads (scheduled once feature flag scaffolding lands).

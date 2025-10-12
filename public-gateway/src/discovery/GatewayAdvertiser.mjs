@@ -175,6 +175,16 @@ class GatewayAdvertiser {
       ? Math.round(this.config.protocolVersion)
       : 1;
 
+    const toPositiveInt = (value) => {
+      const num = Number(value);
+      if (!Number.isFinite(num) || num <= 0) return 0;
+      return Math.round(num);
+    };
+
+    const relayTokenTtl = toPositiveInt(relayInfo?.defaultTokenTtl);
+    const relayTokenRefreshWindow = toPositiveInt(relayInfo?.tokenRefreshWindowSeconds);
+    const dispatcher = relayInfo?.dispatcher || {};
+
     const payload = {
       gatewayId: this.gatewayId,
       timestamp,
@@ -191,7 +201,16 @@ class GatewayAdvertiser {
       signatureKey: Buffer.from(this.keyPair.publicKey).toString('hex'),
       relayKey: relayInfo?.hyperbeeKey || null,
       relayDiscoveryKey: relayInfo?.discoveryKey || null,
-      relayReplicationTopic: relayInfo?.replicationTopic || null
+      relayReplicationTopic: relayInfo?.replicationTopic || null,
+      relayTokenTtl,
+      relayTokenRefreshWindow,
+      dispatcherMaxConcurrent: toPositiveInt(dispatcher.maxConcurrentJobsPerPeer),
+      dispatcherInFlightWeight: toPositiveInt(dispatcher.inFlightWeight),
+      dispatcherLatencyWeight: toPositiveInt(dispatcher.latencyWeight),
+      dispatcherFailureWeight: toPositiveInt(dispatcher.failureWeight),
+      dispatcherReassignLagBlocks: toPositiveInt(dispatcher.reassignOnLagBlocks),
+      dispatcherCircuitBreakerThreshold: toPositiveInt(dispatcher.circuitBreakerThreshold),
+      dispatcherCircuitBreakerTimeoutMs: toPositiveInt(dispatcher.circuitBreakerDurationMs)
     };
 
     payload.signature = signAnnouncement(payload, this.keyPair.secretKey);

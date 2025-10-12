@@ -49,6 +49,9 @@ export interface GatewayRelayMetadata {
   hyperbeeKey: string | null;
   discoveryKey?: string | null;
   replicationTopic?: string | null;
+  defaultTokenTtl?: number | null;
+  tokenRefreshWindowSeconds?: number | null;
+  dispatcher?: DispatcherPolicy | null;
 }
 
 export interface GatewayRegistrationResponse {

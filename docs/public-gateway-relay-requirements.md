@@ -141,7 +141,7 @@
 - **Phase 6 – Shared Module Enhancements**
   - Update shared DTOs, discovery payloads, and settings modules with new fields (relay key, dispatcher parameters, token TTLs) plus validation.
   - Ensure all call sites (gateway, worker, desktop) consume new shapes gracefully with feature flag guarding.
-  - Document versioning expectations for shared packages to coordinate releases.
+  - Document versioning expectations for shared packages to coordinate releases (note new discovery payload fields require coordinated bumps across gateway/worker/desktop bundles).
 
 - **Phase 7 – Validation & Hardening**
   - Execute integration tests across gateway + multiple workers to validate replication, subscription routing, and token lifecycle under realistic loads.

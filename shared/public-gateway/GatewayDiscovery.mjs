@@ -24,6 +24,15 @@ const announcementEncoding = {
     c.string.preencode(state, value.relayKey || '');
     c.string.preencode(state, value.relayDiscoveryKey || '');
     c.string.preencode(state, value.relayReplicationTopic || '');
+    c.uint.preencode(state, value.relayTokenTtl || 0);
+    c.uint.preencode(state, value.relayTokenRefreshWindow || 0);
+    c.uint.preencode(state, value.dispatcherMaxConcurrent || 0);
+    c.uint.preencode(state, value.dispatcherInFlightWeight || 0);
+    c.uint.preencode(state, value.dispatcherLatencyWeight || 0);
+    c.uint.preencode(state, value.dispatcherFailureWeight || 0);
+    c.uint.preencode(state, value.dispatcherReassignLagBlocks || 0);
+    c.uint.preencode(state, value.dispatcherCircuitBreakerThreshold || 0);
+    c.uint.preencode(state, value.dispatcherCircuitBreakerTimeoutMs || 0);
   },
   encode(state, value) {
     c.string.encode(state, value.gatewayId || '');
@@ -43,6 +52,15 @@ const announcementEncoding = {
     c.string.encode(state, value.relayKey || '');
     c.string.encode(state, value.relayDiscoveryKey || '');
     c.string.encode(state, value.relayReplicationTopic || '');
+    c.uint.encode(state, value.relayTokenTtl || 0);
+    c.uint.encode(state, value.relayTokenRefreshWindow || 0);
+    c.uint.encode(state, value.dispatcherMaxConcurrent || 0);
+    c.uint.encode(state, value.dispatcherInFlightWeight || 0);
+    c.uint.encode(state, value.dispatcherLatencyWeight || 0);
+    c.uint.encode(state, value.dispatcherFailureWeight || 0);
+    c.uint.encode(state, value.dispatcherReassignLagBlocks || 0);
+    c.uint.encode(state, value.dispatcherCircuitBreakerThreshold || 0);
+    c.uint.encode(state, value.dispatcherCircuitBreakerTimeoutMs || 0);
   },
   decode(state) {
     const announcement = {
@@ -65,6 +83,18 @@ const announcementEncoding = {
     announcement.relayKey = state.start < state.end ? c.string.decode(state) : '';
     announcement.relayDiscoveryKey = state.start < state.end ? c.string.decode(state) : '';
     announcement.relayReplicationTopic = state.start < state.end ? c.string.decode(state) : '';
+
+    const maybeDecodeUint = () => (state.start < state.end ? c.uint.decode(state) : 0);
+
+    announcement.relayTokenTtl = maybeDecodeUint();
+    announcement.relayTokenRefreshWindow = maybeDecodeUint();
+    announcement.dispatcherMaxConcurrent = maybeDecodeUint();
+    announcement.dispatcherInFlightWeight = maybeDecodeUint();
+    announcement.dispatcherLatencyWeight = maybeDecodeUint();
+    announcement.dispatcherFailureWeight = maybeDecodeUint();
+    announcement.dispatcherReassignLagBlocks = maybeDecodeUint();
+    announcement.dispatcherCircuitBreakerThreshold = maybeDecodeUint();
+    announcement.dispatcherCircuitBreakerTimeoutMs = maybeDecodeUint();
 
     return announcement;
   }
@@ -100,6 +130,15 @@ function canonicalizeAnnouncement(announcement) {
   if (announcement.relayKey) payload.relayKey = announcement.relayKey;
   if (announcement.relayDiscoveryKey) payload.relayDiscoveryKey = announcement.relayDiscoveryKey;
   if (announcement.relayReplicationTopic) payload.relayReplicationTopic = announcement.relayReplicationTopic;
+  if (announcement.relayTokenTtl) payload.relayTokenTtl = announcement.relayTokenTtl;
+  if (announcement.relayTokenRefreshWindow) payload.relayTokenRefreshWindow = announcement.relayTokenRefreshWindow;
+  if (announcement.dispatcherMaxConcurrent) payload.dispatcherMaxConcurrent = announcement.dispatcherMaxConcurrent;
+  if (announcement.dispatcherInFlightWeight) payload.dispatcherInFlightWeight = announcement.dispatcherInFlightWeight;
+  if (announcement.dispatcherLatencyWeight) payload.dispatcherLatencyWeight = announcement.dispatcherLatencyWeight;
+  if (announcement.dispatcherFailureWeight) payload.dispatcherFailureWeight = announcement.dispatcherFailureWeight;
+  if (announcement.dispatcherReassignLagBlocks) payload.dispatcherReassignLagBlocks = announcement.dispatcherReassignLagBlocks;
+  if (announcement.dispatcherCircuitBreakerThreshold) payload.dispatcherCircuitBreakerThreshold = announcement.dispatcherCircuitBreakerThreshold;
+  if (announcement.dispatcherCircuitBreakerTimeoutMs) payload.dispatcherCircuitBreakerTimeoutMs = announcement.dispatcherCircuitBreakerTimeoutMs;
   const json = JSON.stringify(payload);
   return Buffer.from(json, 'utf8');
 }

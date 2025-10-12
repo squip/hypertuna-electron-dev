@@ -35,6 +35,31 @@ class PublicGatewayDiscoveryClient extends EventEmitter {
     this.gateways = new Map();
   }
 
+  #positiveNumber(value) {
+    const num = Number(value);
+    if (!Number.isFinite(num) || num <= 0) return null;
+    return num;
+  }
+
+  #sanitizeDispatcherPolicy(existing = null, announcement = {}) {
+    const policy = { ...(existing || {}) };
+    const assignIfPositive = (key, value) => {
+      const num = this.#positiveNumber(value);
+      if (num !== null) policy[key] = num;
+      else delete policy[key];
+    };
+
+    assignIfPositive('maxConcurrentJobsPerPeer', announcement.dispatcherMaxConcurrent);
+    assignIfPositive('inFlightWeight', announcement.dispatcherInFlightWeight);
+    assignIfPositive('latencyWeight', announcement.dispatcherLatencyWeight);
+    assignIfPositive('failureWeight', announcement.dispatcherFailureWeight);
+    assignIfPositive('reassignOnLagBlocks', announcement.dispatcherReassignLagBlocks);
+    assignIfPositive('circuitBreakerThreshold', announcement.dispatcherCircuitBreakerThreshold);
+    assignIfPositive('circuitBreakerDurationMs', announcement.dispatcherCircuitBreakerTimeoutMs);
+
+    return Object.keys(policy).length ? policy : null;
+  }
+
   async start() {
     if (this.swarm) return;
     this.swarm = new Hyperswarm();
@@ -213,7 +238,10 @@ class PublicGatewayDiscoveryClient extends EventEmitter {
       fetchPromise: existing.fetchPromise || null,
       relayHyperbeeKey: announcement.relayKey || existing.relayHyperbeeKey || '',
       relayDiscoveryKey: announcement.relayDiscoveryKey || existing.relayDiscoveryKey || '',
-      relayReplicationTopic: announcement.relayReplicationTopic || existing.relayReplicationTopic || ''
+      relayReplicationTopic: announcement.relayReplicationTopic || existing.relayReplicationTopic || '',
+      defaultTokenTtl: this.#positiveNumber(announcement.relayTokenTtl) || existing.defaultTokenTtl || null,
+      tokenRefreshWindowSeconds: this.#positiveNumber(announcement.relayTokenRefreshWindow) || existing.tokenRefreshWindowSeconds || null,
+      dispatcherPolicy: this.#sanitizeDispatcherPolicy(existing.dispatcherPolicy, announcement)
     };
 
     this.gateways.set(entry.gatewayId, entry);
@@ -329,6 +357,9 @@ class PublicGatewayDiscoveryClient extends EventEmitter {
       relayHyperbeeKey: entry.relayHyperbeeKey || null,
       relayDiscoveryKey: entry.relayDiscoveryKey || null,
       relayReplicationTopic: entry.relayReplicationTopic || null,
+      defaultTokenTtl: entry.defaultTokenTtl || null,
+      tokenRefreshWindowSeconds: entry.tokenRefreshWindowSeconds || null,
+      dispatcherPolicy: entry.dispatcherPolicy ? { ...entry.dispatcherPolicy } : null,
       isExpired: expired
     };
   }
