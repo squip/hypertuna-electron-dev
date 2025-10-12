@@ -65,8 +65,9 @@ export default class PublicGatewayHyperbeeAdapter {
     }
 
     try {
-      const downloaded = await core.downloaded();
-      const length = core.length;
+      const info = await core.info().catch(() => null);
+      const length = info?.length ?? (typeof core.length === 'number' ? core.length : 0);
+      const downloaded = info?.contiguousLength ?? (typeof core.contiguousLength === 'number' ? core.contiguousLength : 0);
       return {
         length,
         downloaded,
@@ -76,10 +77,12 @@ export default class PublicGatewayHyperbeeAdapter {
       this.logger?.debug?.('[PublicGatewayHyperbeeAdapter] Failed to read replica stats', {
         error: error?.message || error
       });
+      const length = typeof core.length === 'number' ? core.length : 0;
+      const contiguous = typeof core.contiguousLength === 'number' ? core.contiguousLength : 0;
       return {
-        length: core.length || 0,
-        downloaded: 0,
-        lag: core.length || 0
+        length,
+        downloaded: contiguous,
+        lag: Math.max(0, length - contiguous)
       };
     }
   }

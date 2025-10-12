@@ -216,6 +216,7 @@ export class GatewayService extends EventEmitter {
     this.publicGatewayRelayTokens = new Map();
     this.publicGatewayRelayTokenTimers = new Map();
     this.gatewayTelemetryTimers = new Map();
+    this.gatewayProtocols = new Map();
     this.publicGatewayRelayClient = new PublicGatewayRelayClient({ logger: this.#createExternalLogger?.() || console });
     this.hyperbeeAdapter = new PublicGatewayHyperbeeAdapter({
       relayClient: this.publicGatewayRelayClient,
@@ -1026,6 +1027,9 @@ export class GatewayService extends EventEmitter {
             discoveryKey: registrationResult.hyperbee.discoveryKey
           });
           this.hyperbeeAdapter?.setRelayClient(this.publicGatewayRelayClient);
+          for (const protocol of this.gatewayProtocols.values()) {
+            this.publicGatewayRelayClient.attachProtocol(protocol);
+          }
           metadataCopy.gatewayRelay = {
             hyperbeeKey: registrationResult.hyperbee.hyperbeeKey,
             discoveryKey: registrationResult.hyperbee.discoveryKey,
@@ -1200,6 +1204,16 @@ export class GatewayService extends EventEmitter {
     }
 
     if (handshake.isGateway) {
+      if (protocol) {
+        this.gatewayProtocols.set(publicKey, protocol);
+        const cleanup = () => {
+          this.gatewayProtocols.delete(publicKey);
+        };
+        protocol.once('close', cleanup);
+        protocol.once('destroy', cleanup);
+        protocol.mux?.stream?.once('close', cleanup);
+      }
+
       this.publicGatewayRelayClient?.attachProtocol(protocol);
       this.#startGatewayTelemetry(publicKey, protocol);
     }

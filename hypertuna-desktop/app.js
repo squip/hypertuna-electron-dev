@@ -1450,6 +1450,15 @@ async function initializeGatewayControls() {
   populatePublicGatewayRelayOptions()
 }
 
+function populatePublicGatewayRelayOptions() {
+  const select = document.getElementById('public-gateway-relay-select')
+  if (!select) return
+  if (!select.dataset.initialized) {
+    // Placeholder: future implementation will populate selectable relay options
+    select.dataset.initialized = 'true'
+  }
+}
+
 function handleGatewayLogEntry(entry) {
   if (!entry) return
   gatewayLogs.push(entry)

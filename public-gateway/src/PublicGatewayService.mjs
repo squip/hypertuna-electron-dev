@@ -507,7 +507,7 @@ class PublicGatewayService {
       return;
     }
 
-    const tokenValidation = this.#validateToken(token, relayKey);
+    const tokenValidation = await this.#validateToken(token, relayKey);
     if (!tokenValidation) {
       this.logger.warn?.('WebSocket rejected: token validation failed', { relayKey });
       ws.close(4403, 'Invalid token');
@@ -1243,10 +1243,10 @@ class PublicGatewayService {
     return { relayKey, token };
   }
 
-  #validateToken(token, relayKey) {
+  async #validateToken(token, relayKey) {
     if (this.tokenService) {
       try {
-        return this.tokenService.verifyToken(token, relayKey);
+        return await this.tokenService.verifyToken(token, relayKey);
       } catch (error) {
         this.logger.warn?.('Token verification failed', {
           relayKey,

@@ -53,6 +53,7 @@ export class RelayProtocol extends EventEmitter {
     
     this.isServer = isServer;
     this.handshakeData = handshakeData || {};
+    this.stream = stream;
     this.mux = Protomux.from(stream);
     this.channel = null;
     this.requests = new Map(); // For tracking pending requests

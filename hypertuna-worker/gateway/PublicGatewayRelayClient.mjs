@@ -39,11 +39,23 @@ class PublicGatewayRelayClient extends EventEmitter {
     this.store = store;
     this.hyperbeeKey = hyperbeeKey;
     this.discoveryKey = options.discoveryKey || b4a.toString(this.core.discoveryKey, 'hex');
-    this.lastDownloaded = await this.core.downloaded().catch(() => 0);
-    this.lastLength = this.core.length;
+    const initialLength = typeof this.core.length === 'number' ? this.core.length : 0;
+    const initialContiguous = typeof this.core.contiguousLength === 'number'
+      ? this.core.contiguousLength
+      : initialLength;
+    this.lastDownloaded = initialContiguous;
+    this.lastLength = initialLength;
 
     this.core.on('download', () => {
-      this.lastDownloaded += 1;
+      const contiguous = typeof this.core.contiguousLength === 'number'
+        ? this.core.contiguousLength
+        : null;
+      if (typeof contiguous === 'number') {
+        this.lastDownloaded = contiguous;
+        this.lastLength = typeof this.core.length === 'number' ? this.core.length : this.lastLength;
+      } else {
+        this.lastDownloaded += 1;
+      }
     });
 
     this.logger?.info?.('[PublicGatewayRelayClient] Configured', {
@@ -69,10 +81,15 @@ class PublicGatewayRelayClient extends EventEmitter {
   }
 
   attachProtocol(protocol) {
-    if (!this.core || !protocol?.mux?.stream) {
+    if (!this.core) {
       return;
     }
-    const stream = protocol.mux.stream;
+
+    const muxStream = protocol?.mux?.stream || protocol?.stream || protocol?.connection?.stream;
+    if (!muxStream) {
+      return;
+    }
+    const stream = muxStream;
     if (this.replications.has(stream)) return;
 
     try {
@@ -136,11 +153,12 @@ class PublicGatewayRelayClient extends EventEmitter {
       };
     }
     try {
-      const downloaded = await this.core.downloaded();
-      const length = this.core.length;
-      this.lastDownloaded = downloaded;
+      const info = await this.core.info().catch(() => null);
+      const length = info?.length ?? (typeof this.core.length === 'number' ? this.core.length : this.lastLength);
+      const contiguous = info?.contiguousLength ?? (typeof this.core.contiguousLength === 'number' ? this.core.contiguousLength : this.lastDownloaded);
+      this.lastDownloaded = contiguous;
       this.lastLength = length;
-      const lag = Math.max(0, length - downloaded);
+      const lag = Math.max(0, length - contiguous);
       return {
         hyperbeeVersion: this.db?.version || 0,
         hyperbeeLag: lag
