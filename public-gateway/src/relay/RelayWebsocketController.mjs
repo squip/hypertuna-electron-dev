@@ -1,4 +1,5 @@
 import WebSocket from 'ws';
+import PublicGatewayHyperbeeAdapter from './PublicGatewayHyperbeeAdapter.mjs';
 
 export default class RelayWebsocketController {
   constructor({
@@ -25,6 +26,13 @@ export default class RelayWebsocketController {
     };
     this.legacyForward = legacyForward;
     this.subscriptions = new Map();
+    this.hyperbeeAdapter = new PublicGatewayHyperbeeAdapter({
+      relayClient: {
+        getHyperbee: () => this.relayHost?.db || null,
+        getCore: () => this.relayHost?.core || null
+      },
+      logger: this.logger
+    });
   }
 
   async handleMessage(session, rawMessage) {
@@ -112,6 +120,12 @@ export default class RelayWebsocketController {
 
     this.#recordSubscription(session.connectionKey, subscriptionId, filters);
 
+    const servedLocally = await this.#serveReqLocally(session, subscriptionId, filters);
+    if (servedLocally) {
+      this.#incrementReq('hyperbee-served');
+      return;
+    }
+
     const dispatcherEnabled = this.featureFlags?.dispatcherEnabled && !!this.dispatcher;
 
     if (dispatcherEnabled) {
@@ -165,6 +179,45 @@ export default class RelayWebsocketController {
 
     this.#incrementReq('legacy-forward');
     await this.#forwardLegacy(session, rawMessage);
+  }
+
+  async #serveReqLocally(session, subscriptionId, filters) {
+    if (!this.hyperbeeAdapter?.hasReplica?.()) {
+      return false;
+    }
+
+    try {
+      const { events, stats } = await this.hyperbeeAdapter.query(filters);
+      if (!stats?.served) {
+        return false;
+      }
+
+      const eventList = Array.isArray(events) ? events : [];
+      if (!eventList.length && this.#shouldFallbackOnEmpty(filters)) {
+        return false;
+      }
+
+      if (session.ws?.readyState !== WebSocket.OPEN) {
+        return true;
+      }
+
+      for (const event of eventList) {
+        session.ws.send(JSON.stringify(['EVENT', subscriptionId, event]));
+      }
+      session.ws.send(JSON.stringify(['EOSE', subscriptionId]));
+      return true;
+    } catch (error) {
+      this.logger?.debug?.('[RelayWebsocketController] Hyperbee query failed', {
+        error: error?.message || error,
+        relayKey: session.relayKey
+      });
+      return false;
+    }
+  }
+
+  #shouldFallbackOnEmpty(filters = []) {
+    if (!Array.isArray(filters) || filters.length === 0) return false;
+    return filters.some((filter) => Array.isArray(filter?.ids) && filter.ids.length);
   }
 
   async #forwardLegacy(session, rawMessage, targetPeer = null) {

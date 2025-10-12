@@ -688,6 +688,11 @@ class PublicGatewayService {
         return;
       }
 
+      if (session.relayKey === 'public-gateway:hyperbee') {
+        this.eventCheckTimers.delete(session.connectionKey);
+        return;
+      }
+
       try {
         const registration = await this.registrationStore.getRelay(session.relayKey);
         if (registration) {
