@@ -16,6 +16,7 @@ class PublicGatewayRelayClient extends EventEmitter {
     this.discoveryKey = null;
     this.lastDownloaded = 0;
     this.lastLength = 0;
+    this.lastReplicationLog = 0;
   }
 
   async configure(options = {}) {
@@ -31,6 +32,9 @@ class PublicGatewayRelayClient extends EventEmitter {
 
     const store = getCorestore();
     const key = b4a.from(hyperbeeKey, 'hex');
+    this.logger?.info?.('[PublicGatewayRelayClient] Opening hypercore for public gateway relay', {
+      hyperbeeKey
+    });
     this.core = store.get({ key, valueEncoding: 'binary', sparse: true });
     await this.core.ready();
     this.db = new Hyperbee(this.core, { keyEncoding: 'binary', valueEncoding: 'utf-8' });
@@ -45,22 +49,46 @@ class PublicGatewayRelayClient extends EventEmitter {
       : initialLength;
     this.lastDownloaded = initialContiguous;
     this.lastLength = initialLength;
+    this.lastReplicationLog = 0;
 
-    this.core.on('download', () => {
+    this.core.on('download', (index, data) => {
       const contiguous = typeof this.core.contiguousLength === 'number'
         ? this.core.contiguousLength
         : null;
       if (typeof contiguous === 'number') {
         this.lastDownloaded = contiguous;
         this.lastLength = typeof this.core.length === 'number' ? this.core.length : this.lastLength;
+        this.logger?.debug?.('[PublicGatewayRelayClient] Download progress', {
+          hyperbeeKey: this.hyperbeeKey,
+          contiguousLength: contiguous,
+          totalLength: this.lastLength
+        });
+        const now = Date.now();
+        if (!this.lastReplicationLog || (now - this.lastReplicationLog) >= 5000) {
+          this.logger?.info?.('[PublicGatewayRelayClient] Replication sync update', {
+            hyperbeeKey: this.hyperbeeKey,
+            contiguousLength: contiguous,
+            totalLength: this.lastLength
+          });
+          this.lastReplicationLog = now;
+        }
       } else {
         this.lastDownloaded += 1;
+      }
+      if (Number.isInteger(index)) {
+        this.logger?.debug?.('[PublicGatewayRelayClient] Downloaded block', {
+          hyperbeeKey: this.hyperbeeKey,
+          index,
+          size: data?.length || 0
+        });
       }
     });
 
     this.logger?.info?.('[PublicGatewayRelayClient] Configured', {
       hyperbeeKey: this.hyperbeeKey,
-      discoveryKey: this.discoveryKey
+      discoveryKey: this.discoveryKey,
+      contiguousLength: this.lastDownloaded,
+      totalLength: this.lastLength
     });
   }
 
@@ -87,12 +115,20 @@ class PublicGatewayRelayClient extends EventEmitter {
 
     const muxStream = protocol?.mux?.stream || protocol?.stream || protocol?.connection?.stream;
     if (!muxStream) {
+      this.logger?.debug?.('[PublicGatewayRelayClient] No multiplexed stream available for protocol attachment', {
+        hyperbeeKey: this.hyperbeeKey
+      });
       return;
     }
     const stream = muxStream;
     if (this.replications.has(stream)) return;
 
     try {
+      this.logger?.info?.('[PublicGatewayRelayClient] Attaching replication stream', {
+        hyperbeeKey: this.hyperbeeKey,
+        contiguousLength: this.lastDownloaded,
+        totalLength: this.lastLength
+      });
       const replication = this.core.replicate(stream, {
         live: true,
         download: true,
@@ -109,11 +145,39 @@ class PublicGatewayRelayClient extends EventEmitter {
           this.replications.delete(stream);
         }
       };
-      stream.once('close', cleanup);
-      stream.once('end', cleanup);
-      stream.once('error', cleanup);
-      protocol.once('close', cleanup);
-      protocol.once('destroy', cleanup);
+      const cleanupWithLog = (event) => {
+        this.logger?.debug?.('[PublicGatewayRelayClient] Replication stream closed', {
+          hyperbeeKey: this.hyperbeeKey,
+          event,
+          contiguousLength: this.lastDownloaded,
+          totalLength: this.lastLength
+        });
+        cleanup();
+      };
+      stream.once('close', () => cleanupWithLog('close'));
+      stream.once('end', () => cleanupWithLog('end'));
+      stream.once('error', (err) => {
+        this.logger?.warn?.('[PublicGatewayRelayClient] Replication stream error', {
+          hyperbeeKey: this.hyperbeeKey,
+          error: err?.message || err
+        });
+        cleanup();
+      });
+      protocol.once('close', () => cleanupWithLog('protocol-close'));
+      protocol.once('destroy', () => cleanupWithLog('protocol-destroy'));
+
+      replication.on('error', (error) => {
+        this.logger?.warn?.('[PublicGatewayRelayClient] Replication error', {
+          hyperbeeKey: this.hyperbeeKey,
+          error: error?.message || error
+        });
+      });
+      replication.on('close', () => {
+        this.logger?.debug?.('[PublicGatewayRelayClient] Replication ended', {
+          hyperbeeKey: this.hyperbeeKey
+        });
+      });
+
       this.logger?.debug?.('[PublicGatewayRelayClient] Replication stream attached', {
         hyperbeeKey: this.hyperbeeKey
       });

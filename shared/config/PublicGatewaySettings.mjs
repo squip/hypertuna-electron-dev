@@ -7,6 +7,7 @@ const DEFAULT_SETTINGS = Object.freeze({
   preferredBaseUrl: 'https://hypertuna.com',
   baseUrl: 'https://hypertuna.com',
   sharedSecret: '',
+  delegateReqToPeers: false,
   defaultTokenTtl: 3600,
   tokenRefreshWindowSeconds: 300,
   dispatcherMaxConcurrent: 3,
@@ -75,6 +76,10 @@ function normalizeSettings(raw = {}) {
 
   if (typeof raw.sharedSecret === 'string') {
     normalized.sharedSecret = raw.sharedSecret.trim();
+  }
+
+  if (typeof raw.delegateReqToPeers === 'boolean') {
+    normalized.delegateReqToPeers = raw.delegateReqToPeers;
   }
 
   if (raw.defaultTokenTtl != null) {

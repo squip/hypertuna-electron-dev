@@ -629,7 +629,7 @@ function startKeepAlive(publicKey) {
 function setGatewayConnection(protocol, publicKey) {
   gatewayConnection = protocol;
   healthState.services.gatewayStatus = 'connected';
-  
+
   // Mark peer as identified
   const normalizedKey = publicKey.toLowerCase();
   const peer = connectedPeers.get(normalizedKey);
@@ -643,7 +643,13 @@ function setGatewayConnection(protocol, publicKey) {
   console.log('[RelayServer] Gateway public key:', publicKey);
   console.log('[RelayServer] Connection time:', new Date().toISOString());
   console.log('[RelayServer] ========================================');
-  
+
+  try {
+    global.gatewayService?.attachGatewayProtocol?.(publicKey, protocol);
+  } catch (error) {
+    console.warn('[RelayServer] Failed to attach gateway protocol to GatewayService:', error.message);
+  }
+
   // Update worker status
   if (global.sendMessage) {
     console.log('[RelayServer] Notifying worker of gateway connection');
@@ -1579,7 +1585,13 @@ function setupProtocolHandlers(protocol) {
             };
         }
   
-        console.log(`[RelayServer] Found ${events.length} events for connectionKey: ${connectionKey}${virtualRelay ? ' [virtual relay]' : ''}`);
+        if (Array.isArray(events)) {
+            const eventFrames = events.filter((frame) => Array.isArray(frame) && frame[0] === 'EVENT');
+            const eoseFrames = events.filter((frame) => Array.isArray(frame) && frame[0] === 'EOSE');
+            console.log(`[RelayServer] Subscription replay for connectionKey: ${connectionKey}${virtualRelay ? ' [virtual relay]' : ''} events=${eventFrames.length} eose=${eoseFrames.length}`);
+        } else {
+            console.log(`[RelayServer] Subscription replay produced unexpected payload for connectionKey: ${connectionKey}${virtualRelay ? ' [virtual relay]' : ''}`);
+        }
         
         // Update subscriptions if needed
         if (activeSubscriptionsUpdated) {

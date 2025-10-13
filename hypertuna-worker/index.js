@@ -21,7 +21,7 @@ import {
   calculateMembers,
   calculateAuthorizedUsers
 } from './hypertuna-relay-profile-manager-bare.mjs'
-import { loadRelayKeyMappings, activeRelays } from './hypertuna-relay-manager-adapter.mjs'
+import { loadRelayKeyMappings, activeRelays, virtualRelayKeys } from './hypertuna-relay-manager-adapter.mjs'
 import {
   queuePendingAuthUpdate,
   applyPendingAuthUpdates
@@ -111,6 +111,14 @@ async function ensurePublicGatewaySettingsLoaded() {
     console.warn('[Worker] Failed to load public gateway settings:', error)
     publicGatewaySettings = getCachedPublicGatewaySettings()
   }
+
+  if (publicGatewaySettings) {
+    const previous = publicGatewaySettings.delegateReqToPeers
+    publicGatewaySettings.delegateReqToPeers = false
+    if (previous !== false) {
+      console.log('[Worker] Public gateway REQ delegation disabled for local handling tests')
+    }
+  }
   return publicGatewaySettings
 }
 
@@ -123,6 +131,7 @@ async function startGatewayService(options = {}) {
       getCurrentPubkey: () => config?.nostr_pubkey_hex || null,
       getOwnPeerPublicKey: () => config?.swarmPublicKey || deriveSwarmPublicKey(config)
     })
+    global.gatewayService = gatewayService
     gatewayService.on('log', (entry) => {
       sendMessage({ type: 'gateway-log', entry })
     })
@@ -751,6 +760,10 @@ async function ensureMirrorsForAllRelays() {
   const total = activeRelays.size
   console.log(`[Mirror] scanning active relays: ${total}`)
   for (const [relayKey, manager] of activeRelays.entries()) {
+    if (virtualRelayKeys.has(relayKey)) {
+      console.log(`[Mirror] skipping virtual relay ${relayKey} for mirror scan`)
+      continue
+    }
     console.log(`[Mirror] relay ${relayKey}: collecting providers from filekey index`)
     // Collect all provider drive keys for this relay from the filekey index
     let fileMap
@@ -834,6 +847,14 @@ async function backfillRelayFilekeyIndex(relayKey, identifier) {
 }
 
 async function collectRelayHealth(relayKey, manager, maxChecks = 200) {
+  if (virtualRelayKeys.has(relayKey)) {
+    return {
+      relayKey,
+      skipped: true,
+      reason: 'virtual-relay',
+      timestamp: Date.now()
+    }
+  }
   // filekey index map: Map<fileHash, Map<driveKey,pubkey>>
   let fileMap
   try {

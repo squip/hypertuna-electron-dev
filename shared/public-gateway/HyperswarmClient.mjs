@@ -346,7 +346,27 @@ class EnhancedHyperswarmPool {
           this.logger?.debug?.('Swarm connection matched pending dial', { peer: publicKey });
           return;
         }
-        this.logger?.info?.('Replacing existing connection from swarm event', { peer: publicKey });
+
+        const existingStream = existing.stream;
+        const streamHealthy = existingStream
+          && existingStream.destroyed !== true
+          && existingStream.closed !== true;
+        const existingActive = existing.connected && streamHealthy;
+
+        if (existingActive) {
+          this.logger?.debug?.('Duplicate inbound hyperswarm connection ignored – existing stream still active', {
+            peer: publicKey
+          });
+          try {
+            connection.destroy();
+          } catch (_) {}
+          return;
+        }
+
+        this.logger?.info?.('Replacing existing hyperswarm connection from swarm event', {
+          peer: publicKey,
+          reason: existing.connected ? 'existing-stream-closed' : 'existing-connection-inactive'
+        });
         existing.destroy();
       }
       const conn = new HyperswarmConnection(publicKey, this.swarm, this, this.logger);

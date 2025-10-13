@@ -37,6 +37,7 @@ import HyperbeeRelayHost from './relay/HyperbeeRelayHost.mjs';
 import RelayWebsocketController from './relay/RelayWebsocketController.mjs';
 import RelayDispatcherService from './relay/RelayDispatcherService.mjs';
 import RelayTokenService from './relay/RelayTokenService.mjs';
+import PublicGatewayHyperbeeAdapter from '../../shared/public-gateway/PublicGatewayHyperbeeAdapter.mjs';
 
 function safeString(value) {
   if (typeof value === 'string') return value;
@@ -86,6 +87,9 @@ class PublicGatewayService {
     this.relayHost = null;
     this.relayTelemetryUnsub = null;
     this.relayWebsocketController = null;
+    this.hyperbeeAdapter = null;
+    this.internalRelayKey = 'public-gateway:hyperbee';
+    this.internalRegistrationInterval = null;
     this.dispatcher = this.featureFlags.dispatcherEnabled
       ? new RelayDispatcherService({ logger: this.logger, policy: this.config.dispatcher })
       : null;
@@ -202,6 +206,11 @@ class PublicGatewayService {
       }
       this.relayHost = null;
       this.relayWebsocketController = null;
+    }
+
+    if (this.internalRegistrationInterval) {
+      clearInterval(this.internalRegistrationInterval);
+      this.internalRegistrationInterval = null;
     }
 
     await this.connectionPool.destroy();
@@ -369,12 +378,20 @@ class PublicGatewayService {
     }
 
     this.relayHost = host;
+    this.hyperbeeAdapter = new PublicGatewayHyperbeeAdapter({
+      logger: this.logger,
+      relayClient: {
+        getHyperbee: () => this.relayHost?.getHyperbee?.(),
+        getCore: () => this.relayHost?.getCore?.()
+      }
+    });
     this.logger?.info?.('Hyperbee relay host ready', {
       relayKey: host.getPublicKey()
     });
 
     this.relayWebsocketController = new RelayWebsocketController({
       relayHost: host,
+      hyperbeeAdapter: this.hyperbeeAdapter,
       dispatcher: this.dispatcher,
       logger: this.logger,
       featureFlags: this.featureFlags,
@@ -385,6 +402,46 @@ class PublicGatewayService {
       },
       legacyForward: (session, message, preferredPeer) => this.#forwardLegacyMessage(session, message, preferredPeer)
     });
+
+    await this.#ensureInternalRelayRegistration();
+
+    const ttlSeconds = Math.max(Number(this.config.registration?.cacheTtlSeconds) || 300, 60);
+    const refreshIntervalMs = Math.max(60000, Math.floor((ttlSeconds * 1000) / 2));
+    this.internalRegistrationInterval = setInterval(() => {
+      this.#ensureInternalRelayRegistration().catch((error) => {
+        this.logger?.debug?.('Failed to refresh internal relay registration', {
+          error: error?.message || error
+        });
+      });
+    }, refreshIntervalMs);
+    this.internalRegistrationInterval.unref?.();
+  }
+
+  async #ensureInternalRelayRegistration() {
+    if (!this.relayHost || !this.registrationStore?.upsertRelay) return;
+
+    const timestamp = new Date().toISOString();
+    const gatewayPath = this.internalRelayKey.replace(':', '/');
+
+    const registration = {
+      relayKey: this.internalRelayKey,
+      identifier: this.internalRelayKey,
+      peers: [],
+      registeredAt: timestamp,
+      updatedAt: timestamp,
+      metadata: {
+        identifier: this.internalRelayKey,
+        name: 'Public Gateway Hyperbee',
+        description: 'Authoritative public gateway relay dataset',
+        requiresAuth: false,
+        isPublic: true,
+        isGatewayReplica: true,
+        gatewayPath,
+        gatewayRelay: this.#getRelayHostInfo()
+      }
+    };
+
+    await this.registrationStore.upsertRelay(this.internalRelayKey, registration);
   }
 
   #computeWsBase(baseUrl) {
@@ -538,33 +595,46 @@ class PublicGatewayService {
     });
 
     const selection = this.#selectPeer({ ...registration, peers: availablePeers });
-    if (!selection) {
+    const supportsLocal = this.#supportsLocalRelay(registration);
+
+    let peerKey = null;
+    let peers = availablePeers;
+    let peerIndex = 0;
+    const localOnly = !selection && supportsLocal;
+
+    if (selection) {
+      peerKey = selection.peerKey;
+      peers = selection.peers;
+      peerIndex = selection.index >= 0 ? selection.index : 0;
+    } else if (!localOnly) {
       this.logger.warn?.('WebSocket rejected: no peers available', { relayKey });
       ws.close(1013, 'No peers available');
       ws.terminate();
       return;
     }
 
-    const { peerKey, peers, index } = selection;
-    const peerIndex = index >= 0 ? index : 0;
-    try {
-      this.logger.info?.('Attempting hyperswarm connection for websocket session', {
-        relayKey,
-        peerKey
-      });
-      await this.connectionPool.getConnection(peerKey);
-      this.logger.info?.('Hyperswarm connection established for websocket session', {
-        relayKey,
-        peerKey
-      });
-    } catch (err) {
-      err.relayKey = relayKey;
-      this.logger.error?.('WebSocket rejected: failed to connect to peer', {
-        relayKey,
-        peerKey,
-        error: err?.message || 'unknown error'
-      });
-      throw err;
+    if (!localOnly && peerKey) {
+      try {
+        this.logger.info?.('Attempting hyperswarm connection for websocket session', {
+          relayKey,
+          peerKey
+        });
+        await this.connectionPool.getConnection(peerKey);
+        this.logger.info?.('Hyperswarm connection established for websocket session', {
+          relayKey,
+          peerKey
+        });
+      } catch (err) {
+        err.relayKey = relayKey;
+        this.logger.error?.('WebSocket rejected: failed to connect to peer', {
+          relayKey,
+          peerKey,
+          error: err?.message || 'unknown error'
+        });
+        throw err;
+      }
+    } else if (localOnly) {
+      this.logger.info?.('WebSocket session using local Hyperbee host', { relayKey });
     }
 
     const connectionKey = this.#generateConnectionKey();
@@ -580,10 +650,15 @@ class PublicGatewayService {
       peerKey,
       peers,
       peerIndex,
+      localOnly,
       messageQueue: new MessageQueue(),
       openedAt: Date.now(),
       subscriptionPeers: new Map(),
-      assignPeer: (assignedPeer, subscriptionId) => this.#assignPeerForSubscription(session, assignedPeer, subscriptionId)
+      assignPeer: null
+    };
+    session.assignPeer = (assignedPeer, subscriptionId) => {
+      if (session.localOnly) return;
+      this.#assignPeerForSubscription(session, assignedPeer, subscriptionId);
     };
 
     this.sessions.set(connectionKey, session);
@@ -651,6 +726,13 @@ class PublicGatewayService {
       return;
     }
 
+    if (!session?.peers?.length) {
+      this.logger.debug?.('Legacy forward skipped - no peers available for relay', {
+        relayKey: session?.relayKey
+      });
+      return;
+    }
+
     try {
       const responses = await this.#withPeer(session, async (peerKey) => {
         requestCounter.inc({ relay: session.relayKey });
@@ -689,25 +771,29 @@ class PublicGatewayService {
       }
 
       try {
-        const registration = await this.registrationStore.getRelay(session.relayKey);
-        if (registration) {
-          session.peers = this.#getPeersFromRegistration(registration);
-        }
+        if (session.localOnly) {
+          await this.#pollLocalHyperbee(session);
+        } else {
+          const registration = await this.registrationStore.getRelay(session.relayKey);
+          if (registration) {
+            session.peers = this.#getPeersFromRegistration(registration);
+          }
 
-        const events = await this.#withPeer(session, async (peerKey) => {
-          return getEventsFromPeerHyperswarm(
-            peerKey,
-            session.relayKey,
-            session.connectionKey,
-            this.connectionPool,
-            session.relayAuthToken
-          );
-        });
+          const events = await this.#withPeer(session, async (peerKey) => {
+            return getEventsFromPeerHyperswarm(
+              peerKey,
+              session.relayKey,
+              session.connectionKey,
+              this.connectionPool,
+              session.relayAuthToken
+            );
+          });
 
-        if (Array.isArray(events) && events.length && session.ws.readyState === WebSocket.OPEN) {
-          for (const event of events) {
-            if (!event) continue;
-            session.ws.send(JSON.stringify(event));
+          if (Array.isArray(events) && events.length && session.ws.readyState === WebSocket.OPEN) {
+            for (const event of events) {
+              if (!event) continue;
+              session.ws.send(JSON.stringify(event));
+            }
           }
         }
       } catch (error) {
@@ -724,6 +810,57 @@ class PublicGatewayService {
     this.eventCheckTimers.set(session.connectionKey, timer);
   }
 
+  async #pollLocalHyperbee(session) {
+    if (!this.hyperbeeAdapter?.hasReplica?.()) {
+      return;
+    }
+
+    const snapshot = this.relayWebsocketController?.getSubscriptionSnapshot?.(session.connectionKey);
+    if (!Array.isArray(snapshot) || snapshot.length === 0) {
+      return;
+    }
+
+    for (const entry of snapshot) {
+      const { subscriptionId, filters, lastReturnedAt } = entry;
+      try {
+        const queryResult = await this.hyperbeeAdapter.query(filters || []);
+        const events = Array.isArray(queryResult?.events) ? queryResult.events : [];
+        if (!events.length) continue;
+
+        const filtered = events
+          .filter((event) => {
+            const createdAt = Number(event?.created_at ?? 0);
+            if (!Number.isFinite(lastReturnedAt)) return true;
+            return createdAt > lastReturnedAt;
+          })
+          .sort((a, b) => (a?.created_at || 0) - (b?.created_at || 0));
+
+        if (!filtered.length || session.ws.readyState !== WebSocket.OPEN) {
+          continue;
+        }
+
+        let newestTimestamp = Number.isFinite(lastReturnedAt) ? lastReturnedAt : null;
+        for (const event of filtered) {
+          const createdAt = Number(event?.created_at ?? 0);
+          if (Number.isFinite(createdAt)) {
+            newestTimestamp = newestTimestamp === null ? createdAt : Math.max(newestTimestamp, createdAt);
+          }
+          session.ws.send(JSON.stringify(['EVENT', subscriptionId, event]));
+        }
+
+        if (Number.isFinite(newestTimestamp)) {
+          this.relayWebsocketController?.updateSubscriptionCursor?.(session.connectionKey, subscriptionId, newestTimestamp);
+        }
+      } catch (error) {
+        this.logger.debug?.('Local Hyperbee poll failed', {
+          relayKey: session.relayKey,
+          subscriptionId,
+          error: error?.message || error
+        });
+      }
+    }
+  }
+
   #getPeersFromRegistration(registration) {
     if (!registration) return [];
     const { peers } = registration;
@@ -735,6 +872,15 @@ class PublicGatewayService {
       return Array.from(peers).filter(Boolean);
     }
     return [];
+  }
+
+  #supportsLocalRelay(registration) {
+    if (!registration) return false;
+    if (!this.relayHost) return false;
+    if (registration.relayKey === this.internalRelayKey) return true;
+    if (registration.identifier === this.internalRelayKey) return true;
+    if (registration.metadata?.identifier === this.internalRelayKey) return true;
+    return registration.metadata?.isGatewayReplica === true;
   }
 
   #selectPeer(registration) {

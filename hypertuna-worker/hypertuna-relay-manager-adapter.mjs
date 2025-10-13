@@ -72,7 +72,9 @@ function parseRelayMetadataEvent(event) {
 
 export async function getRelayMetadata(relayKey, publicIdentifier = null) {
     const manager = activeRelays.get(relayKey);
-    if (!manager) return null;
+    if (!manager || typeof manager.queryEvents !== 'function') {
+        return null;
+    }
 
     try {
         const filter = { kinds: [39000], limit: 50 };

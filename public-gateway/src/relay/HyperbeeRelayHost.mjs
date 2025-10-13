@@ -20,6 +20,16 @@ function safeStringify(payload) {
   }
 }
 
+function padNumber(num, length) {
+  const value = Number.isFinite(num) ? num : 0;
+  return String(Math.trunc(value)).padStart(length, '0');
+}
+
+function padTimestamp(timestamp) {
+  const value = Number.isFinite(timestamp) ? timestamp : 0;
+  return String(Math.trunc(value)).padStart(10, '0');
+}
+
 export class HyperbeeRelayHost extends EventEmitter {
   constructor({ logger = console, telemetryIntervalMs = DEFAULT_STATS_INTERVAL_MS } = {}) {
     super();
@@ -138,7 +148,19 @@ export class HyperbeeRelayHost extends EventEmitter {
     const payload = safeStringify(event);
 
     try {
-      await this.db.put(key, payload);
+      const batch = this.db.batch();
+      await batch.put(key, payload);
+
+      for (const entry of this.#buildIndexEntries(event)) {
+        await batch.put(entry.key, entry.value);
+      }
+
+      await batch.flush();
+      this.logger?.info?.('[HyperbeeRelayHost] Event stored', {
+        id: event.id,
+        kind: event.kind,
+        created_at: event.created_at
+      });
       this.#emitTelemetry('hyperbee-append', { id: event.id, kind: event.kind, created_at: event.created_at });
       return { id: event.id, status: 'accepted' };
     } catch (error) {
@@ -186,6 +208,41 @@ export class HyperbeeRelayHost extends EventEmitter {
     };
   }
 
+  #buildIndexEntries(event) {
+    const entries = [];
+    if (!event?.id) return entries;
+
+    const eventIdValue = b4a.from(event.id, 'utf8');
+    const createdAt = Number(event?.created_at) || 0;
+    const paddedCreatedAt = padTimestamp(createdAt);
+
+    const timeKey = b4a.from(`created_at:${paddedCreatedAt}:id:${event.id}`, 'utf8');
+    entries.push({ key: timeKey, value: eventIdValue });
+
+    if (Number.isInteger(event?.kind)) {
+      const paddedKind = padNumber(event.kind, 5);
+      const kindKey = b4a.from(`kind:${paddedKind}:created_at:${paddedCreatedAt}:id:${event.id}`, 'utf8');
+      entries.push({ key: kindKey, value: eventIdValue });
+    }
+
+    if (typeof event?.pubkey === 'string' && event.pubkey.length) {
+      const authorKey = b4a.from(`pubkey:${event.pubkey}:created_at:${paddedCreatedAt}:id:${event.id}`, 'utf8');
+      entries.push({ key: authorKey, value: eventIdValue });
+    }
+
+    if (Array.isArray(event?.tags)) {
+      for (const tag of event.tags) {
+        if (!Array.isArray(tag) || tag.length < 2) continue;
+        const [name, value] = tag;
+        if (typeof name !== 'string' || typeof value !== 'string') continue;
+        const tagKey = b4a.from(`tagKey:${name}:tagValue:${value}:created_at:${paddedCreatedAt}:id:${event.id}`, 'utf8');
+        entries.push({ key: tagKey, value: eventIdValue });
+      }
+    }
+
+    return entries;
+  }
+
   getPublicKey() {
     if (!this.core?.key) return null;
     return b4a.toString(this.core.key, 'hex');
@@ -194,6 +251,14 @@ export class HyperbeeRelayHost extends EventEmitter {
   getDiscoveryKey() {
     if (!this.core?.discoveryKey) return null;
     return b4a.toString(this.core.discoveryKey, 'hex');
+  }
+
+  getHyperbee() {
+    return this.db;
+  }
+
+  getCore() {
+    return this.core;
   }
 
   #startStatsLoop() {

@@ -3,6 +3,7 @@ import WebSocket from 'ws';
 export default class RelayWebsocketController {
   constructor({
     relayHost,
+    hyperbeeAdapter = null,
     dispatcher = null,
     logger = console,
     featureFlags = {},
@@ -15,6 +16,7 @@ export default class RelayWebsocketController {
     }
 
     this.relayHost = relayHost;
+    this.hyperbeeAdapter = hyperbeeAdapter;
     this.dispatcher = dispatcher;
     this.logger = logger;
     this.featureFlags = featureFlags;
@@ -25,6 +27,20 @@ export default class RelayWebsocketController {
     };
     this.legacyForward = legacyForward;
     this.subscriptions = new Map();
+  }
+
+  getSubscriptionSnapshot(sessionKey) {
+    const subs = this.subscriptions.get(sessionKey);
+    if (!subs) return [];
+    return Array.from(subs.entries()).map(([subscriptionId, state]) => ({
+      subscriptionId,
+      filters: Array.isArray(state?.filters) ? state.filters : [],
+      lastReturnedAt: Number.isFinite(state?.lastReturnedAt) ? state.lastReturnedAt : null
+    }));
+  }
+
+  updateSubscriptionCursor(sessionKey, subscriptionId, timestamp) {
+    this.#updateSubscriptionCursor(sessionKey, subscriptionId, timestamp);
   }
 
   async handleMessage(session, rawMessage) {
@@ -112,6 +128,17 @@ export default class RelayWebsocketController {
 
     this.#recordSubscription(session.connectionKey, subscriptionId, filters);
 
+    const subscriptionState = this.#getSubscriptionState(session.connectionKey, subscriptionId);
+    const lastReturnedAt = subscriptionState?.lastReturnedAt ?? null;
+
+    const localResult = await this.#serveReqFromHyperbee(session, subscriptionId, filters, lastReturnedAt);
+    if (localResult?.handled) {
+      if (Number.isFinite(localResult.latestTimestamp)) {
+        this.#updateSubscriptionCursor(session.connectionKey, subscriptionId, localResult.latestTimestamp);
+      }
+      return;
+    }
+
     const dispatcherEnabled = this.featureFlags?.dispatcherEnabled && !!this.dispatcher;
 
     if (dispatcherEnabled) {
@@ -168,6 +195,10 @@ export default class RelayWebsocketController {
   }
 
   async #forwardLegacy(session, rawMessage, targetPeer = null) {
+    if (session?.localOnly) {
+      return;
+    }
+
     try {
       await this.legacyForward(session, rawMessage, targetPeer);
     } catch (error) {
@@ -217,7 +248,9 @@ export default class RelayWebsocketController {
       subs = new Map();
       this.subscriptions.set(sessionKey, subs);
     }
-    subs.set(subscriptionId, filters || []);
+    const existing = subs.get(subscriptionId) || { filters: [], lastReturnedAt: null };
+    existing.filters = filters || [];
+    subs.set(subscriptionId, existing);
   }
 
   #removeSubscription(sessionKey, subscriptionId) {
@@ -228,6 +261,74 @@ export default class RelayWebsocketController {
     this.dispatcher?.acknowledge(subscriptionId, { peerId: null });
     if (subs.size === 0) {
       this.subscriptions.delete(sessionKey);
+    }
+  }
+
+  #getSubscriptionState(sessionKey, subscriptionId) {
+    const subs = this.subscriptions.get(sessionKey);
+    if (!subs) return null;
+    return subs.get(subscriptionId) || null;
+  }
+
+  #updateSubscriptionCursor(sessionKey, subscriptionId, timestamp) {
+    if (!Number.isFinite(timestamp)) return;
+    const subs = this.subscriptions.get(sessionKey);
+    if (!subs) return;
+    const state = subs.get(subscriptionId);
+    if (!state) return;
+    state.lastReturnedAt = timestamp;
+    subs.set(subscriptionId, state);
+  }
+
+  async #serveReqFromHyperbee(session, subscriptionId, filters, lastReturnedAt) {
+    if (!this.hyperbeeAdapter?.hasReplica?.()) {
+      return null;
+    }
+
+    try {
+      const queryResult = await this.hyperbeeAdapter.query(filters || []);
+      if (!queryResult?.stats?.served) {
+        return null;
+      }
+
+      const events = Array.isArray(queryResult.events) ? queryResult.events : [];
+      const filteredEvents = events.filter((event) => {
+        const createdAt = Number(event?.created_at ?? 0);
+        if (!Number.isFinite(lastReturnedAt)) return true;
+        return createdAt > lastReturnedAt;
+      });
+
+      const latestTimestamp = filteredEvents.reduce((acc, event) => {
+        const createdAt = Number(event?.created_at ?? 0);
+        if (!Number.isFinite(createdAt)) return acc;
+        return Math.max(acc, createdAt);
+      }, Number.isFinite(lastReturnedAt) ? lastReturnedAt : -Infinity);
+
+      for (const event of filteredEvents) {
+        if (session.ws?.readyState === WebSocket.OPEN) {
+          session.ws.send(JSON.stringify(['EVENT', subscriptionId, event]));
+        }
+      }
+
+      if (session.ws?.readyState === WebSocket.OPEN) {
+        session.ws.send(JSON.stringify(['EOSE', subscriptionId]));
+      }
+
+      this.#incrementReq('served-local');
+
+      return {
+        handled: true,
+        latestTimestamp: Number.isFinite(latestTimestamp) ? latestTimestamp : lastReturnedAt ?? null,
+        delivered: filteredEvents.length
+      };
+    } catch (error) {
+      this.logger.warn?.('[RelayWebsocketController] Hyperbee query failed, falling back to peers', {
+        error: error?.message || error,
+        relayKey: session.relayKey,
+        subscriptionId
+      });
+      this.#incrementError('hyperbee-query');
+      return null;
     }
   }
 }

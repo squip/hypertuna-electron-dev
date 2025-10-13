@@ -19,7 +19,7 @@ import {
 import PublicGatewayRegistrar from './PublicGatewayRegistrar.mjs';
 import PublicGatewayDiscoveryClient from './PublicGatewayDiscoveryClient.mjs';
 import PublicGatewayRelayClient from './PublicGatewayRelayClient.mjs';
-import PublicGatewayHyperbeeAdapter from './PublicGatewayHyperbeeAdapter.mjs';
+import PublicGatewayHyperbeeAdapter from '../../shared/public-gateway/PublicGatewayHyperbeeAdapter.mjs';
 import PublicGatewayVirtualRelayManager from './PublicGatewayVirtualRelayManager.mjs';
 import {
   registerVirtualRelay,
@@ -263,6 +263,8 @@ export class GatewayService extends EventEmitter {
     const envBaseUrl = (process.env.PUBLIC_GATEWAY_URL || '').trim();
     const envSecret = (process.env.PUBLIC_GATEWAY_SECRET || '').trim();
     const envTtl = Number(process.env.PUBLIC_GATEWAY_DEFAULT_TOKEN_TTL);
+    const envDelegateRaw = process.env.PUBLIC_GATEWAY_DELEGATE_REQS;
+    const envDelegate = envDelegateRaw === 'true' ? true : envDelegateRaw === 'false' ? false : null;
 
     const ttlCandidate = rawConfig?.defaultTokenTtl ?? (Number.isFinite(envTtl) ? envTtl : undefined);
     const ttlNumber = Number(ttlCandidate);
@@ -312,6 +314,14 @@ export class GatewayService extends EventEmitter {
       dispatcherCircuitBreakerThreshold: this.#parsePositiveNumber(rawConfig?.dispatcherCircuitBreakerThreshold, 5),
       dispatcherCircuitBreakerTimeoutMs: this.#parsePositiveNumber(rawConfig?.dispatcherCircuitBreakerTimeoutMs, 60000)
     };
+
+    if (envDelegate !== null) {
+      config.delegateReqToPeers = envDelegate;
+    } else if (typeof rawConfig?.delegateReqToPeers === 'boolean') {
+      config.delegateReqToPeers = rawConfig.delegateReqToPeers;
+    } else {
+      config.delegateReqToPeers = false;
+    }
 
     if (!config.selectionMode) {
       config.selectionMode = envSecret ? 'manual' : 'default';
@@ -1266,6 +1276,11 @@ export class GatewayService extends EventEmitter {
     const isServer = !!context.isServer;
     if (!isServer) return;
 
+    this.log('debug', '[PublicGateway] Hyperswarm protocol created for peer', {
+      peer: publicKey,
+      isServer
+    });
+
     protocol.handle('/gateway/register', async (request) => {
       return this._handleGatewayRegisterRequest(publicKey, request);
     });
@@ -1275,13 +1290,27 @@ export class GatewayService extends EventEmitter {
     if (!handshake) return;
     this.peerHandshakes.set(publicKey, handshake);
 
+    const handshakeKeys = handshake ? Object.keys(handshake) : [];
+    const summary = `peer=${publicKey} role=${handshake?.role ?? 'unknown'} isGateway=${handshake?.isGateway ?? 'unknown'}`;
+    this.log('debug', `[PublicGateway] Hyperswarm handshake received (${summary})`);
+
+    if (handshake) {
+      let serialized = null;
+      try {
+        serialized = JSON.stringify(handshake);
+      } catch (_) {
+        serialized = '[unserializable]';
+      }
+      this.log('debug', `[PublicGateway] Hyperswarm handshake payload peer=${publicKey} keys=${handshakeKeys.join(',')} payload=${serialized}`);
+    }
+
     if (handshake.role === 'relay' || handshake.isGateway === false) {
       this.healthState.services.hyperswarmStatus = 'connected';
       this.healthState.services.protocolStatus = 'connected';
       this.emit('status', this.getStatus());
     }
 
-    if (handshake.isGateway) {
+    if (handshake?.isGateway === true || handshake?.role === 'gateway' || this.#isResolvedGatewayPeer(publicKey, handshake)) {
       if (protocol) {
         this.gatewayProtocols.set(publicKey, protocol);
         const cleanup = () => {
@@ -1291,9 +1320,53 @@ export class GatewayService extends EventEmitter {
         protocol.once('destroy', cleanup);
         protocol.mux?.stream?.once('close', cleanup);
       }
+      this.log('debug', '[PublicGateway] Attaching protocol to public gateway relay client (handshake)', {
+        peer: publicKey,
+        handshakeRole: handshake.role,
+        isGateway: handshake.isGateway,
+        protocolOpen: protocol?.isOpen
+      });
+      this.attachGatewayProtocol(publicKey, protocol);
+    } else {
+      this.log('debug', `[PublicGateway] Hyperswarm handshake did not identify peer as gateway (peer=${publicKey} role=${handshake?.role ?? 'unknown'} isGateway=${handshake?.isGateway ?? 'unknown'})`);
+    }
+  }
 
+  #isResolvedGatewayPeer(peerPublicKey, handshake = {}) {
+    const resolvedGatewayId = this.publicGatewaySettings?.resolvedGatewayId;
+    if (!resolvedGatewayId) return false;
+
+    const normalize = (value) => (typeof value === 'string' ? value.toLowerCase() : null);
+
+    const target = normalize(resolvedGatewayId);
+    if (!target) return false;
+
+    const candidates = new Set();
+    candidates.add(normalize(peerPublicKey));
+    candidates.add(normalize(handshake?.relayPublicKey));
+    candidates.add(normalize(handshake?.gatewayPublicKey));
+
+    return Array.from(candidates).some((candidate) => candidate === target);
+  }
+
+  attachGatewayProtocol(peerPublicKey, protocol) {
+    if (!protocol) {
+      this.log('debug', '[PublicGateway] attachGatewayProtocol invoked without protocol', {
+        peer: peerPublicKey
+      });
+      return;
+    }
+
+    this.log('debug', '[PublicGateway] Attaching gateway protocol stream', {
+      peer: peerPublicKey,
+      protocolOpen: protocol?.isOpen ?? null
+    });
+
+    try {
       this.publicGatewayRelayClient?.attachProtocol(protocol);
-      this.#startGatewayTelemetry(publicKey, protocol);
+      this.#startGatewayTelemetry(peerPublicKey, protocol);
+    } catch (error) {
+      this.log('warn', `[PublicGateway] Failed to attach gateway protocol stream: ${error.message}`);
     }
   }
 
@@ -1457,6 +1530,7 @@ export class GatewayService extends EventEmitter {
       resolvedDefaultTokenTtl: config.resolvedDefaultTokenTtl || null,
       resolvedTokenRefreshWindowSeconds: config.resolvedTokenRefreshWindowSeconds || null,
       resolvedDispatcher: config.resolvedDispatcher || null,
+      delegateReqToPeers: !!config.delegateReqToPeers,
       defaultTokenTtl: config.defaultTokenTtl || 3600,
       wsBase: enabled ? (config.resolvedWsUrl || this.publicGatewayWsBase) : null,
       lastUpdatedAt: this.publicGatewayStatusUpdatedAt,
@@ -2506,7 +2580,10 @@ export class GatewayService extends EventEmitter {
       ws,
       relayKey: identifier,
       authToken,
-      connectionKey
+      connectionKey,
+      shouldPollPeers: false,
+      delegatedSubscriptions: new Set(),
+      localServedSubscriptions: new Set()
     });
 
     const messageQueue = new MessageQueue();
@@ -2522,9 +2599,57 @@ export class GatewayService extends EventEmitter {
           return;
         }
 
-        const handledLocally = await this.#maybeHandleReqLocally(connData, msg);
-        if (handledLocally) {
+        let frameType = null;
+        let frameSubscriptionId = null;
+        if (typeof msg === 'string' || msg instanceof Buffer) {
+          try {
+            const parsed = JSON.parse(typeof msg === 'string' ? msg : msg.toString());
+            if (Array.isArray(parsed)) {
+              frameType = parsed[0];
+              frameSubscriptionId = parsed[1];
+            }
+          } catch (_) {}
+        }
+
+        const localResult = await this.#maybeHandleReqLocally(connData, msg);
+        if (localResult?.handled) {
+          connData.shouldPollPeers = false;
+          if (localResult.subscriptionId) {
+            connData.localServedSubscriptions.add(localResult.subscriptionId);
+            connData.delegatedSubscriptions.delete(localResult.subscriptionId);
+          }
+          this.log('debug', `[PublicGateway] Served subscription locally`, {
+            connectionKey,
+            relayKey: connData.relayKey,
+            subscriptionId: localResult.subscriptionId,
+            events: localResult.eventsServed ?? 0
+          });
           return;
+        }
+
+        if (localResult?.subscriptionId) {
+          connData.delegatedSubscriptions.add(localResult.subscriptionId);
+          connData.localServedSubscriptions.delete(localResult.subscriptionId);
+        }
+
+        if (localResult?.shouldPollPeers) {
+          connData.shouldPollPeers = true;
+        }
+
+        if (connData.delegatedSubscriptions.size > 0) {
+          connData.shouldPollPeers = true;
+        }
+
+        if (frameType === 'CLOSE' && frameSubscriptionId) {
+          connData.delegatedSubscriptions.delete(frameSubscriptionId);
+          connData.localServedSubscriptions.delete(frameSubscriptionId);
+          connData.shouldPollPeers = connData.delegatedSubscriptions.size > 0;
+          this.log('debug', '[PublicGateway] Client closed subscription', {
+            connectionKey,
+            relayKey: connData.relayKey,
+            subscriptionId: frameSubscriptionId,
+            delegatedSubscriptions: connData.delegatedSubscriptions.size
+          });
         }
 
         const healthyPeer = await this.findHealthyPeerForRelay(identifier);
@@ -2534,6 +2659,14 @@ export class GatewayService extends EventEmitter {
           }
           return;
         }
+
+        this.log('debug', '[PublicGateway] Forwarding message to peer', {
+          connectionKey,
+          relayKey: identifier,
+          peer: healthyPeer.publicKey?.slice(0, 12) || 'unknown',
+          delegated: connData.shouldPollPeers,
+          subscriptionId: localResult?.subscriptionId || frameSubscriptionId || null
+        });
 
         try {
           const responses = await forwardMessageToPeerHyperswarm(
@@ -2578,17 +2711,17 @@ export class GatewayService extends EventEmitter {
   }
 
   async #maybeHandleReqLocally(connData, rawMessage) {
-    if (!this.hyperbeeAdapter?.hasReplica()) {
-      return false;
-    }
+    const response = {
+      handled: false,
+      subscriptionId: null,
+      shouldPollPeers: false,
+      eventsServed: 0,
+      delegated: false
+    };
 
     const { ws, relayKey } = connData || {};
     if (!ws || ws.readyState !== WebSocket.OPEN) {
-      return false;
-    }
-
-    if (!this.#canServeRelayLocally(relayKey)) {
-      return false;
+      return response;
     }
 
     let frame;
@@ -2597,24 +2730,84 @@ export class GatewayService extends EventEmitter {
       textPayload = typeof rawMessage === 'string' ? rawMessage : rawMessage.toString();
       frame = JSON.parse(textPayload);
     } catch (error) {
-      return false;
+      return response;
     }
 
     if (!Array.isArray(frame) || frame[0] !== 'REQ') {
-      return false;
+      return response;
     }
 
     const subscriptionId = frame[1];
     if (!subscriptionId) {
-      return false;
+      return response;
     }
+    response.subscriptionId = subscriptionId;
 
     const filters = frame.slice(2);
+
+    if (this.publicGatewaySettings?.delegateReqToPeers === false) {
+      this.log(
+        'debug',
+        `[PublicGateway] Delegation disabled via settings for incoming REQ relay=${relayKey} subscription=${subscriptionId} filterCount=${filters.length}`
+      );
+    }
+
+    this.log(
+      'debug',
+      `[PublicGateway] Handling incoming REQ relay=${relayKey} subscription=${subscriptionId} connection=${connData.connectionKey} filters=${JSON.stringify(filters)}`
+    );
+
+    if (connData.delegatedSubscriptions?.has(subscriptionId)) {
+      this.log('debug', '[PublicGateway] Subscription already delegated to peer; bypassing local serve', {
+        relayKey,
+        subscriptionId
+      });
+      response.shouldPollPeers = true;
+      return response;
+    }
+
+    const hasReplica = this.hyperbeeAdapter?.hasReplica?.() === true;
+    const hyperbeeKey = this.publicGatewayRelayClient?.getHyperbeeKey?.() || null;
+    const canServeLocally = hasReplica ? this.#canServeRelayLocally(relayKey) : false;
+    if (!hasReplica || !canServeLocally) {
+      this.log(
+        'debug',
+        `[PublicGateway] Replica unavailable or disabled for local serving relay=${relayKey} subscription=${subscriptionId} hasReplica=${hasReplica} canServeLocally=${canServeLocally} hyperbeeKey=${hyperbeeKey || 'null'}`
+      );
+      response.shouldPollPeers = true;
+      return response;
+    }
+
+    if (this.#shouldDelegateReq(filters, relayKey, subscriptionId)) {
+      this.#recordHyperbeeFallback('delegated', relayKey, { subscriptionId });
+      this.log('info', '[PublicGateway] Delegating subscription to worker', {
+        relayKey,
+        subscriptionId,
+        filterCount: filters.length
+      });
+      response.shouldPollPeers = true;
+      response.delegated = true;
+      return response;
+    }
+
     const replicaStats = await this.hyperbeeAdapter.getReplicaStats();
     const lagThreshold = Number(this.publicGatewaySettings?.dispatcherReassignLagBlocks) || 0;
+    const replicaLag = replicaStats?.lag || 0;
+    const replicaVersion = this.hyperbeeAdapter?.relayClient?.getHyperbee?.()?.version || null;
+    this.log(
+      'debug',
+      `[PublicGateway] Replica stats relay=${relayKey} subscription=${subscriptionId} version=${replicaVersion} lag=${replicaLag}`
+    );
     if (lagThreshold > 0 && replicaStats.lag > lagThreshold) {
       this.#recordHyperbeeFallback('lag', relayKey, { lag: replicaStats.lag, lagThreshold });
-      return false;
+      this.log('info', '[PublicGateway] Delegating subscription due to replica lag', {
+        relayKey,
+        subscriptionId,
+        lag: replicaStats.lag,
+        lagThreshold
+      });
+      response.shouldPollPeers = true;
+      return response;
     }
 
     let queryResult;
@@ -2622,18 +2815,43 @@ export class GatewayService extends EventEmitter {
       queryResult = await this.hyperbeeAdapter.query(filters);
     } catch (error) {
       this.#recordHyperbeeError(error, relayKey);
-      return false;
+      response.shouldPollPeers = true;
+      return response;
     }
+
+    const returnedEvents = Array.isArray(queryResult?.events) ? queryResult.events.length : 0;
+    const served = !!queryResult?.stats?.served;
+    const truncated = !!queryResult?.stats?.truncated;
+    this.log(
+      'debug',
+      `[PublicGateway] Local query stats relay=${relayKey} subscription=${subscriptionId} served=${served} events=${returnedEvents} truncated=${truncated}`
+    );
 
     if (!queryResult?.stats?.served) {
       this.#recordHyperbeeFallback('not-served', relayKey);
-      return false;
+      this.log('debug', '[PublicGateway] Hyperbee replica unable to serve query, delegating', {
+        relayKey,
+        subscriptionId
+      });
+      response.shouldPollPeers = true;
+      return response;
     }
 
     const events = Array.isArray(queryResult.events) ? queryResult.events : [];
+    if (events.length === 0) {
+      this.log(
+        'debug',
+        `[PublicGateway] Local query returned no events relay=${relayKey} subscription=${subscriptionId} filterCount=${filters.length}`
+      );
+    }
     if (events.length === 0 && this.#shouldFallbackOnEmpty(filters)) {
       this.#recordHyperbeeFallback('empty', relayKey);
-      return false;
+      this.log('debug', '[PublicGateway] Delegating subscription because replica returned empty result set', {
+        relayKey,
+        subscriptionId
+      });
+      response.shouldPollPeers = true;
+      return response;
     }
 
     try {
@@ -2643,7 +2861,8 @@ export class GatewayService extends EventEmitter {
       ws.send(JSON.stringify(['EOSE', subscriptionId]));
     } catch (error) {
       this.#recordHyperbeeError(error, relayKey);
-      return false;
+      response.shouldPollPeers = true;
+      return response;
     }
 
     this.#recordHyperbeeServed(relayKey, {
@@ -2651,15 +2870,22 @@ export class GatewayService extends EventEmitter {
       truncated: !!queryResult?.stats?.truncated,
       lag: replicaStats.lag
     });
+    this.log(
+      'info',
+      `[PublicGateway] Served subscription locally relay=${relayKey} subscription=${subscriptionId} events=${events.length}`
+    );
 
-    return true;
+    response.handled = true;
+    response.eventsServed = events.length;
+    return response;
   }
 
   #canServeRelayLocally(relayKey) {
     if (!relayKey) return false;
     if (!this.hyperbeeAdapter?.hasReplica()) return false;
     const relayState = this.publicGatewayRelayState.get(relayKey);
-    const gatewayRelay = relayState?.metadata?.gatewayRelay;
+    const fallbackRelay = this.publicGatewaySettings?.resolvedGatewayRelay || null;
+    const gatewayRelay = relayState?.metadata?.gatewayRelay || fallbackRelay;
     if (!gatewayRelay?.hyperbeeKey) return false;
     const currentKey = this.publicGatewayRelayClient?.getHyperbeeKey?.();
     if (currentKey && currentKey !== gatewayRelay.hyperbeeKey) {
@@ -2671,6 +2897,54 @@ export class GatewayService extends EventEmitter {
   #shouldFallbackOnEmpty(filters) {
     if (!Array.isArray(filters) || filters.length === 0) return false;
     return filters.some((filter) => Array.isArray(filter?.ids) && filter.ids.length);
+  }
+
+  #shouldDelegateReq(filters, relayKey, subscriptionId) {
+    if (!Array.isArray(filters) || filters.length === 0) return false;
+
+    const filterCount = filters.length;
+
+    if (process.env.PUBLIC_GATEWAY_DELEGATE_REQS === 'true') {
+      this.log(
+        'debug',
+        `[PublicGateway] Delegation forced by PUBLIC_GATEWAY_DELEGATE_REQS env flag relay=${relayKey} subscription=${subscriptionId} filterCount=${filterCount}`
+      );
+      return true;
+    }
+
+    if (this.publicGatewaySettings?.delegateReqToPeers !== true) {
+      const heuristicsTriggered = filterCount >= 6 || filters.some((filter) => {
+        const limit = Number(filter?.limit);
+        return Number.isFinite(limit) && limit >= 1000;
+      });
+      if (heuristicsTriggered) {
+        this.log(
+          'debug',
+          `[PublicGateway] Delegation heuristics suppressed (delegate disabled) relay=${relayKey} subscription=${subscriptionId} filterCount=${filterCount}`
+        );
+      }
+      return false;
+    }
+
+    if (filterCount >= 6) {
+      this.log(
+        'debug',
+        `[PublicGateway] Delegating based on filter count heuristic relay=${relayKey} subscription=${subscriptionId} filterCount=${filterCount}`
+      );
+      return true;
+    }
+
+    return filters.some((filter) => {
+      const limit = Number(filter?.limit);
+      const delegate = Number.isFinite(limit) && limit >= 1000;
+      if (delegate) {
+        this.log(
+          'debug',
+          `[PublicGateway] Delegating based on filter limit heuristic relay=${relayKey} subscription=${subscriptionId} filterLimit=${limit}`
+        );
+      }
+      return delegate;
+    });
   }
 
   #recordHyperbeeServed(relayKey, { events = 0, truncated = false, lag = 0 } = {}) {
@@ -2728,27 +3002,39 @@ export class GatewayService extends EventEmitter {
         return;
       }
 
-      try {
-        const healthyPeer = await this.findHealthyPeerForRelay(identifier, true);
-        if (!healthyPeer) {
-          ws.send(JSON.stringify(['NOTICE', 'Gateway temporarily unavailable - no healthy peers']));
-        } else {
-          const events = await getEventsFromPeerHyperswarm(
-            healthyPeer.publicKey,
-            identifier,
-            connectionKey,
-            this.connectionPool,
-            authToken
-          );
+      if (connectionData.shouldPollPeers) {
+        this.log('debug', '[PublicGateway] Polling delegated subscriptions from peer', {
+          connectionKey,
+          relayKey: identifier,
+          delegatedSubscriptions: connectionData.delegatedSubscriptions?.size || 0
+        });
+        try {
+          const healthyPeer = await this.findHealthyPeerForRelay(identifier, true);
+          if (!healthyPeer) {
+            ws.send(JSON.stringify(['NOTICE', 'Gateway temporarily unavailable - no healthy peers']));
+          } else {
+            const events = await getEventsFromPeerHyperswarm(
+              healthyPeer.publicKey,
+              identifier,
+              connectionKey,
+              this.connectionPool,
+              authToken
+            );
 
-          for (const event of events) {
-            if (ws.readyState === WebSocket.OPEN) {
-              ws.send(JSON.stringify(event));
+            for (const event of events) {
+              if (ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify(event));
+              }
             }
           }
+        } catch (error) {
+          this.log('warn', `Event check failed: ${error.message}`);
         }
-      } catch (error) {
-        this.log('warn', `Event check failed: ${error.message}`);
+      } else {
+        this.log('debug', '[PublicGateway] Skipping peer poll for connection (local handling active)', {
+          connectionKey,
+          relayKey: identifier
+        });
       }
 
       const timer = setTimeout(loop, 10000);

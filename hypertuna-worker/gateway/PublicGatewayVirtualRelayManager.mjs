@@ -208,9 +208,10 @@ export default class PublicGatewayVirtualRelayManager {
 
     const normalizedFilters = filters.filter(Boolean).map(this.#normalizeFilter.bind(this));
     const session = this.#ensureSession(connectionKey);
+    const existing = session.subscriptions.get(subscriptionId) || DEFAULT_SUBSCRIPTION_STATE();
     session.subscriptions.set(subscriptionId, {
       filters: normalizedFilters,
-      lastReturnedAt: null
+      lastReturnedAt: existing.lastReturnedAt ?? null
     });
     session.updatedAt = Date.now();
 
@@ -281,9 +282,19 @@ export default class PublicGatewayVirtualRelayManager {
     let newestTimestamp = lastReturnedAt ?? null;
 
     for (const filter of filters) {
+      this.#log('debug', 'Querying Hyperbee for subscription filter', {
+        subscriptionId,
+        filter,
+        lastReturnedAt
+      });
       try {
         const queryResult = await this.hyperbeeAdapter.query([filter]);
         const events = Array.isArray(queryResult?.events) ? queryResult.events : [];
+        this.#log('debug', 'Hyperbee query result', {
+          subscriptionId,
+          filter,
+          eventCount: events.length
+        });
         for (const event of events) {
           const createdAt = Number(event?.created_at ?? 0);
           if (Number.isFinite(lastReturnedAt) && createdAt <= lastReturnedAt) {
@@ -304,6 +315,11 @@ export default class PublicGatewayVirtualRelayManager {
     }
 
     const sortedEvents = Array.from(results.values()).sort((a, b) => (a?.created_at || 0) - (b?.created_at || 0));
+    this.#log('debug', 'Subscription query completed', {
+      subscriptionId,
+      returnedEvents: sortedEvents.length,
+      newestTimestamp
+    });
     return {
       events: sortedEvents,
       newestTimestamp
