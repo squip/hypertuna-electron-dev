@@ -112,12 +112,8 @@ async function ensurePublicGatewaySettingsLoaded() {
     publicGatewaySettings = getCachedPublicGatewaySettings()
   }
 
-  if (publicGatewaySettings) {
-    const previous = publicGatewaySettings.delegateReqToPeers
+  if (publicGatewaySettings && typeof publicGatewaySettings.delegateReqToPeers !== 'boolean') {
     publicGatewaySettings.delegateReqToPeers = false
-    if (previous !== false) {
-      console.log('[Worker] Public gateway REQ delegation disabled for local handling tests')
-    }
   }
   return publicGatewaySettings
 }

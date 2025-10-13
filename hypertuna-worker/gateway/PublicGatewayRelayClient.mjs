@@ -17,6 +17,14 @@ class PublicGatewayRelayClient extends EventEmitter {
     this.lastDownloaded = 0;
     this.lastLength = 0;
     this.lastReplicationLog = 0;
+    this.lastReplicaUpdateAt = 0;
+    this.replicaSnapshot = {
+      length: 0,
+      contiguousLength: 0,
+      lag: 0,
+      version: 0,
+      updatedAt: 0
+    };
   }
 
   async configure(options = {}) {
@@ -50,6 +58,14 @@ class PublicGatewayRelayClient extends EventEmitter {
     this.lastDownloaded = initialContiguous;
     this.lastLength = initialLength;
     this.lastReplicationLog = 0;
+    this.lastReplicaUpdateAt = Date.now();
+    this.replicaSnapshot = {
+      length: initialLength,
+      contiguousLength: initialContiguous,
+      lag: Math.max(0, initialLength - initialContiguous),
+      version: this.db?.version || 0,
+      updatedAt: this.lastReplicaUpdateAt
+    };
 
     this.core.on('download', (index, data) => {
       const contiguous = typeof this.core.contiguousLength === 'number'
@@ -63,6 +79,14 @@ class PublicGatewayRelayClient extends EventEmitter {
           contiguousLength: contiguous,
           totalLength: this.lastLength
         });
+        this.lastReplicaUpdateAt = Date.now();
+        this.replicaSnapshot = {
+          length: this.lastLength,
+          contiguousLength: contiguous,
+          lag: Math.max(0, this.lastLength - contiguous),
+          version: this.db?.version || 0,
+          updatedAt: this.lastReplicaUpdateAt
+        };
         const now = Date.now();
         if (!this.lastReplicationLog || (now - this.lastReplicationLog) >= 5000) {
           this.logger?.info?.('[PublicGatewayRelayClient] Replication sync update', {
@@ -207,13 +231,26 @@ class PublicGatewayRelayClient extends EventEmitter {
     this.store = null;
     this.hyperbeeKey = null;
     this.discoveryKey = null;
+    this.replicaSnapshot = {
+      length: 0,
+      contiguousLength: 0,
+      lag: 0,
+      version: 0,
+      updatedAt: 0
+    };
+    this.lastReplicaUpdateAt = 0;
   }
 
   async getTelemetry() {
     if (!this.core) {
       return {
         hyperbeeVersion: 0,
-        hyperbeeLag: 0
+        hyperbeeLag: 0,
+        hyperbeeContiguousLength: 0,
+        hyperbeeLength: 0,
+        hyperbeeLastUpdatedAt: 0,
+        hyperbeeKey: null,
+        hyperbeeDiscoveryKey: null
       };
     }
     try {
@@ -223,9 +260,22 @@ class PublicGatewayRelayClient extends EventEmitter {
       this.lastDownloaded = contiguous;
       this.lastLength = length;
       const lag = Math.max(0, length - contiguous);
+      this.lastReplicaUpdateAt = Date.now();
+      this.replicaSnapshot = {
+        length,
+        contiguousLength: contiguous,
+        lag,
+        version: this.db?.version || 0,
+        updatedAt: this.lastReplicaUpdateAt
+      };
       return {
         hyperbeeVersion: this.db?.version || 0,
-        hyperbeeLag: lag
+        hyperbeeLag: lag,
+        hyperbeeContiguousLength: contiguous,
+        hyperbeeLength: length,
+        hyperbeeLastUpdatedAt: this.lastReplicaUpdateAt,
+        hyperbeeKey: this.hyperbeeKey,
+        hyperbeeDiscoveryKey: this.discoveryKey
       };
     } catch (error) {
       this.logger?.debug?.('[PublicGatewayRelayClient] Failed to collect telemetry', {
@@ -233,9 +283,22 @@ class PublicGatewayRelayClient extends EventEmitter {
       });
       return {
         hyperbeeVersion: this.db?.version || 0,
-        hyperbeeLag: Math.max(0, this.lastLength - this.lastDownloaded)
+        hyperbeeLag: Math.max(0, this.lastLength - this.lastDownloaded),
+        hyperbeeContiguousLength: this.lastDownloaded,
+        hyperbeeLength: this.lastLength,
+        hyperbeeLastUpdatedAt: this.lastReplicaUpdateAt,
+        hyperbeeKey: this.hyperbeeKey,
+        hyperbeeDiscoveryKey: this.discoveryKey
       };
     }
+  }
+
+  getReplicaSnapshot() {
+    return {
+      hyperbeeKey: this.hyperbeeKey,
+      discoveryKey: this.discoveryKey,
+      ...this.replicaSnapshot
+    };
   }
 }
 

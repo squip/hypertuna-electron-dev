@@ -47,6 +47,8 @@ import {
 import { getFile, getPfpFile } from './hyperdrive-manager.mjs';
 import { loadGatewaySettings, getCachedGatewaySettings } from '../shared/config/GatewaySettings.mjs';
 
+const PUBLIC_GATEWAY_REPLICA_IDENTIFIER = 'public-gateway:hyperbee';
+
 function parseNostrMessagePayload(message) {
   if (typeof message === 'string') {
     const trimmed = message.trim();
@@ -2072,6 +2074,55 @@ async function registerWithGateway(relayProfileInfo = null, options = {}) {
       });
     }
 
+    const gatewayServiceInstance = global.gatewayService || null;
+    const publicGatewayState = gatewayServiceInstance?.getPublicGatewayState?.();
+    const replicaInfo = gatewayServiceInstance?.getPublicGatewayReplicaInfo?.();
+    const replicaStateEntry = publicGatewayState?.relays?.[PUBLIC_GATEWAY_REPLICA_IDENTIFIER] || null;
+
+    if (replicaInfo || replicaStateEntry) {
+      let replicaEntry = relayList.find((entry) => entry?.identifier === PUBLIC_GATEWAY_REPLICA_IDENTIFIER);
+      if (!replicaEntry) {
+        const metadata = (replicaStateEntry && replicaStateEntry.metadata) || {};
+        replicaEntry = {
+          identifier: PUBLIC_GATEWAY_REPLICA_IDENTIFIER,
+          name: metadata.name || 'Public Gateway Relay Replica',
+          description: metadata.description || 'Replicated public gateway relay dataset',
+          avatarUrl: metadata.avatarUrl || null,
+          isPublic: true,
+          metadataUpdatedAt: metadata.metadataUpdatedAt || Date.now(),
+          metadataEventId: metadata.metadataEventId || null,
+          gatewayPath: metadata.gatewayPath || 'public-gateway/hyperbee'
+        };
+        relayList.push(replicaEntry);
+      }
+
+      replicaEntry.isGatewayReplica = true;
+
+      const gatewayRelay = replicaStateEntry?.metadata?.gatewayRelay || {};
+      replicaEntry.gatewayRelay = {
+        hyperbeeKey: replicaInfo?.hyperbeeKey || gatewayRelay.hyperbeeKey || null,
+        discoveryKey: replicaInfo?.discoveryKey || gatewayRelay.discoveryKey || null,
+        replicationTopic: gatewayRelay.replicationTopic || null
+      };
+
+      const fallbackMetrics = replicaEntry.replicaMetrics || {};
+      replicaEntry.replicaMetrics = {
+        length: Number.isFinite(replicaInfo?.length) ? replicaInfo.length : (Number.isFinite(fallbackMetrics.length) ? fallbackMetrics.length : 0),
+        contiguousLength: Number.isFinite(replicaInfo?.contiguousLength) ? replicaInfo.contiguousLength : (Number.isFinite(fallbackMetrics.contiguousLength) ? fallbackMetrics.contiguousLength : 0),
+        lag: Number.isFinite(replicaInfo?.lag) ? replicaInfo.lag : (Number.isFinite(fallbackMetrics.lag) ? fallbackMetrics.lag : 0),
+        version: Number.isFinite(replicaInfo?.version) ? replicaInfo.version : (Number.isFinite(fallbackMetrics.version) ? fallbackMetrics.version : 0),
+        updatedAt: Number.isFinite(replicaInfo?.updatedAt) ? replicaInfo.updatedAt : (Number.isFinite(fallbackMetrics.updatedAt) ? fallbackMetrics.updatedAt : 0)
+      };
+
+      if (replicaInfo?.telemetry) {
+        replicaEntry.replicaTelemetry = replicaInfo.telemetry;
+      }
+
+      if (typeof replicaInfo?.delegateReqToPeers === 'boolean') {
+        replicaEntry.delegateReqToPeers = replicaInfo.delegateReqToPeers;
+      }
+    }
+
     const advertisedAddress = config.proxy_server_address && config.proxy_server_address.includes(':')
       ? config.proxy_server_address
       : `${config.proxy_server_address}:${config.port}`;
@@ -2085,6 +2136,22 @@ async function registerWithGateway(relayProfileInfo = null, options = {}) {
       nostrPubkeyHex: config.nostr_pubkey_hex || null,
       pfpDriveKey: config.pfpDriveKey || null
     };
+
+    if (replicaInfo) {
+      registrationData.gatewayReplica = {
+        hyperbeeKey: replicaInfo.hyperbeeKey || null,
+        discoveryKey: replicaInfo.discoveryKey || null,
+        length: replicaInfo.length || 0,
+        contiguousLength: replicaInfo.contiguousLength || 0,
+        lag: replicaInfo.lag || 0,
+        version: replicaInfo.version || 0,
+        updatedAt: replicaInfo.updatedAt || 0,
+        telemetry: replicaInfo.telemetry || null
+      };
+      if (typeof replicaInfo.delegateReqToPeers === 'boolean') {
+        registrationData.gatewayReplica.delegateReqToPeers = replicaInfo.delegateReqToPeers;
+      }
+    }
 
     if (relayProfileInfo) {
       const newRelayIdentifier = String(

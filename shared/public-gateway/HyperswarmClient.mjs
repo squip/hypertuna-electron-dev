@@ -46,7 +46,12 @@ class HyperswarmConnection {
         }
 
         this.stream = connection;
-        this.protocol = new RelayProtocolWithGateway(connection, false);
+        const handshakeData = this.pool._buildHandshakeData(false, {
+          publicKey: this.publicKey,
+          connection,
+          wrapper: this
+        });
+        this.protocol = new RelayProtocolWithGateway(connection, false, handshakeData);
         this.pool._configureProtocol(this.publicKey, this.protocol, { isServer: false, connection: this });
         this.logger?.info?.('Protocol instance created for peer', { peer: this.publicKey });
 
@@ -131,11 +136,24 @@ class HyperswarmConnection {
     if (!this.protocol) return;
     try {
       this.logger?.info?.('Sending gateway identification', { peer: this.publicKey });
+      const identityPayload = this.pool._buildHandshakeData(false, {
+        publicKey: this.publicKey,
+        connection: this.stream,
+        wrapper: this
+      }) || {};
+      if (!identityPayload.role) {
+        identityPayload.role = identityPayload.gatewayReplica ? 'gateway-replica' : 'gateway';
+      }
       await this.protocol.sendRequest({
         method: 'POST',
         path: '/identify-gateway',
         headers: { 'content-type': 'application/json' },
-        body: Buffer.from(JSON.stringify({ role: 'gateway' }))
+        body: Buffer.from(JSON.stringify({
+          status: 'identified',
+          payload: identityPayload,
+          peer: this.pool?.getPublicKey?.() || null,
+          timestamp: Date.now()
+        }))
       });
       this.logger?.info?.('Gateway identification acknowledged', { peer: this.publicKey });
     } catch (err) {
@@ -306,10 +324,15 @@ class RelayProtocolWithGateway extends RelayProtocol {
     const handshake = {
       version: '2.0',
       isServer: this.isServer,
-      isGateway: true,
-      role: 'gateway',
+      isGateway: false,
+      role: this.isServer ? 'server' : 'client',
       capabilities: ['http', 'websocket', 'health', 'telemetry']
     };
+
+    if (this.handshakeData && typeof this.handshakeData === 'object') {
+      Object.assign(handshake, this.handshakeData);
+    }
+
     this.channel.open(handshake);
   }
 
@@ -371,7 +394,13 @@ class EnhancedHyperswarmPool {
       }
       const conn = new HyperswarmConnection(publicKey, this.swarm, this, this.logger);
       conn.stream = connection;
-      conn.protocol = new RelayProtocolWithGateway(connection, true);
+      const handshakeData = this._buildHandshakeData(true, {
+        publicKey,
+        peerInfo,
+        connection,
+        wrapper: conn
+      });
+      conn.protocol = new RelayProtocolWithGateway(connection, true, handshakeData);
       conn.connected = true;
       this._configureProtocol(publicKey, conn.protocol, { isServer: true, peerInfo, connection: conn });
       this.connections.set(publicKey, conn);
@@ -484,7 +513,28 @@ class EnhancedHyperswarmPool {
       protocol.once('open', onOpen);
     }
   }
-  
+
+  _buildHandshakeData(isServer, context = {}) {
+    if (typeof this.options.handshakeBuilder !== 'function') {
+      return {};
+    }
+    try {
+      const result = this.options.handshakeBuilder({
+        isServer,
+        ...context
+      });
+      if (!result || typeof result !== 'object') {
+        return {};
+      }
+      return result;
+    } catch (error) {
+      this.logger?.warn?.('handshakeBuilder failed', {
+        error: error?.message || error
+      });
+      return {};
+    }
+  }
+
   async destroy() {
     this.logger?.info?.('Destroying hyperswarm pool, closing connections', {
       connectionCount: this.connections.size

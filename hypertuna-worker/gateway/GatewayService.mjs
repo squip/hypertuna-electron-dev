@@ -183,7 +183,8 @@ export class GatewayService extends EventEmitter {
     this.connectionPool = new EnhancedHyperswarmPool({
       onProtocol: this._onProtocolCreated.bind(this),
       onHandshake: this._onProtocolHandshake.bind(this),
-      onTelemetry: this._onPeerTelemetry.bind(this)
+      onTelemetry: this._onPeerTelemetry.bind(this),
+      handshakeBuilder: this.#buildHandshakePayload.bind(this)
     });
     this.peerHealthManager = new PeerHealthManager();
     this.activePeers = [];
@@ -240,6 +241,7 @@ export class GatewayService extends EventEmitter {
       lastErrorAt: null,
       lastErrorMessage: null
     };
+    this.publicGatewayReplicaMetrics = null;
     this.ownPeerPublicKey = typeof options.getOwnPeerPublicKey === 'function'
       ? options.getOwnPeerPublicKey()
       : (options.ownPeerPublicKey || null);
@@ -1286,6 +1288,40 @@ export class GatewayService extends EventEmitter {
     });
   }
 
+  #buildHandshakePayload({ isServer }) {
+    const peerId = this.ownPeerPublicKey
+      || this.connectionPool?.getPublicKey?.()
+      || this.getCurrentPubkey?.()
+      || null;
+    const relayCount = this.activeRelays?.size || 0;
+    const replicaInfo = this.getPublicGatewayReplicaInfo();
+
+    const payload = {
+      role: 'gateway-replica',
+      isGateway: false,
+      gatewayReplica: true,
+      peerId,
+      relayCount,
+      delegateReqToPeers: !!this.publicGatewaySettings?.delegateReqToPeers,
+      isServer: !!isServer
+    };
+
+    if (replicaInfo) {
+      payload.hyperbeeKey = replicaInfo.hyperbeeKey || null;
+      payload.hyperbeeDiscoveryKey = replicaInfo.discoveryKey || null;
+      payload.hyperbeeLength = replicaInfo.length || 0;
+      payload.hyperbeeContiguousLength = replicaInfo.contiguousLength || 0;
+      payload.hyperbeeLag = replicaInfo.lag || 0;
+      payload.hyperbeeVersion = replicaInfo.version || 0;
+      payload.hyperbeeUpdatedAt = replicaInfo.updatedAt || 0;
+      if (replicaInfo.telemetry) {
+        payload.telemetry = replicaInfo.telemetry;
+      }
+    }
+
+    return payload;
+  }
+
   _onProtocolHandshake({ publicKey, protocol, handshake, context = {} }) {
     if (!handshake) return;
     this.peerHandshakes.set(publicKey, handshake);
@@ -1542,6 +1578,36 @@ export class GatewayService extends EventEmitter {
     };
   }
 
+  getPublicGatewayReplicaInfo() {
+    const snapshot = this.publicGatewayRelayClient?.getReplicaSnapshot?.() || null;
+    const telemetry = this.publicGatewayReplicaMetrics ? { ...this.publicGatewayReplicaMetrics } : null;
+    if (!snapshot) {
+      return {
+        hyperbeeKey: null,
+        discoveryKey: null,
+        length: 0,
+        contiguousLength: 0,
+        lag: 0,
+        version: 0,
+        updatedAt: 0,
+        telemetry,
+        delegateReqToPeers: !!this.publicGatewaySettings?.delegateReqToPeers
+      };
+    }
+
+    return {
+      hyperbeeKey: snapshot.hyperbeeKey || null,
+      discoveryKey: snapshot.discoveryKey || null,
+      length: Number.isFinite(snapshot.length) ? snapshot.length : 0,
+      contiguousLength: Number.isFinite(snapshot.contiguousLength) ? snapshot.contiguousLength : 0,
+      lag: Number.isFinite(snapshot.lag) ? snapshot.lag : 0,
+      version: Number.isFinite(snapshot.version) ? snapshot.version : 0,
+      updatedAt: Number.isFinite(snapshot.updatedAt) ? snapshot.updatedAt : 0,
+      telemetry,
+      delegateReqToPeers: !!this.publicGatewaySettings?.delegateReqToPeers
+    };
+  }
+
   async syncPublicGatewayRelay(relayKey, { forceTokenRefresh = true } = {}) {
     await this.#syncPublicGatewayRelay(relayKey, { forceTokenRefresh });
   }
@@ -1748,11 +1814,31 @@ export class GatewayService extends EventEmitter {
 
     let hyperbeeVersion = 0;
     let hyperbeeLag = 0;
+    let hyperbeeContiguousLength = 0;
+    let hyperbeeLength = 0;
+    let hyperbeeLastUpdatedAt = 0;
+    let hyperbeeKey = null;
+    let hyperbeeDiscoveryKey = null;
     if (this.publicGatewayRelayClient) {
       try {
         const telemetry = await this.publicGatewayRelayClient.getTelemetry();
         hyperbeeVersion = telemetry?.hyperbeeVersion || 0;
         hyperbeeLag = telemetry?.hyperbeeLag || 0;
+        hyperbeeContiguousLength = telemetry?.hyperbeeContiguousLength || 0;
+        hyperbeeLength = telemetry?.hyperbeeLength || 0;
+        hyperbeeLastUpdatedAt = telemetry?.hyperbeeLastUpdatedAt || 0;
+        hyperbeeKey = telemetry?.hyperbeeKey || null;
+        hyperbeeDiscoveryKey = telemetry?.hyperbeeDiscoveryKey || null;
+        this.publicGatewayReplicaMetrics = {
+          hyperbeeVersion,
+          hyperbeeLag,
+          hyperbeeContiguousLength,
+          hyperbeeLength,
+          hyperbeeLastUpdatedAt,
+          hyperbeeKey,
+          hyperbeeDiscoveryKey,
+          recordedAt: Date.now()
+        };
       } catch (error) {
         this.log('debug', `[PublicGateway] Hyperbee telemetry error: ${error.message}`);
       }
@@ -1767,6 +1853,11 @@ export class GatewayService extends EventEmitter {
       failureRate,
       hyperbeeVersion,
       hyperbeeLag,
+      hyperbeeContiguousLength,
+      hyperbeeLength,
+      hyperbeeLastUpdatedAt,
+      hyperbeeKey,
+      hyperbeeDiscoveryKey,
       queueDepth,
       reportedAt: Date.now(),
       hyperbeeServed: this.hyperbeeQueryStats?.totalServed || 0,
@@ -2214,6 +2305,32 @@ export class GatewayService extends EventEmitter {
           nextMetadata.isPublic = true;
         }
 
+        if (typeof relayObj.isGatewayReplica === 'boolean') {
+          nextMetadata.isGatewayReplica = relayObj.isGatewayReplica;
+        }
+
+        if (relayObj.gatewayRelay && typeof relayObj.gatewayRelay === 'object') {
+          nextMetadata.gatewayRelay = {
+            ...(nextMetadata.gatewayRelay || {}),
+            ...relayObj.gatewayRelay
+          };
+        }
+
+        if (relayObj.replicaMetrics && typeof relayObj.replicaMetrics === 'object') {
+          nextMetadata.replicaMetrics = {
+            ...(nextMetadata.replicaMetrics || {}),
+            ...relayObj.replicaMetrics
+          };
+        }
+
+        if (relayObj.replicaTelemetry && typeof relayObj.replicaTelemetry === 'object') {
+          nextMetadata.replicaTelemetry = relayObj.replicaTelemetry;
+        }
+
+        if (typeof relayObj.delegateReqToPeers === 'boolean') {
+          nextMetadata.delegateReqToPeers = relayObj.delegateReqToPeers;
+        }
+
         const incomingTimestamp = this._coerceTimestamp(relayObj.metadataUpdatedAt);
         const existingTimestamp = this._coerceTimestamp(prevMetadata.metadataUpdatedAt);
         if (incomingTimestamp !== null) {
@@ -2223,8 +2340,24 @@ export class GatewayService extends EventEmitter {
         }
 
         relayData.metadata = nextMetadata;
+        if (nextMetadata.replicaMetrics) {
+          relayData.replicaMetrics = { ...nextMetadata.replicaMetrics };
+        }
+        if (nextMetadata.replicaTelemetry) {
+          relayData.replicaTelemetry = { ...nextMetadata.replicaTelemetry };
+        }
+        if (typeof nextMetadata.isGatewayReplica === 'boolean') {
+          relayData.isGatewayReplica = nextMetadata.isGatewayReplica;
+        }
         updatedRelays.push(identifier);
       });
+    }
+
+    if (data.gatewayReplica && typeof data.gatewayReplica === 'object') {
+      peer.gatewayReplica = {
+        ...(peer.gatewayReplica || {}),
+        ...data.gatewayReplica
+      };
     }
 
     peer.address = address || null;

@@ -80,7 +80,9 @@ class PublicGatewayService {
     this.wss = null;
     this.featureFlags = {
       hyperbeeRelayEnabled: !!config?.features?.hyperbeeRelayEnabled,
-      dispatcherEnabled: !!config?.features?.dispatcherEnabled,
+      dispatcherEnabled: config?.features?.dispatcherEnabled === undefined
+        ? true
+        : !!config?.features?.dispatcherEnabled,
       tokenEnforcementEnabled: !!config?.features?.tokenEnforcementEnabled
     };
     this.relayConfig = this.#normalizeRelayConfig(config?.relay);
@@ -103,7 +105,8 @@ class PublicGatewayService {
       logger: this.logger,
       onProtocol: this.#onProtocolCreated.bind(this),
       onHandshake: this.#onProtocolHandshake.bind(this),
-      onTelemetry: this.#handlePeerTelemetry.bind(this)
+      onTelemetry: this.#handlePeerTelemetry.bind(this),
+      handshakeBuilder: this.#buildHandshakePayload.bind(this)
     });
 
     this.sessions = new Map();
@@ -111,6 +114,8 @@ class PublicGatewayService {
     this.pruneInterval = null;
     this.eventCheckTimers = new Map();
     this.relayPeerIndex = new Map();
+    this.peerMetadata = new Map();
+    this.publicGatewayStatusUpdatedAt = null;
   }
 
   async init() {
@@ -1138,8 +1143,9 @@ class PublicGatewayService {
     session.peerKey = peerKey;
   }
 
-  #handlePeerTelemetry({ publicKey, payload }) {
-    if (!this.dispatcher || !payload) return;
+  async #handlePeerTelemetry({ publicKey, payload }) {
+    if (!publicKey || !payload) return;
+
     const metrics = {
       peerId: publicKey,
       latencyMs: Number(payload.latencyMs) || 0,
@@ -1151,7 +1157,52 @@ class PublicGatewayService {
       reportedAt: Number(payload.reportedAt) || Date.now(),
       tokenExpiresAt: payload.tokenExpiresAt
     };
-    this.dispatcher.reportPeerMetrics(publicKey, metrics);
+    this.dispatcher?.reportPeerMetrics(publicKey, metrics);
+
+    const entry = this.peerMetadata.get(publicKey) || {};
+    entry.telemetry = payload;
+    entry.lastTelemetryAt = Date.now();
+    this.peerMetadata.set(publicKey, entry);
+
+    const handshake = entry.handshake || {};
+    const isReplica = handshake.gatewayReplica === true
+      || handshake.role === 'gateway-replica'
+      || payload.gatewayReplica === true;
+
+    if (isReplica || payload.hyperbeeKey || payload.hyperbeeLag !== undefined) {
+      const gatewayRelay = {
+        hyperbeeKey: payload.hyperbeeKey || handshake.hyperbeeKey || null,
+        discoveryKey: payload.hyperbeeDiscoveryKey || handshake.hyperbeeDiscoveryKey || null,
+        replicationTopic: payload.replicationTopic || null
+      };
+
+      const replicaMetrics = {
+        length: Number(payload.hyperbeeLength) || Number(handshake.hyperbeeLength) || 0,
+        contiguousLength: Number(payload.hyperbeeContiguousLength) || Number(handshake.hyperbeeContiguousLength) || 0,
+        lag: Number(payload.hyperbeeLag) || Number(handshake.hyperbeeLag) || 0,
+        version: Number(payload.hyperbeeVersion) || Number(handshake.hyperbeeVersion) || 0,
+        updatedAt: Number(payload.hyperbeeLastUpdatedAt) || Number(payload.reportedAt) || Date.now()
+      };
+
+      const delegateReqToPeers = typeof payload.delegateReqToPeers === 'boolean'
+        ? payload.delegateReqToPeers
+        : (typeof handshake.delegateReqToPeers === 'boolean' ? handshake.delegateReqToPeers : null);
+
+      try {
+        await this.#upsertInternalReplicaPeer(publicKey, {
+          gatewayRelay,
+          replicaMetrics,
+          replicaTelemetry: payload,
+          delegateReqToPeers
+        });
+        this.#emitPublicGatewayStatus();
+      } catch (error) {
+        this.logger?.warn?.('Failed to update replica telemetry for peer', {
+          peer: publicKey,
+          error: error?.message || error
+        });
+      }
+    }
   }
 
   #getRelayHostInfo() {
@@ -1184,6 +1235,40 @@ class PublicGatewayService {
       tokenRefreshWindowSeconds: sanitizePositive(registrationConfig.tokenRefreshWindowSeconds),
       dispatcher: hasDispatcher ? dispatcherInfo : null
     };
+  }
+
+  #coerceTimestamp(value) {
+    if (value === null || value === undefined) return null;
+    if (typeof value === 'number' && Number.isFinite(value)) {
+      return value;
+    }
+    const parsed = Date.parse(value);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+
+  #emitPublicGatewayStatus() {
+    this.publicGatewayStatusUpdatedAt = Date.now();
+    if (!this.logger?.debug) return;
+
+    let relayCount;
+    const storeItems = this.registrationStore?.items;
+    if (storeItems && typeof storeItems.size === 'number') {
+      relayCount = storeItems.size;
+    }
+
+    const peerCount = (() => {
+      try {
+        return this.connectionPool?.connections?.size;
+      } catch (_) {
+        return undefined;
+      }
+    })();
+
+    this.logger.debug('[PublicGateway] Replica status updated', {
+      relayCount,
+      peerCount,
+      updatedAt: this.publicGatewayStatusUpdatedAt
+    });
   }
 
   #verifySignedPayload(payload, signature) {
@@ -1322,6 +1407,284 @@ class PublicGatewayService {
     return disconnected;
   }
 
+  async #handleGatewayHyperswarmRegistration(peerKey, request) {
+    const method = typeof request?.method === 'string' ? request.method.toUpperCase() : 'GET';
+    if (method !== 'POST') {
+      return {
+        statusCode: 405,
+        headers: { 'content-type': 'application/json' },
+        body: Buffer.from(JSON.stringify({ error: 'method-not-allowed' }))
+      };
+    }
+
+    let payload = {};
+    if (request?.body && request.body.length) {
+      try {
+        payload = JSON.parse(Buffer.from(request.body).toString());
+      } catch (error) {
+        this.logger.warn?.('Failed to parse Hyperswarm registration payload', {
+          peer: peerKey,
+          error: error?.message || error
+        });
+        return {
+          statusCode: 400,
+          headers: { 'content-type': 'application/json' },
+          body: Buffer.from(JSON.stringify({ error: 'invalid-json' }))
+        };
+      }
+    }
+
+    if (!payload || typeof payload !== 'object') {
+      payload = {};
+    }
+
+    payload.publicKey = payload.publicKey || peerKey;
+
+    const now = Date.now();
+    const relays = Array.isArray(payload.relays) ? payload.relays : [];
+
+    for (const entry of relays) {
+      let relayKey = null;
+      let relayPayload = entry;
+      if (typeof entry === 'string') {
+        relayKey = entry;
+        relayPayload = { identifier: entry };
+      } else if (entry && typeof entry === 'object') {
+        relayKey = entry.identifier || entry.relayKey || null;
+      }
+      if (!relayKey) continue;
+
+      try {
+        await this.#mergeRelayRegistration(relayKey, peerKey, relayPayload, payload.gatewayReplica, now);
+      } catch (error) {
+        this.logger.error?.('Failed to merge relay registration from peer', {
+          relayKey,
+          peer: peerKey,
+          error: error?.message || error
+        });
+      }
+    }
+
+    if (payload.gatewayReplica && typeof payload.gatewayReplica === 'object') {
+      const gatewayRelay = {
+        hyperbeeKey: payload.gatewayReplica.hyperbeeKey || null,
+        discoveryKey: payload.gatewayReplica.discoveryKey || null,
+        replicationTopic: payload.gatewayReplica.replicationTopic || null
+      };
+      const replicaMetrics = {
+        length: Number(payload.gatewayReplica.length) || 0,
+        contiguousLength: Number(payload.gatewayReplica.contiguousLength) || 0,
+        lag: Number(payload.gatewayReplica.lag) || 0,
+        version: Number(payload.gatewayReplica.version) || 0,
+        updatedAt: Number(payload.gatewayReplica.updatedAt) || now
+      };
+      const replicaTelemetry = payload.gatewayReplica.telemetry || null;
+      const delegateReqToPeers = typeof payload.gatewayReplica.delegateReqToPeers === 'boolean'
+        ? payload.gatewayReplica.delegateReqToPeers
+        : null;
+
+      await this.#upsertInternalReplicaPeer(peerKey, {
+        gatewayRelay,
+        replicaMetrics,
+        replicaTelemetry,
+        delegateReqToPeers
+      });
+    }
+
+    const peerEntry = this.peerMetadata.get(peerKey) || {};
+    peerEntry.registration = payload;
+    peerEntry.lastRegistrationAt = now;
+    this.peerMetadata.set(peerKey, peerEntry);
+
+    this.#emitPublicGatewayStatus();
+
+    return {
+      statusCode: 200,
+      headers: { 'content-type': 'application/json' },
+      body: Buffer.from(JSON.stringify({
+        status: 'ok',
+        hyperbee: this.#getRelayHostInfo()
+      }))
+    };
+  }
+
+  async #mergeRelayRegistration(relayKey, peerKey, relayPayload = {}, globalReplicaPayload = null, now = Date.now()) {
+    if (!relayKey || !peerKey) return;
+
+    const existing = await this.registrationStore.getRelay(relayKey);
+    const peers = new Set(Array.isArray(existing?.peers) ? existing.peers : []);
+    peers.add(peerKey);
+
+    const metadata = { ...(existing?.metadata || {}) };
+    metadata.identifier = metadata.identifier || relayKey;
+
+    const maybeString = (value) => (typeof value === 'string' && value.trim().length ? value.trim() : null);
+
+    const name = maybeString(relayPayload?.name);
+    if (name) metadata.name = name;
+
+    if (relayPayload?.description !== undefined) {
+      const desc = maybeString(relayPayload.description);
+      metadata.description = desc || null;
+    }
+
+    const avatar = maybeString(relayPayload?.avatarUrl);
+    if (avatar !== null) {
+      metadata.avatarUrl = avatar;
+    } else if (relayPayload?.avatarUrl === null) {
+      metadata.avatarUrl = null;
+    }
+
+    const gatewayPath = maybeString(relayPayload?.gatewayPath);
+    if (gatewayPath) {
+      metadata.gatewayPath = gatewayPath;
+    }
+
+    if (typeof relayPayload?.isPublic === 'boolean') {
+      metadata.isPublic = relayPayload.isPublic;
+    }
+
+    if (typeof relayPayload?.isGatewayReplica === 'boolean') {
+      metadata.isGatewayReplica = relayPayload.isGatewayReplica;
+    }
+
+    const incomingTimestamp = this.#coerceTimestamp(relayPayload?.metadataUpdatedAt);
+    const existingTimestamp = this.#coerceTimestamp(metadata.metadataUpdatedAt);
+    if (incomingTimestamp !== null) {
+      if (existingTimestamp === null || incomingTimestamp >= existingTimestamp) {
+        metadata.metadataUpdatedAt = incomingTimestamp;
+      }
+    }
+
+    if (relayPayload?.metadataEventId) {
+      metadata.metadataEventId = relayPayload.metadataEventId;
+    }
+
+    if (relayPayload?.gatewayRelay && typeof relayPayload.gatewayRelay === 'object') {
+      metadata.gatewayRelay = {
+        ...(metadata.gatewayRelay || {}),
+        ...relayPayload.gatewayRelay
+      };
+    }
+
+    if (relayPayload?.replicaMetrics && typeof relayPayload.replicaMetrics === 'object') {
+      metadata.replicaMetrics = {
+        ...(metadata.replicaMetrics || {}),
+        ...relayPayload.replicaMetrics,
+        peerId: peerKey,
+        updatedAt: now
+      };
+    }
+
+    if (relayPayload?.replicaTelemetry && typeof relayPayload.replicaTelemetry === 'object') {
+      metadata.replicaTelemetry = relayPayload.replicaTelemetry;
+    }
+
+    if (typeof relayPayload?.delegateReqToPeers === 'boolean') {
+      metadata.delegateReqToPeers = relayPayload.delegateReqToPeers;
+    }
+
+    metadata.lastPeerUpdateAt = now;
+
+    const record = {
+      relayKey,
+      peers: Array.from(peers),
+      metadata,
+      registeredAt: existing?.registeredAt || now,
+      updatedAt: now
+    };
+
+    if (metadata.isGatewayReplica) {
+      const gatewayReplica = { ...(existing?.gatewayReplica || {}) };
+      gatewayReplica.peerId = peerKey;
+      gatewayReplica.updatedAt = now;
+
+      if (metadata.gatewayRelay) {
+        Object.assign(gatewayReplica, metadata.gatewayRelay);
+      }
+
+      if (globalReplicaPayload && typeof globalReplicaPayload === 'object') {
+        if (globalReplicaPayload.hyperbeeKey) {
+          gatewayReplica.hyperbeeKey = globalReplicaPayload.hyperbeeKey;
+        }
+        if (globalReplicaPayload.discoveryKey) {
+          gatewayReplica.discoveryKey = globalReplicaPayload.discoveryKey;
+        }
+        if (typeof globalReplicaPayload.delegateReqToPeers === 'boolean') {
+          gatewayReplica.delegateReqToPeers = globalReplicaPayload.delegateReqToPeers;
+        }
+        if (globalReplicaPayload.telemetry && typeof globalReplicaPayload.telemetry === 'object') {
+          gatewayReplica.telemetry = globalReplicaPayload.telemetry;
+        }
+
+        const replicaMetrics = {};
+        const toNumber = (value) => {
+          const num = Number(value);
+          return Number.isFinite(num) ? num : null;
+        };
+        const lengthVal = toNumber(globalReplicaPayload.length);
+        if (lengthVal !== null) replicaMetrics.length = lengthVal;
+        const contiguousVal = toNumber(globalReplicaPayload.contiguousLength);
+        if (contiguousVal !== null) replicaMetrics.contiguousLength = contiguousVal;
+        const lagVal = toNumber(globalReplicaPayload.lag);
+        if (lagVal !== null) replicaMetrics.lag = lagVal;
+        const versionVal = toNumber(globalReplicaPayload.version);
+        if (versionVal !== null) replicaMetrics.version = versionVal;
+        const updatedVal = toNumber(globalReplicaPayload.updatedAt);
+        if (updatedVal !== null) replicaMetrics.updatedAt = updatedVal;
+
+        if (Object.keys(replicaMetrics).length) {
+          gatewayReplica.metrics = {
+            ...(gatewayReplica.metrics || {}),
+            ...replicaMetrics,
+            peerId,
+            reportedAt: now
+          };
+        }
+      }
+
+      if (metadata.replicaMetrics) {
+        gatewayReplica.metrics = {
+          ...(gatewayReplica.metrics || {}),
+          ...metadata.replicaMetrics
+        };
+      }
+
+      if (metadata.replicaTelemetry) {
+        gatewayReplica.telemetry = metadata.replicaTelemetry;
+      }
+
+      record.gatewayReplica = gatewayReplica;
+    } else if (existing?.gatewayReplica) {
+      record.gatewayReplica = existing.gatewayReplica;
+    }
+
+    await this.registrationStore.upsertRelay(relayKey, record);
+  }
+
+  async #upsertInternalReplicaPeer(peerKey, { gatewayRelay = {}, replicaMetrics = null, replicaTelemetry = null, delegateReqToPeers = null } = {}) {
+    const relayKey = this.internalRelayKey;
+    const payload = {
+      identifier: relayKey,
+      isGatewayReplica: true,
+      gatewayRelay,
+      replicaMetrics,
+      replicaTelemetry,
+      delegateReqToPeers
+    };
+    await this.#mergeRelayRegistration(relayKey, peerKey, payload, {
+      hyperbeeKey: gatewayRelay?.hyperbeeKey,
+      discoveryKey: gatewayRelay?.discoveryKey,
+      length: replicaMetrics?.length,
+      contiguousLength: replicaMetrics?.contiguousLength,
+      lag: replicaMetrics?.lag,
+      version: replicaMetrics?.version,
+      updatedAt: replicaMetrics?.updatedAt,
+      telemetry: replicaTelemetry,
+      delegateReqToPeers
+    });
+  }
+
   async #handleRelayRegistration(req, res) {
     if (!this.sharedSecret) {
       return res.status(503).json({ error: 'Registration disabled' });
@@ -1442,12 +1805,124 @@ class PublicGatewayService {
     };
   }
 
-  #onProtocolCreated() {
-    // Placeholder for protocol setup hooks
+  #onProtocolCreated({ publicKey, protocol }) {
+    if (!protocol || !publicKey) return;
+
+    protocol.handle('/gateway/register', async (request) => {
+      try {
+        return await this.#handleGatewayHyperswarmRegistration(publicKey, request);
+      } catch (error) {
+        this.logger.error?.('Hyperswarm registration handler failed', {
+          peer: publicKey,
+          error: error?.message || error
+        });
+        return {
+          statusCode: 500,
+          headers: { 'content-type': 'application/json' },
+          body: Buffer.from(JSON.stringify({ error: 'registration-failed' }))
+        };
+      }
+    });
+
+    const cleanup = () => {
+      this.peerMetadata.delete(publicKey);
+    };
+    protocol.once('close', cleanup);
+    protocol.once('destroy', cleanup);
   }
 
-  #onProtocolHandshake() {
-    // Placeholder for handshake accounting
+  #buildHandshakePayload({ isServer }) {
+    const payload = {
+      role: 'gateway',
+      isGateway: true,
+      gatewayReplica: false,
+      dispatcherEnabled: !!this.featureFlags?.dispatcherEnabled,
+      hyperbeeRelayEnabled: this.#isHyperbeeRelayEnabled(),
+      isServer: !!isServer
+    };
+
+    if (typeof this.relayHost?.getPublicKey === 'function') {
+      payload.hyperbeeKey = this.relayHost.getPublicKey();
+    }
+    if (typeof this.relayHost?.getDiscoveryKey === 'function') {
+      payload.hyperbeeDiscoveryKey = this.relayHost.getDiscoveryKey();
+    }
+
+    const core = typeof this.relayHost?.getCore === 'function' ? this.relayHost.getCore() : null;
+    if (core) {
+      const length = typeof core.length === 'number' ? core.length : 0;
+      const contiguous = typeof core.contiguousLength === 'number' ? core.contiguousLength : length;
+      payload.hyperbeeLength = length;
+      payload.hyperbeeContiguousLength = contiguous;
+      payload.hyperbeeLag = Math.max(0, length - contiguous);
+      payload.hyperbeeUpdatedAt = core?.header?.timestamp || null;
+    }
+
+    const hyperbee = this.hyperbeeAdapter?.hyperbee || null;
+    if (hyperbee) {
+      payload.hyperbeeVersion = hyperbee.version || 0;
+    }
+
+    return payload;
+  }
+
+  #onProtocolHandshake({ publicKey, handshake }) {
+    if (!publicKey || !handshake) return;
+
+    const entry = this.peerMetadata.get(publicKey) || {};
+    entry.handshake = handshake;
+    entry.lastHandshakeAt = Date.now();
+    this.peerMetadata.set(publicKey, entry);
+
+    const isReplica = handshake.gatewayReplica === true
+      || handshake.role === 'gateway-replica'
+      || handshake.gatewayReplica === 'true'
+      || handshake.gatewayReplica === 1;
+
+    if (isReplica) {
+      const gatewayRelay = {
+        hyperbeeKey: handshake.hyperbeeKey || null,
+        discoveryKey: handshake.hyperbeeDiscoveryKey || null
+      };
+      const replicaMetrics = {
+        length: Number(handshake.hyperbeeLength) || 0,
+        contiguousLength: Number(handshake.hyperbeeContiguousLength) || 0,
+        lag: Number(handshake.hyperbeeLag) || 0,
+        version: Number(handshake.hyperbeeVersion) || 0,
+        updatedAt: Number(handshake.hyperbeeUpdatedAt) || Date.now()
+      };
+      const replicaTelemetry = handshake.telemetry && typeof handshake.telemetry === 'object'
+        ? handshake.telemetry
+        : null;
+      const delegateReqToPeers = typeof handshake.delegateReqToPeers === 'boolean'
+        ? handshake.delegateReqToPeers
+        : null;
+
+      this.#upsertInternalReplicaPeer(publicKey, {
+        gatewayRelay,
+        replicaMetrics,
+        replicaTelemetry,
+        delegateReqToPeers
+      }).then(() => {
+        this.#emitPublicGatewayStatus();
+      }).catch((error) => {
+        this.logger?.warn?.('Failed to apply replica data from handshake', {
+          peer: publicKey,
+          error: error?.message || error
+        });
+      });
+
+      this.dispatcher?.reportPeerMetrics(publicKey, {
+        peerId: publicKey,
+        latencyMs: Number(handshake.latencyMs) || 0,
+        inFlightJobs: Number(handshake.inFlightJobs) || 0,
+        failureRate: Number(handshake.failureRate) || 0,
+        hyperbeeVersion: Number(handshake.hyperbeeVersion) || 0,
+        hyperbeeLag: Number(handshake.hyperbeeLag) || 0,
+        queueDepth: Number(handshake.queueDepth) || 0,
+        reportedAt: Date.now()
+      });
+    }
   }
 
   #collectMetrics() {
