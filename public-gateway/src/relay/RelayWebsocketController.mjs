@@ -157,14 +157,14 @@ export default class RelayWebsocketController {
         this.#incrementReq('scheduled');
         if (decision?.status === 'rejected') {
           this.#sendNotice(session, decision?.reason || 'Subscription rejected');
-          await this.#forwardLegacy(session, rawMessage, null, { subscriptionId });
+          await this.#forwardLegacy(session, rawMessage, null, { subscriptionId, storePending: true });
           return;
         }
 
         if (decision?.status === 'assigned' && decision.assignedPeer) {
           session.assignPeer?.(decision.assignedPeer, subscriptionId);
           try {
-            await this.#forwardLegacy(session, rawMessage, decision.assignedPeer, { subscriptionId });
+            await this.#forwardLegacy(session, rawMessage, decision.assignedPeer, { subscriptionId, storePending: true });
             this.dispatcher.acknowledge(subscriptionId, { peerId: decision.assignedPeer });
           } catch (error) {
             this.dispatcher.fail(subscriptionId, { peerId: decision.assignedPeer, error: error?.message || error });
@@ -175,7 +175,7 @@ export default class RelayWebsocketController {
               peerId: decision.assignedPeer,
               error: error?.message || error
             });
-            await this.#forwardLegacy(session, rawMessage, null, { subscriptionId });
+            await this.#forwardLegacy(session, rawMessage, null, { subscriptionId, storePending: true });
           }
           return;
         }
@@ -185,13 +185,13 @@ export default class RelayWebsocketController {
           error: error?.message || error,
           relayKey: session.relayKey
         });
-        await this.#forwardLegacy(session, rawMessage, null, { subscriptionId });
+        await this.#forwardLegacy(session, rawMessage, null, { subscriptionId, storePending: true });
       }
       return;
     }
 
     this.#incrementReq('legacy-forward');
-    await this.#forwardLegacy(session, rawMessage, null, { subscriptionId });
+    await this.#forwardLegacy(session, rawMessage, null, { subscriptionId, storePending: true });
   }
 
   async #forwardLegacy(session, rawMessage, targetPeer = null, context = {}) {
