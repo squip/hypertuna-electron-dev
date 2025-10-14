@@ -502,15 +502,16 @@ class EnhancedHyperswarmPool {
     });
 
     if (this.options.onHandshake) {
-      const onOpen = (handshake) => {
+      const emitHandshake = (stage, handshake) => {
         try {
-          this.options.onHandshake({ publicKey, protocol, handshake, context });
+          this.options.onHandshake({ publicKey, protocol, handshake, context, stage });
         } catch (err) {
           // eslint-disable-next-line no-console
           console.warn('[EnhancedHyperswarmPool] onHandshake handler error:', err);
         }
       };
-      protocol.once('open', onOpen);
+      protocol.once('opening', emitHandshake.bind(null, 'opening'));
+      protocol.once('open', emitHandshake.bind(null, 'open'));
     }
   }
 

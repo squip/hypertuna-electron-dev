@@ -157,14 +157,14 @@ export default class RelayWebsocketController {
         this.#incrementReq('scheduled');
         if (decision?.status === 'rejected') {
           this.#sendNotice(session, decision?.reason || 'Subscription rejected');
-          await this.#forwardLegacy(session, rawMessage);
+          await this.#forwardLegacy(session, rawMessage, null, { subscriptionId });
           return;
         }
 
         if (decision?.status === 'assigned' && decision.assignedPeer) {
           session.assignPeer?.(decision.assignedPeer, subscriptionId);
           try {
-            await this.#forwardLegacy(session, rawMessage, decision.assignedPeer);
+            await this.#forwardLegacy(session, rawMessage, decision.assignedPeer, { subscriptionId });
             this.dispatcher.acknowledge(subscriptionId, { peerId: decision.assignedPeer });
           } catch (error) {
             this.dispatcher.fail(subscriptionId, { peerId: decision.assignedPeer, error: error?.message || error });
@@ -175,7 +175,7 @@ export default class RelayWebsocketController {
               peerId: decision.assignedPeer,
               error: error?.message || error
             });
-            await this.#forwardLegacy(session, rawMessage);
+            await this.#forwardLegacy(session, rawMessage, null, { subscriptionId });
           }
           return;
         }
@@ -185,22 +185,44 @@ export default class RelayWebsocketController {
           error: error?.message || error,
           relayKey: session.relayKey
         });
-        await this.#forwardLegacy(session, rawMessage);
+        await this.#forwardLegacy(session, rawMessage, null, { subscriptionId });
       }
       return;
     }
 
     this.#incrementReq('legacy-forward');
-    await this.#forwardLegacy(session, rawMessage);
+    await this.#forwardLegacy(session, rawMessage, null, { subscriptionId });
   }
 
-  async #forwardLegacy(session, rawMessage, targetPeer = null) {
+  async #forwardLegacy(session, rawMessage, targetPeer = null, context = {}) {
+    const subscriptionId = context?.subscriptionId || null;
     if (session?.localOnly) {
+      if (session?.delegateReqToPeers) {
+        if (!Array.isArray(session.pendingDelegatedMessages)) {
+          session.pendingDelegatedMessages = [];
+        }
+        const normalizedMessage = typeof rawMessage === 'string'
+          ? rawMessage
+          : Buffer.isBuffer(rawMessage)
+            ? rawMessage.toString('utf8')
+            : JSON.stringify(rawMessage);
+        session.pendingDelegatedMessages.push({
+          message: normalizedMessage,
+          preferredPeer: targetPeer || null,
+          queuedAt: Date.now(),
+          subscriptionId
+        });
+        this.logger.debug?.('[RelayWebsocketController] Queued delegated frame while session is local-only', {
+          relayKey: session.relayKey,
+          connectionKey: session.connectionKey,
+          queueLength: session.pendingDelegatedMessages.length
+        });
+      }
       return;
     }
 
     try {
-      await this.legacyForward(session, rawMessage, targetPeer);
+      await this.legacyForward(session, rawMessage, targetPeer, context);
     } catch (error) {
       this.#incrementError('legacy-forward');
       this.logger.warn?.('[RelayWebsocketController] Legacy forward failed', {
@@ -282,6 +304,14 @@ export default class RelayWebsocketController {
 
   async #serveReqFromHyperbee(session, subscriptionId, filters, lastReturnedAt) {
     if (!this.hyperbeeAdapter?.hasReplica?.()) {
+      return null;
+    }
+
+    if (session?.delegateReqToPeers === true && session?.localOnly !== true) {
+      this.logger.debug?.('[RelayWebsocketController] Skipping local serve due to delegation preference', {
+        relayKey: session.relayKey,
+        subscriptionId
+      });
       return null;
     }
 

@@ -38,6 +38,7 @@ import RelayWebsocketController from './relay/RelayWebsocketController.mjs';
 import RelayDispatcherService from './relay/RelayDispatcherService.mjs';
 import RelayTokenService from './relay/RelayTokenService.mjs';
 import PublicGatewayHyperbeeAdapter from '../../shared/public-gateway/PublicGatewayHyperbeeAdapter.mjs';
+import { openHyperbeeReplicationChannel } from '../../shared/public-gateway/hyperbeeReplicationChannel.mjs';
 
 function safeString(value) {
   if (typeof value === 'string') return value;
@@ -115,6 +116,7 @@ class PublicGatewayService {
     this.eventCheckTimers = new Map();
     this.relayPeerIndex = new Map();
     this.peerMetadata = new Map();
+    this.peerHyperbeeReplications = new Map();
     this.publicGatewayStatusUpdatedAt = null;
   }
 
@@ -405,7 +407,7 @@ class PublicGatewayService {
         reqCounter: relayReqCounter,
         errorCounter: relayErrorCounter
       },
-      legacyForward: (session, message, preferredPeer) => this.#forwardLegacyMessage(session, message, preferredPeer)
+      legacyForward: (session, message, preferredPeer, context = {}) => this.#forwardLegacyMessage(session, message, preferredPeer, context)
     });
 
     await this.#ensureInternalRelayRegistration();
@@ -592,6 +594,10 @@ class PublicGatewayService {
 
     const { payload: tokenPayload, relayAuthToken, pubkey: tokenPubkey, scope: tokenScope } = tokenValidation || {};
 
+    const metadata = registration?.metadata || {};
+    const delegateReqToPeers = metadata?.delegateReqToPeers === true
+      || registration?.gatewayReplica?.delegateReqToPeers === true;
+
     const availablePeers = this.#getPeersFromRegistration(registration);
     this.logger.info?.('Initializing websocket session - relay registration fetched', {
       relayKey,
@@ -656,10 +662,12 @@ class PublicGatewayService {
       peers,
       peerIndex,
       localOnly,
+      delegateReqToPeers,
       messageQueue: new MessageQueue(),
       openedAt: Date.now(),
       subscriptionPeers: new Map(),
-      assignPeer: null
+      assignPeer: null,
+      pendingDelegatedMessages: []
     };
     session.assignPeer = (assignedPeer, subscriptionId) => {
       if (session.localOnly) return;
@@ -724,7 +732,8 @@ class PublicGatewayService {
     sessionGauge.set(this.sessions.size);
   }
 
-  async #forwardLegacyMessage(session, msg, preferredPeer = null) {
+  async #forwardLegacyMessage(session, msg, preferredPeer = null, options = {}) {
+    const { allowQueue = true, subscriptionId = null } = options || {};
     const serialized = typeof msg === 'string' ? msg : safeString(msg);
     if (!serialized) {
       this.logger.warn?.('Failed to serialize legacy message', { relayKey: session.relayKey });
@@ -732,9 +741,26 @@ class PublicGatewayService {
     }
 
     if (!session?.peers?.length) {
-      this.logger.debug?.('Legacy forward skipped - no peers available for relay', {
-        relayKey: session?.relayKey
-      });
+      if (allowQueue && session?.delegateReqToPeers) {
+        if (!Array.isArray(session.pendingDelegatedMessages)) {
+          session.pendingDelegatedMessages = [];
+        }
+        session.pendingDelegatedMessages.push({
+          message: serialized,
+          preferredPeer: preferredPeer || null,
+          queuedAt: Date.now(),
+          subscriptionId
+        });
+        this.logger.debug?.('Queued delegated relay message pending peer availability', {
+          relayKey: session?.relayKey,
+          connectionKey: session?.connectionKey,
+          queueLength: session.pendingDelegatedMessages.length
+        });
+      } else {
+        this.logger.debug?.('Legacy forward skipped - no peers available for relay', {
+          relayKey: session?.relayKey
+        });
+      }
       return;
     }
 
@@ -759,11 +785,70 @@ class PublicGatewayService {
         }
       }
     } catch (error) {
+      const awaitingPeer = error?.message === 'delegated-session-awaiting-peer';
+      if (allowQueue && awaitingPeer && session?.delegateReqToPeers) {
+        if (!Array.isArray(session.pendingDelegatedMessages)) {
+          session.pendingDelegatedMessages = [];
+        }
+        session.pendingDelegatedMessages.push({
+          message: serialized,
+          preferredPeer: preferredPeer || null,
+          queuedAt: Date.now(),
+          subscriptionId
+        });
+        this.logger.debug?.('Queued delegated relay message while awaiting peer', {
+          relayKey: session?.relayKey,
+          connectionKey: session?.connectionKey,
+          queueLength: session.pendingDelegatedMessages.length
+        });
+        return;
+      }
+
       this.logger.warn?.('Forwarding message failed', { relayKey: session.relayKey, error: error.message });
       if (session.ws.readyState === WebSocket.OPEN) {
         session.ws.send(JSON.stringify(['NOTICE', `Error: ${error.message}`]));
       } else {
         this.#cleanupSession(session.connectionKey);
+      }
+    }
+  }
+
+  async #flushPendingDelegatedMessages(session, preferredPeer = null) {
+    if (!session || !Array.isArray(session.pendingDelegatedMessages) || !session.pendingDelegatedMessages.length) {
+      return;
+    }
+
+    const pending = session.pendingDelegatedMessages.splice(0);
+    for (const entry of pending) {
+      try {
+        const targetPeer = entry?.preferredPeer ?? preferredPeer ?? null;
+        await this.#forwardLegacyMessage(session, entry.message, targetPeer, {
+          allowQueue: false,
+          subscriptionId: entry?.subscriptionId || null
+        });
+        if (targetPeer && entry?.subscriptionId) {
+          session.assignPeer?.(targetPeer, entry.subscriptionId);
+        }
+      } catch (error) {
+        this.logger.debug?.('Failed to flush delegated message to peer', {
+          relayKey: session?.relayKey,
+          connectionKey: session?.connectionKey,
+          error: error?.message || error
+        });
+        if (entry) {
+          entry.retryCount = (entry.retryCount || 0) + 1;
+          const maxRetries = 5;
+          if (entry.retryCount <= maxRetries) {
+            session.pendingDelegatedMessages.unshift(entry);
+          } else {
+            this.logger.warn?.('Dropping delegated message after max retries', {
+              relayKey: session?.relayKey,
+              connectionKey: session?.connectionKey,
+              subscriptionId: entry?.subscriptionId || null
+            });
+          }
+        }
+        break;
       }
     }
   }
@@ -782,6 +867,14 @@ class PublicGatewayService {
           const registration = await this.registrationStore.getRelay(session.relayKey);
           if (registration) {
             session.peers = this.#getPeersFromRegistration(registration);
+          }
+
+          if (!session.localOnly
+            && session.delegateReqToPeers
+            && Array.isArray(session.pendingDelegatedMessages)
+            && session.pendingDelegatedMessages.length
+            && session.peers?.length) {
+            await this.#flushPendingDelegatedMessages(session);
           }
 
           const events = await this.#withPeer(session, async (peerKey) => {
@@ -882,10 +975,18 @@ class PublicGatewayService {
   #supportsLocalRelay(registration) {
     if (!registration) return false;
     if (!this.relayHost) return false;
+    const metadata = registration.metadata || {};
+    const delegateReqToPeers = metadata.delegateReqToPeers === true
+      || registration.gatewayReplica?.delegateReqToPeers === true;
+    if (delegateReqToPeers) {
+      const peerCount = this.#getPeersFromRegistration(registration).length;
+      if (peerCount > 0) return false;
+    }
+
     if (registration.relayKey === this.internalRelayKey) return true;
     if (registration.identifier === this.internalRelayKey) return true;
-    if (registration.metadata?.identifier === this.internalRelayKey) return true;
-    return registration.metadata?.isGatewayReplica === true;
+    if (metadata.identifier === this.internalRelayKey) return true;
+    return metadata.isGatewayReplica === true;
   }
 
   #selectPeer(registration) {
@@ -1083,7 +1184,19 @@ class PublicGatewayService {
   }
 
   async #withPeer(session, handler, options = {}) {
+    const sessionSupportsDelegation = session?.delegateReqToPeers === true
+      && session.localOnly === true
+      && Array.isArray(session.peers)
+      && session.peers.length > 0;
+
     if (!session.peers?.length) {
+      if (sessionSupportsDelegation) {
+        this.logger?.debug?.('Delegated session waiting for peer availability', {
+          relayKey: session?.relayKey,
+          connectionKey: session?.connectionKey
+        });
+        throw new Error('delegated-session-awaiting-peer');
+      }
       throw new Error('No peers registered for relay');
     }
 
@@ -1826,6 +1939,7 @@ class PublicGatewayService {
 
     const cleanup = () => {
       this.peerMetadata.delete(publicKey);
+      this.#detachHyperbeeReplication(publicKey);
     };
     protocol.once('close', cleanup);
     protocol.once('destroy', cleanup);
@@ -1866,8 +1980,15 @@ class PublicGatewayService {
     return payload;
   }
 
-  #onProtocolHandshake({ publicKey, handshake }) {
+  #onProtocolHandshake({ publicKey, protocol, handshake, stage = 'open' }) {
     if (!publicKey || !handshake) return;
+
+    this.logger.debug?.('[PublicGateway] Hyperswarm handshake event', {
+      peer: publicKey,
+      stage,
+      role: handshake?.role ?? 'unknown',
+      isGateway: handshake?.isGateway ?? 'unknown'
+    });
 
     const entry = this.peerMetadata.get(publicKey) || {};
     entry.handshake = handshake;
@@ -1912,6 +2033,20 @@ class PublicGatewayService {
         });
       });
 
+      this.#attachHyperbeeReplication(publicKey, protocol, handshake).catch((error) => {
+        this.logger?.warn?.('[PublicGateway] Failed to initialise replication channel', {
+          peer: publicKey,
+          error: error?.message || error
+        });
+      });
+
+      this.#promoteDelegatedSessions(publicKey).catch((error) => {
+        this.logger?.warn?.('Failed to promote delegated sessions to peer', {
+          peer: publicKey,
+          error: error?.message || error
+        });
+      });
+
       this.dispatcher?.reportPeerMetrics(publicKey, {
         peerId: publicKey,
         latencyMs: Number(handshake.latencyMs) || 0,
@@ -1928,6 +2063,209 @@ class PublicGatewayService {
   #collectMetrics() {
     sessionGauge.set(this.sessions.size);
     peerGauge.set(this.connectionPool.connections.size);
+  }
+
+  async #promoteDelegatedSessions(peerKey) {
+    if (!peerKey || !this.sessions.size) return;
+
+    for (const session of this.sessions.values()) {
+      if (!session || session.relayKey !== this.internalRelayKey) continue;
+      if (!session?.delegateReqToPeers) continue;
+      if (session.localOnly !== true) continue;
+      if (!session.ws || session.ws.readyState !== WebSocket.OPEN) continue;
+      if (!session.peers || !Array.isArray(session.peers)) {
+        session.peers = [];
+      }
+      if (!session.peers.includes(peerKey)) {
+        session.peers.push(peerKey);
+      }
+
+      session.peerKey = peerKey;
+      session.peerIndex = session.peers.indexOf(peerKey);
+
+      session.localOnly = false;
+      await this.#flushPendingDelegatedMessages(session, peerKey);
+
+      const snapshots = this.relayWebsocketController?.getSubscriptionSnapshot(session.connectionKey) || [];
+      if (!snapshots.length) {
+        continue;
+      }
+
+      for (const snapshot of snapshots) {
+        if (!snapshot?.subscriptionId || !Array.isArray(snapshot.filters)) continue;
+
+        const filters = snapshot.filters.map((filter) => this.#cloneDelegatedFilter(filter, snapshot.lastReturnedAt)).filter(Boolean);
+        if (!filters.length) continue;
+
+        const frame = ['REQ', snapshot.subscriptionId, ...filters];
+        try {
+          await this.#forwardLegacyMessage(session, JSON.stringify(frame), peerKey, {
+            subscriptionId: snapshot.subscriptionId
+          });
+          session.assignPeer?.(peerKey, snapshot.subscriptionId);
+        } catch (error) {
+          this.logger?.warn?.('Failed to delegate subscription to peer', {
+            relayKey: session.relayKey,
+            connectionKey: session.connectionKey,
+            subscriptionId: snapshot.subscriptionId,
+            peerKey,
+            error: error?.message || error
+          });
+        }
+      }
+    }
+  }
+
+  #cloneDelegatedFilter(filter, lastReturnedAt = null) {
+    if (!filter || typeof filter !== 'object') return null;
+    let clone;
+    try {
+      clone = JSON.parse(JSON.stringify(filter));
+    } catch (_) {
+      clone = { ...filter };
+      for (const key of Object.keys(clone)) {
+        if (Array.isArray(clone[key])) {
+          clone[key] = [...clone[key]];
+        }
+      }
+    }
+
+    if (Number.isFinite(lastReturnedAt)) {
+      const exclusiveCursor = lastReturnedAt + 1;
+      const existingSince = Number(clone.since);
+      if (!Number.isFinite(existingSince) || existingSince < exclusiveCursor) {
+        clone.since = exclusiveCursor;
+      }
+      if (Number.isFinite(clone.until) && clone.until < clone.since) {
+        delete clone.until;
+      }
+    }
+
+    return clone;
+  }
+
+  async #attachHyperbeeReplication(publicKey, protocol, handshake = {}) {
+    if (!this.relayHost?.getCore || typeof this.relayHost.getCore !== 'function') return;
+    if (!protocol) return;
+
+    const hostKey = this.relayHost.getPublicKey?.();
+    if (hostKey && handshake?.hyperbeeKey && handshake.hyperbeeKey !== hostKey) {
+      this.logger?.debug?.('[PublicGateway] Replica handshake hyperbee key mismatch, skipping replication', {
+        peer: publicKey,
+        expected: hostKey,
+        received: handshake.hyperbeeKey
+      });
+      return;
+    }
+
+    const core = this.relayHost.getCore();
+    if (!core) {
+      this.logger?.warn?.('[PublicGateway] Hyperbee relay core unavailable for replication', { peer: publicKey });
+      return;
+    }
+
+    if (this.peerHyperbeeReplications.has(publicKey)) {
+      this.logger?.debug?.('[PublicGateway] Replication already active for peer', { peer: publicKey });
+      return;
+    }
+
+    const isInitiator = protocol?.mux?.stream?.isInitiator === true;
+    const discoveryKey = this.relayHost.getDiscoveryKey?.();
+
+    try {
+      const { channel, stream, remoteHandshake } = await openHyperbeeReplicationChannel({
+        protocol,
+        hyperbeeKey: hostKey,
+        discoveryKey,
+        isInitiator,
+        role: 'gateway',
+        replicationMode: 'upload',
+        logger: this.logger
+      });
+
+      this.logger?.info?.('[PublicGateway] Outbound Hyperbee replication channel ready', {
+        peer: publicKey,
+        hyperbeeKey: hostKey,
+        isInitiator,
+        remoteHandshake
+      });
+
+      if (remoteHandshake?.version && remoteHandshake.version !== 1) {
+        this.logger?.warn?.('[PublicGateway] Remote replication channel version mismatch', {
+          peer: publicKey,
+          expected: 1,
+          received: remoteHandshake.version
+        });
+      }
+
+      let replication;
+      try {
+        replication = core.replicate(isInitiator, {
+          live: true,
+          download: false,
+          upload: true
+        });
+      } catch (error) {
+        try {
+          channel.close();
+        } catch (_) {}
+        throw error;
+      }
+
+      replication.on('handshake', () => {
+        this.logger?.debug?.('[PublicGateway] Hyperbee replication handshake (outbound)', {
+          peer: publicKey,
+          isInitiator,
+          localLength: core.length,
+          remoteLength: core.remoteLength
+        });
+      });
+
+      replication.on('error', (error) => {
+        this.logger?.warn?.('[PublicGateway] Hyperbee replication error (outbound)', {
+          peer: publicKey,
+          error: error?.message || error
+        });
+      });
+      replication.once('close', () => {
+        this.logger?.debug?.('[PublicGateway] Hyperbee replication stream closed (outbound)', {
+          peer: publicKey,
+          isInitiator
+        });
+      });
+
+      stream.pipe(replication).pipe(stream);
+
+      this.peerHyperbeeReplications.set(publicKey, { replication, stream, channel, remoteHandshake });
+
+      channel.fullyClosed().then(() => {
+        const entry = this.peerHyperbeeReplications.get(publicKey);
+        if (entry?.channel === channel) {
+          this.peerHyperbeeReplications.delete(publicKey);
+        }
+      }).catch(() => {});
+    } catch (error) {
+      this.logger?.warn?.('[PublicGateway] Failed to attach Hyperbee replication stream', {
+        peer: publicKey,
+        error: error?.message || error
+      });
+    }
+  }
+
+  #detachHyperbeeReplication(publicKey) {
+    if (!this.peerHyperbeeReplications.has(publicKey)) return;
+    const entry = this.peerHyperbeeReplications.get(publicKey);
+    try {
+      entry?.replication?.end?.();
+      entry?.replication?.destroy?.();
+    } catch (_) {}
+    try {
+      entry?.stream?.destroy?.();
+    } catch (_) {}
+    try {
+      entry?.channel?.close?.();
+    } catch (_) {}
+    this.peerHyperbeeReplications.delete(publicKey);
   }
 }
 

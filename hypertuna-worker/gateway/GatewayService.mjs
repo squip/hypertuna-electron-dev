@@ -214,6 +214,7 @@ export class GatewayService extends EventEmitter {
     };
     this.healthInterval = null;
     this.eventCheckTimers = new Map();
+    this.activePeerPolls = new Map();
     this.pfpOwnerIndex = new Map(); // owner -> Set<peerPublicKey>
     this.pfpDriveKeys = new Map(); // peerPublicKey -> driveKey
     this.peerHandshakes = new Map();
@@ -1322,12 +1323,12 @@ export class GatewayService extends EventEmitter {
     return payload;
   }
 
-  _onProtocolHandshake({ publicKey, protocol, handshake, context = {} }) {
+  _onProtocolHandshake({ publicKey, protocol, handshake, context = {}, stage = 'open' }) {
     if (!handshake) return;
     this.peerHandshakes.set(publicKey, handshake);
 
     const handshakeKeys = handshake ? Object.keys(handshake) : [];
-    const summary = `peer=${publicKey} role=${handshake?.role ?? 'unknown'} isGateway=${handshake?.isGateway ?? 'unknown'}`;
+    const summary = `peer=${publicKey} stage=${stage} role=${handshake?.role ?? 'unknown'} isGateway=${handshake?.isGateway ?? 'unknown'}`;
     this.log('debug', `[PublicGateway] Hyperswarm handshake received (${summary})`);
 
     if (handshake) {
@@ -1346,7 +1347,12 @@ export class GatewayService extends EventEmitter {
       this.emit('status', this.getStatus());
     }
 
-    if (handshake?.isGateway === true || handshake?.role === 'gateway' || this.#isResolvedGatewayPeer(publicKey, handshake)) {
+    const isGatewayLike = handshake?.isGateway === true
+      || handshake?.role === 'gateway'
+      || handshake?.role === 'gateway-replica'
+      || this.#isResolvedGatewayPeer(publicKey, handshake);
+
+    if (isGatewayLike) {
       if (protocol) {
         this.gatewayProtocols.set(publicKey, protocol);
         const cleanup = () => {
@@ -2722,7 +2728,8 @@ export class GatewayService extends EventEmitter {
       connectionKey,
       shouldPollPeers: false,
       delegatedSubscriptions: new Set(),
-      localServedSubscriptions: new Set()
+      localServedSubscriptions: new Set(),
+      pendingDelegations: new Map()
     });
 
     const messageQueue = new MessageQueue();
@@ -2750,12 +2757,16 @@ export class GatewayService extends EventEmitter {
           } catch (_) {}
         }
 
+        const wasPolling = connData.shouldPollPeers;
+        let shouldTriggerImmediatePoll = false;
+
         const localResult = await this.#maybeHandleReqLocally(connData, msg);
         if (localResult?.handled) {
           connData.shouldPollPeers = false;
           if (localResult.subscriptionId) {
             connData.localServedSubscriptions.add(localResult.subscriptionId);
             connData.delegatedSubscriptions.delete(localResult.subscriptionId);
+            connData.pendingDelegations?.delete?.(localResult.subscriptionId);
           }
           this.log('debug', `[PublicGateway] Served subscription locally`, {
             connectionKey,
@@ -2766,36 +2777,41 @@ export class GatewayService extends EventEmitter {
           return;
         }
 
-        if (localResult?.subscriptionId) {
-          connData.delegatedSubscriptions.add(localResult.subscriptionId);
-          connData.localServedSubscriptions.delete(localResult.subscriptionId);
-        }
-
-        if (localResult?.shouldPollPeers) {
-          connData.shouldPollPeers = true;
-        }
-
-        if (connData.delegatedSubscriptions.size > 0) {
-          connData.shouldPollPeers = true;
-        }
+        const subscriptionId = localResult?.subscriptionId || frameSubscriptionId || null;
+        const wantsDelegation = localResult?.shouldPollPeers === true && typeof subscriptionId === 'string';
 
         if (frameType === 'CLOSE' && frameSubscriptionId) {
           connData.delegatedSubscriptions.delete(frameSubscriptionId);
           connData.localServedSubscriptions.delete(frameSubscriptionId);
-          connData.shouldPollPeers = connData.delegatedSubscriptions.size > 0;
+          connData.pendingDelegations?.delete?.(frameSubscriptionId);
+          connData.shouldPollPeers = (connData.delegatedSubscriptions.size > 0) ||
+            (connData.pendingDelegations?.size > 0);
           this.log('debug', '[PublicGateway] Client closed subscription', {
             connectionKey,
             relayKey: connData.relayKey,
             subscriptionId: frameSubscriptionId,
             delegatedSubscriptions: connData.delegatedSubscriptions.size
           });
+          return;
         }
 
-        const healthyPeer = await this.findHealthyPeerForRelay(identifier);
+        if (wantsDelegation) {
+          const outboundMessage = typeof msg === 'string' ? msg : msg?.toString?.() ?? '';
+          connData.pendingDelegations?.set(subscriptionId, {
+            message: outboundMessage,
+            attempts: 0,
+            lastAttemptAt: Date.now()
+          });
+          connData.shouldPollPeers = true;
+        }
+
+        const healthyPeer = await this.findHealthyPeerForRelay(identifier, wantsDelegation);
         if (!healthyPeer) {
           if (ws.readyState === WebSocket.OPEN) {
             ws.send(JSON.stringify(['NOTICE', 'No healthy peers available for this relay']));
           }
+          connData.shouldPollPeers = (connData.delegatedSubscriptions.size > 0) ||
+            (connData.pendingDelegations?.size > 0);
           return;
         }
 
@@ -2803,19 +2819,20 @@ export class GatewayService extends EventEmitter {
           connectionKey,
           relayKey: identifier,
           peer: healthyPeer.publicKey?.slice(0, 12) || 'unknown',
-          delegated: connData.shouldPollPeers,
-          subscriptionId: localResult?.subscriptionId || frameSubscriptionId || null
+          delegated: wantsDelegation || connData.delegatedSubscriptions.size > 0,
+          subscriptionId
         });
 
+        let forwardSucceeded = false;
         try {
-          const responses = await forwardMessageToPeerHyperswarm(
-            healthyPeer.publicKey,
+          const responses = await this.#forwardMessageToPeer({
+            connData,
+            healthyPeer,
             identifier,
-            msg,
-            connectionKey,
-            this.connectionPool,
-            connData.authToken
-          );
+            rawMessage: msg,
+            subscriptionId,
+            isRetry: false
+          });
 
           for (const response of responses) {
             if (!response) continue;
@@ -2830,10 +2847,43 @@ export class GatewayService extends EventEmitter {
               ws.send(JSON.stringify(response));
             }
           }
+
+          forwardSucceeded = true;
         } catch (error) {
+          const pendingEntry = subscriptionId ? connData.pendingDelegations?.get?.(subscriptionId) : null;
+          if (pendingEntry) {
+            pendingEntry.attempts = (pendingEntry.attempts || 0) + 1;
+            pendingEntry.lastAttemptAt = Date.now();
+            connData.pendingDelegations.set(subscriptionId, pendingEntry);
+          }
           if (ws.readyState === WebSocket.OPEN) {
             ws.send(JSON.stringify(['NOTICE', `Error: ${error.message}`]));
           }
+          connData.shouldPollPeers = (connData.delegatedSubscriptions.size > 0) ||
+            (connData.pendingDelegations?.size > 0);
+          if (wantsDelegation) {
+            setTimeout(() => {
+              this.#pollDelegatedSubscriptions(connectionKey, {
+                reason: 'retry',
+                allowRetry: true
+              }).catch((err) => {
+                this.log('warn', `[PublicGateway] Delegation retry failed: ${err.message}`);
+              });
+            }, 250);
+          }
+          return;
+        }
+
+        connData.shouldPollPeers = (connData.delegatedSubscriptions.size > 0) ||
+          (connData.pendingDelegations?.size > 0) ||
+          (wantsDelegation && forwardSucceeded);
+
+        if (!wasPolling && connData.shouldPollPeers) {
+          shouldTriggerImmediatePoll = true;
+        }
+
+        if (shouldTriggerImmediatePoll && forwardSucceeded) {
+          await this.#pollDelegatedSubscriptions(connectionKey, { reason: 'immediate', allowRetry: true });
         }
       });
     });
@@ -3043,6 +3093,14 @@ export class GatewayService extends EventEmitter {
 
     const filterCount = filters.length;
 
+    if (this.publicGatewaySettings?.delegateReqToPeers === true) {
+      this.log(
+        'debug',
+        `[PublicGateway] Delegating based on configuration relay=${relayKey} subscription=${subscriptionId}`
+      );
+      return true;
+    }
+
     if (process.env.PUBLIC_GATEWAY_DELEGATE_REQS === 'true') {
       this.log(
         'debug',
@@ -3125,6 +3183,175 @@ export class GatewayService extends EventEmitter {
       clearTimeout(timer);
       this.eventCheckTimers.delete(connectionKey);
     }
+
+    data.pendingDelegations?.clear?.();
+    this.activePeerPolls.delete(connectionKey);
+  }
+
+  async #forwardMessageToPeer({ connData, healthyPeer, identifier, rawMessage, subscriptionId = null, isRetry = false }) {
+    if (!connData || !healthyPeer) {
+      throw new Error('Missing connection context for peer forwarding');
+    }
+
+    const outboundMessage = typeof rawMessage === 'string' ? rawMessage : rawMessage?.toString?.() ?? '';
+    const responses = await forwardMessageToPeerHyperswarm(
+      healthyPeer.publicKey,
+      identifier,
+      outboundMessage,
+      connData.connectionKey,
+      this.connectionPool,
+      connData.authToken
+    );
+
+    if (subscriptionId) {
+      connData.delegatedSubscriptions.add(subscriptionId);
+      connData.localServedSubscriptions.delete(subscriptionId);
+      connData.pendingDelegations?.delete?.(subscriptionId);
+      this.log('debug', '[PublicGateway] Delegated subscription forwarded to peer', {
+        connectionKey: connData.connectionKey,
+        relayKey: identifier,
+        subscriptionId,
+        retry: isRetry
+      });
+    }
+
+    return responses;
+  }
+
+  async #pollDelegatedSubscriptions(connectionKey, { reason = 'scheduled', allowRetry = false } = {}) {
+    const existing = this.activePeerPolls.get(connectionKey);
+    if (existing) {
+      if (reason === 'immediate') {
+        try {
+          await existing;
+        } catch (_) {}
+      }
+      return existing;
+    }
+
+    const pollPromise = (async () => {
+      const connectionData = this.wsConnections.get(connectionKey);
+      if (!connectionData) return;
+
+      const { ws, relayKey: identifier, pendingDelegations } = connectionData;
+      if (!ws || ws.readyState !== WebSocket.OPEN) {
+        this.cleanupConnection(connectionKey);
+        return;
+      }
+
+      const hasPending = (pendingDelegations?.size || 0) > 0;
+      const hasDelegated = (connectionData.delegatedSubscriptions?.size || 0) > 0;
+
+      if (!hasPending && !hasDelegated) {
+        connectionData.shouldPollPeers = false;
+        return;
+      }
+
+      let healthyPeer = await this.findHealthyPeerForRelay(
+        identifier,
+        allowRetry || reason === 'immediate' || hasPending
+      );
+      if (!healthyPeer) {
+        ws.send(JSON.stringify(['NOTICE', 'Gateway temporarily unavailable - no healthy peers']));
+        return;
+      }
+
+      if (hasPending) {
+        const entries = Array.from(pendingDelegations.entries());
+        for (const [pendingSubscriptionId, payload] of entries) {
+          try {
+            await this.#forwardMessageToPeer({
+              connData: connectionData,
+              healthyPeer,
+              identifier,
+              rawMessage: payload?.message ?? '[]',
+              subscriptionId: pendingSubscriptionId,
+              isRetry: true
+            });
+            pendingDelegations.delete(pendingSubscriptionId);
+            this.log('debug', '[PublicGateway] Delegated subscription resent to peer', {
+              connectionKey,
+              relayKey: identifier,
+              subscriptionId: pendingSubscriptionId,
+              attempts: payload?.attempts ?? 0,
+              reason
+            });
+          } catch (error) {
+            const attempts = (payload?.attempts ?? 0) + 1;
+            pendingDelegations.set(pendingSubscriptionId, {
+              ...(payload || {}),
+              attempts,
+              lastAttemptAt: Date.now()
+            });
+            this.log('debug', `[PublicGateway] Failed to resend delegated subscription (attempt ${attempts})`, {
+              connectionKey,
+              relayKey: identifier,
+              subscriptionId: pendingSubscriptionId,
+              error: error?.message || error
+            });
+          }
+        }
+      }
+
+      if (pendingDelegations?.size) {
+        connectionData.shouldPollPeers = true;
+        this.log('debug', '[PublicGateway] Pending delegations remain unsent, deferring event polling', {
+          connectionKey,
+          relayKey: identifier,
+          pending: pendingDelegations.size,
+          reason
+        });
+        return;
+      }
+
+      if (!connectionData.delegatedSubscriptions?.size) {
+        connectionData.shouldPollPeers = false;
+        return;
+      }
+
+      this.log('debug', '[PublicGateway] Polling delegated subscriptions from peer', {
+        connectionKey,
+        relayKey: identifier,
+        delegatedSubscriptions: connectionData.delegatedSubscriptions?.size || 0,
+        reason
+      });
+
+      try {
+        // reuse existing healthyPeer if available, otherwise resolve again for clarity
+        const peer = healthyPeer || await this.findHealthyPeerForRelay(identifier, allowRetry || reason === 'immediate');
+        if (!peer) {
+          ws.send(JSON.stringify(['NOTICE', 'Gateway temporarily unavailable - no healthy peers']));
+          return;
+        }
+
+        const events = await getEventsFromPeerHyperswarm(
+          peer.publicKey,
+          identifier,
+          connectionKey,
+          this.connectionPool,
+          connectionData.authToken
+        );
+
+        for (const event of events) {
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify(event));
+          }
+        }
+      } catch (error) {
+        this.log('warn', `[PublicGateway] Event check failed (${reason}): ${error.message}`);
+      }
+    })();
+
+    this.activePeerPolls.set(connectionKey, pollPromise);
+    try {
+      await pollPromise;
+    } finally {
+      if (this.activePeerPolls.get(connectionKey) === pollPromise) {
+        this.activePeerPolls.delete(connectionKey);
+      }
+    }
+
+    return pollPromise;
   }
 
   async startEventChecking(connectionKey) {
@@ -3135,40 +3362,18 @@ export class GatewayService extends EventEmitter {
         return;
       }
 
-      const { ws, relayKey: identifier, authToken } = connectionData;
-      if (ws.readyState !== WebSocket.OPEN) {
+      const { ws, relayKey: identifier } = connectionData;
+      if (!ws || ws.readyState !== WebSocket.OPEN) {
         this.cleanupConnection(connectionKey);
         return;
       }
 
-      if (connectionData.shouldPollPeers) {
-        this.log('debug', '[PublicGateway] Polling delegated subscriptions from peer', {
-          connectionKey,
-          relayKey: identifier,
-          delegatedSubscriptions: connectionData.delegatedSubscriptions?.size || 0
+      const hasPending = (connectionData.pendingDelegations?.size || 0) > 0;
+      if (connectionData.shouldPollPeers || hasPending) {
+        await this.#pollDelegatedSubscriptions(connectionKey, {
+          reason: hasPending ? 'pending-resend' : 'scheduled',
+          allowRetry: true
         });
-        try {
-          const healthyPeer = await this.findHealthyPeerForRelay(identifier, true);
-          if (!healthyPeer) {
-            ws.send(JSON.stringify(['NOTICE', 'Gateway temporarily unavailable - no healthy peers']));
-          } else {
-            const events = await getEventsFromPeerHyperswarm(
-              healthyPeer.publicKey,
-              identifier,
-              connectionKey,
-              this.connectionPool,
-              authToken
-            );
-
-            for (const event of events) {
-              if (ws.readyState === WebSocket.OPEN) {
-                ws.send(JSON.stringify(event));
-              }
-            }
-          }
-        } catch (error) {
-          this.log('warn', `Event check failed: ${error.message}`);
-        }
       } else {
         this.log('debug', '[PublicGateway] Skipping peer poll for connection (local handling active)', {
           connectionKey,
@@ -3176,11 +3381,19 @@ export class GatewayService extends EventEmitter {
         });
       }
 
-      const timer = setTimeout(loop, 10000);
+      const timer = setTimeout(() => {
+        loop().catch((error) => {
+          this.log('warn', `[PublicGateway] Event polling loop error: ${error.message}`);
+        });
+      }, hasPending ? 2000 : 10000);
       this.eventCheckTimers.set(connectionKey, timer);
     };
 
-    const timer = setTimeout(loop, 1000);
+    const timer = setTimeout(() => {
+      loop().catch((error) => {
+        this.log('warn', `[PublicGateway] Initial event polling loop error: ${error.message}`);
+      });
+    }, 500);
     this.eventCheckTimers.set(connectionKey, timer);
   }
 

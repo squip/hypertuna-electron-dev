@@ -98,6 +98,14 @@ export default class PublicGatewayHyperbeeAdapter {
       };
     }
 
+    const syncState = await this.#ensureReplicaReady(options);
+    const replicaLag = Number.isFinite(syncState?.lag) ? syncState.lag : null;
+    const synchronized = typeof syncState?.synchronized === 'boolean' ? syncState.synchronized : null;
+    this.logger?.debug?.('[PublicGatewayHyperbeeAdapter] Replica sync state before query', {
+      synchronized,
+      replicaLag
+    });
+
     const resultMap = new Map();
     let truncated = false;
 
@@ -132,8 +140,69 @@ export default class PublicGatewayHyperbeeAdapter {
       stats: {
         served: true,
         truncated,
-        returned: events.length
+        returned: events.length,
+        replicaLag,
+        synchronized
       }
+    };
+  }
+
+  async #ensureReplicaReady(options = {}) {
+    const syncOptions = {};
+    if (Number.isFinite(options?.maxSyncWaitMs) && options.maxSyncWaitMs >= 0) {
+      syncOptions.maxWaitMs = Math.round(options.maxSyncWaitMs);
+    }
+    if (Number.isFinite(options?.syncPollIntervalMs) && options.syncPollIntervalMs > 0) {
+      syncOptions.pollIntervalMs = Math.round(options.syncPollIntervalMs);
+    }
+
+    if (this.relayClient && typeof this.relayClient.ensureSynchronized === 'function') {
+      try {
+        const synchronized = await this.relayClient.ensureSynchronized(syncOptions);
+        const snapshot = typeof this.relayClient.getReplicaSnapshot === 'function'
+          ? this.relayClient.getReplicaSnapshot()
+          : null;
+        const lag = Number.isFinite(snapshot?.lag) ? snapshot.lag : null;
+        this.logger?.debug?.('[PublicGatewayHyperbeeAdapter] ensureSynchronized completed', {
+          synchronized,
+          lag,
+          snapshot
+        });
+        return {
+          synchronized: !!synchronized,
+          lag
+        };
+      } catch (error) {
+        this.logger?.debug?.('[PublicGatewayHyperbeeAdapter] ensureSynchronized failed', {
+          error: error?.message || error
+        });
+      }
+    }
+
+    const db = this.hyperbee;
+    if (db && typeof db.update === 'function') {
+      try {
+        await db.update({ wait: true });
+        const core = this.core;
+        const length = typeof core?.length === 'number' ? core.length : null;
+        const contiguous = typeof core?.contiguousLength === 'number' ? core.contiguousLength : null;
+        const lag = Number.isFinite(length) && Number.isFinite(contiguous)
+          ? Math.max(0, length - contiguous)
+          : null;
+        return {
+          synchronized: true,
+          lag
+        };
+      } catch (error) {
+        this.logger?.debug?.('[PublicGatewayHyperbeeAdapter] Hyperbee update failed', {
+          error: error?.message || error
+        });
+      }
+    }
+
+    return {
+      synchronized: false,
+      lag: null
     };
   }
 
