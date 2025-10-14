@@ -2254,11 +2254,13 @@ export class GatewayService extends EventEmitter {
         const identifier = typeof entry === 'string' ? entry : entry?.identifier;
         if (!identifier) return;
 
-        const relayObj = (entry && typeof entry === 'object') ? entry : { identifier };
+        const normalizedIdentifier = this._normalizeRelayIdentifier(identifier) || identifier;
+        const relayObj = (entry && typeof entry === 'object') ? { ...entry } : { identifier };
+        relayObj.identifier = normalizedIdentifier;
 
-        peer.relays.add(identifier);
-        if (!this.activeRelays.has(identifier)) {
-          this.activeRelays.set(identifier, {
+        peer.relays.add(normalizedIdentifier);
+        if (!this.activeRelays.has(normalizedIdentifier)) {
+          this.activeRelays.set(normalizedIdentifier, {
             peers: new Set(),
             status: 'active',
             createdAt: Date.now(),
@@ -2267,7 +2269,7 @@ export class GatewayService extends EventEmitter {
           });
         }
 
-        const relayData = this.activeRelays.get(identifier);
+        const relayData = this.activeRelays.get(normalizedIdentifier);
         relayData.peers.add(publicKey);
         relayData.lastActive = Date.now();
 
@@ -2291,10 +2293,10 @@ export class GatewayService extends EventEmitter {
           nextMetadata.metadataEventId = relayObj.metadataEventId;
         }
         if (!nextMetadata.identifier) {
-          nextMetadata.identifier = identifier;
+          nextMetadata.identifier = normalizedIdentifier;
         }
 
-        const gatewayPath = this._normalizeGatewayPath(identifier, relayObj.gatewayPath, relayObj.connectionUrl);
+        const gatewayPath = this._normalizeGatewayPath(normalizedIdentifier, relayObj.gatewayPath, relayObj.connectionUrl);
         if (gatewayPath) {
           nextMetadata.gatewayPath = gatewayPath;
         }
@@ -2349,7 +2351,7 @@ export class GatewayService extends EventEmitter {
         if (typeof nextMetadata.isGatewayReplica === 'boolean') {
           relayData.isGatewayReplica = nextMetadata.isGatewayReplica;
         }
-        updatedRelays.push(identifier);
+        updatedRelays.push(normalizedIdentifier);
       });
     }
 
@@ -2694,8 +2696,12 @@ export class GatewayService extends EventEmitter {
       fallbackIdentifier = rawParts[0];
     }
 
-    const candidateIdentifiers = [normalizedIdentifier, fallbackIdentifier].filter(Boolean);
-    const matchedIdentifier = candidateIdentifiers.find(id => this.activeRelays.has(id));
+    const candidateIdentifiers = new Set();
+    if (normalizedIdentifier) candidateIdentifiers.add(normalizedIdentifier);
+    if (fallbackIdentifier) candidateIdentifiers.add(fallbackIdentifier);
+    if (strippedPath) candidateIdentifiers.add(strippedPath);
+
+    const matchedIdentifier = Array.from(candidateIdentifiers).find(id => this.activeRelays.has(id));
 
     const authToken = parsedUrl.query?.token || null;
 
