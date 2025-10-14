@@ -1637,7 +1637,7 @@ class PublicGatewayService {
           gatewayReplica.metrics = {
             ...(gatewayReplica.metrics || {}),
             ...replicaMetrics,
-            peerId,
+            peerId: peerKey,
             reportedAt: now
           };
         }

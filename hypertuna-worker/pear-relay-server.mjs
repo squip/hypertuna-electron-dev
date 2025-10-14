@@ -475,12 +475,34 @@ function handlePeerConnection(stream, peerInfo) {
     publicKey
   });
   
+  const gatewayServiceInstance = global.gatewayService || null;
+  const replicaInfo = gatewayServiceInstance?.getPublicGatewayReplicaInfo?.() || null;
+
   const handshakeInfo = {
-    role: 'relay',
+    role: 'gateway-replica',
+    isGateway: false,
+    gatewayReplica: true,
     relayPublicKey: config?.swarmPublicKey,
+    peerId: config?.swarmPublicKey,
     relayCount: healthState?.activeRelaysCount || 0,
-    proxyAddress: config?.proxy_server_address || null
+    proxyAddress: config?.proxy_server_address || null,
+    delegateReqToPeers: !!replicaInfo?.delegateReqToPeers
   };
+
+  if (replicaInfo) {
+    handshakeInfo.hyperbeeKey = replicaInfo.hyperbeeKey || null;
+    handshakeInfo.hyperbeeDiscoveryKey = replicaInfo.discoveryKey || null;
+    handshakeInfo.hyperbeeLength = Number.isFinite(replicaInfo.length) ? replicaInfo.length : 0;
+    handshakeInfo.hyperbeeContiguousLength = Number.isFinite(replicaInfo.contiguousLength)
+      ? replicaInfo.contiguousLength
+      : 0;
+    handshakeInfo.hyperbeeLag = Number.isFinite(replicaInfo.lag) ? replicaInfo.lag : 0;
+    handshakeInfo.hyperbeeVersion = Number.isFinite(replicaInfo.version) ? replicaInfo.version : 0;
+    handshakeInfo.hyperbeeUpdatedAt = Number.isFinite(replicaInfo.updatedAt) ? replicaInfo.updatedAt : 0;
+    if (replicaInfo.telemetry && typeof replicaInfo.telemetry === 'object') {
+      handshakeInfo.telemetry = { ...replicaInfo.telemetry };
+    }
+  }
 
   // Create relay protocol handler
   const protocol = new RelayProtocol(stream, true, handshakeInfo);

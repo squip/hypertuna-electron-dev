@@ -664,6 +664,12 @@ async function addAuthInfoToRelays(relays) {
 
 async function reconcileRelayFiles() {
   for (const [relayKey, manager] of activeRelays.entries()) {
+    if (relayKey === 'public-gateway:hyperbee') {
+      continue;
+    }
+    if (typeof manager?.relay?.queryFilekeyIndex !== 'function') {
+      continue;
+    }
     let fileMap
     try {
       fileMap = await manager.relay.queryFilekeyIndex()

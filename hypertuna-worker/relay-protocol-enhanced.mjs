@@ -108,12 +108,18 @@ export class RelayProtocol extends EventEmitter {
       encoding: c.json,
       onmessage: this._onhealthresponse.bind(this)
     });
+
+    // Message type 5: Telemetry payloads
+    this.channel.addMessage({
+      encoding: c.json,
+      onmessage: this._ontelemetry.bind(this)
+    });
     
     // Open the channel
     const handshake = {
       version: '2.0',
       isServer: this.isServer,
-      capabilities: ['http', 'websocket', 'health']
+      capabilities: ['http', 'websocket', 'health', 'telemetry']
     };
 
     if (this.handshakeData && typeof this.handshakeData === 'object') {
@@ -270,6 +276,11 @@ export class RelayProtocol extends EventEmitter {
       request.resolve(message);
     }
   }
+
+  _ontelemetry(message) {
+    console.log('[RelayProtocol] Received telemetry payload');
+    this.emit('telemetry', message);
+  }
   
   // Register a request handler for a specific path pattern
   handle(pattern, handler) {
@@ -361,6 +372,15 @@ export class RelayProtocol extends EventEmitter {
       this.channel.messages[4].send(response);
     } catch (err) {
       console.error('[RelayProtocol] Failed to send health response:', err);
+    }
+  }
+
+  // Send a telemetry payload
+  sendTelemetry(payload) {
+    try {
+      this.channel.messages[5].send(payload);
+    } catch (err) {
+      console.error('[RelayProtocol] Failed to send telemetry:', err);
     }
   }
   
