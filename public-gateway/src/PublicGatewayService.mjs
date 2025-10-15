@@ -40,7 +40,7 @@ import RelayTokenService from './relay/RelayTokenService.mjs';
 import PublicGatewayHyperbeeAdapter from '../../shared/public-gateway/PublicGatewayHyperbeeAdapter.mjs';
 import { openHyperbeeReplicationChannel } from '../../shared/public-gateway/hyperbeeReplicationChannel.mjs';
 
-const DELEGATION_FALLBACK_MS = 3000;
+const DELEGATION_FALLBACK_MS = 1500;
 
 function safeString(value) {
   if (typeof value === 'string') return value;
@@ -675,7 +675,8 @@ class PublicGatewayService {
       openedAt: Date.now(),
       subscriptionPeers: new Map(),
       assignPeer: null,
-      pendingDelegatedMessages: []
+      pendingDelegatedMessages: [],
+      delegationReady: delegateReqToPeers === true
     };
     session.assignPeer = (assignedPeer, subscriptionId) => {
       if (session.localOnly) return;
@@ -762,53 +763,133 @@ class PublicGatewayService {
     }
 
     let pendingEntry = null;
-    if (storePending && session?.delegateReqToPeers) {
-      if (!Array.isArray(session.pendingDelegatedMessages)) {
-        session.pendingDelegatedMessages = [];
-      }
-      pendingEntry = {
-        message: serialized,
-        preferredPeer: preferredPeer || null,
-        queuedAt: Date.now(),
-        subscriptionId
-      };
-      session.pendingDelegatedMessages.push(pendingEntry);
+    if (Array.isArray(session.pendingDelegatedMessages) && subscriptionId) {
+      pendingEntry = session.pendingDelegatedMessages.find((entry) => entry?.subscriptionId === subscriptionId) || null;
     }
-
-    if (!session?.peers?.length) {
-      if (allowQueue && session?.delegateReqToPeers) {
+    if (storePending && session?.delegateReqToPeers) {
+      if (!pendingEntry) {
         if (!Array.isArray(session.pendingDelegatedMessages)) {
           session.pendingDelegatedMessages = [];
         }
-        session.pendingDelegatedMessages.push({
+        pendingEntry = {
           message: serialized,
           preferredPeer: preferredPeer || null,
           queuedAt: Date.now(),
           subscriptionId
-        });
+        };
+        session.pendingDelegatedMessages.push(pendingEntry);
+      } else {
+        pendingEntry.preferredPeer = preferredPeer || null;
+        pendingEntry.queuedAt = Date.now();
+      }
+    }
+
+    if (subscriptionId) {
+      this.logger.info?.({
+        tag: 'DelegationDebug',
+        stage: 'forward-invoked',
+        relayKey: session.relayKey,
+        connectionKey: session.connectionKey,
+        subscriptionId,
+        delegateReqToPeers: session.delegateReqToPeers === true,
+        delegationReady: session.delegationReady === true,
+        localOnly: session.localOnly === true,
+        peerKey: session.peerKey || null,
+        peerCount: Array.isArray(session.peers) ? session.peers.length : 0,
+        allowQueue,
+        storePending,
+        hasPendingEntry: !!pendingEntry,
+        pendingDelegatedMessages: Array.isArray(session.pendingDelegatedMessages)
+          ? session.pendingDelegatedMessages.length
+          : 0
+      }, 'DelegationDebug: forwardLegacyMessage invoked');
+    }
+
+    if (!session?.peers?.length) {
+      if (allowQueue && session?.delegateReqToPeers) {
+        if (pendingEntry) {
+          pendingEntry.preferredPeer = preferredPeer || null;
+          pendingEntry.queuedAt = Date.now();
+        } else {
+          if (!Array.isArray(session.pendingDelegatedMessages)) {
+            session.pendingDelegatedMessages = [];
+          }
+          session.pendingDelegatedMessages.push({
+            message: serialized,
+            preferredPeer: preferredPeer || null,
+            queuedAt: Date.now(),
+            subscriptionId
+          });
+          pendingEntry = session.pendingDelegatedMessages[session.pendingDelegatedMessages.length - 1];
+        }
+        if (subscriptionId) {
+          this.logger.info?.({
+            tag: 'DelegationDebug',
+            stage: 'queue-no-peer',
+            relayKey: session?.relayKey,
+            connectionKey: session?.connectionKey,
+            subscriptionId,
+            queueLength: session.pendingDelegatedMessages.length,
+            allowQueue,
+            reason: 'no-peers-available'
+          }, 'DelegationDebug: queueing delegated message while peers unavailable');
+        }
         this.logger.debug?.('Queued delegated relay message pending peer availability', {
           relayKey: session?.relayKey,
           connectionKey: session?.connectionKey,
           queueLength: session.pendingDelegatedMessages.length
         });
-        this.#scheduleDelegationFallback(session);
-      } else if (!allowQueue && session?.delegateReqToPeers) {
-        if (!Array.isArray(session.pendingDelegatedMessages)) {
-          session.pendingDelegatedMessages = [];
+        if (session.delegationReady) {
+          this.#scheduleDelegationFallback(session);
         }
-        session.pendingDelegatedMessages.unshift({
-          message: serialized,
-          preferredPeer: preferredPeer || null,
-          queuedAt: Date.now(),
-          subscriptionId
-        });
+      } else if (!allowQueue && session?.delegateReqToPeers) {
+        if (pendingEntry) {
+          pendingEntry.preferredPeer = preferredPeer || null;
+          pendingEntry.queuedAt = Date.now();
+        } else {
+          if (!Array.isArray(session.pendingDelegatedMessages)) {
+            session.pendingDelegatedMessages = [];
+          }
+          session.pendingDelegatedMessages.unshift({
+            message: serialized,
+            preferredPeer: preferredPeer || null,
+            queuedAt: Date.now(),
+            subscriptionId
+          });
+          pendingEntry = session.pendingDelegatedMessages[0];
+        }
+        if (subscriptionId) {
+          this.logger.info?.({
+            tag: 'DelegationDebug',
+            stage: 'requeue-no-peer',
+            relayKey: session?.relayKey,
+            connectionKey: session?.connectionKey,
+            subscriptionId,
+            queueLength: session.pendingDelegatedMessages.length,
+            allowQueue,
+            reason: 'no-peers-available'
+          }, 'DelegationDebug: re-queueing delegated message without peers');
+        }
         this.logger.debug?.('Re-queued delegated relay message while peers unavailable', {
           relayKey: session?.relayKey,
           connectionKey: session?.connectionKey,
           queueLength: session.pendingDelegatedMessages.length
         });
-        this.#scheduleDelegationFallback(session);
+        if (session.delegationReady) {
+          this.#scheduleDelegationFallback(session);
+        }
       } else {
+        if (subscriptionId) {
+          this.logger.info?.({
+            tag: 'DelegationDebug',
+            stage: 'skip-no-peer',
+            relayKey: session?.relayKey,
+            connectionKey: session?.connectionKey,
+            subscriptionId,
+            allowQueue,
+            delegateReqToPeers: session?.delegateReqToPeers === true
+          }, 'DelegationDebug: skipping delegation - peers unavailable and queue disabled');
+        }
         this.logger.debug?.('Legacy forward skipped - no peers available for relay', {
           relayKey: session?.relayKey
         });
@@ -817,6 +898,17 @@ class PublicGatewayService {
     }
 
     try {
+      if (subscriptionId) {
+        this.logger.info?.({
+          tag: 'DelegationDebug',
+          stage: 'forward-to-peer',
+          relayKey: session.relayKey,
+          connectionKey: session.connectionKey,
+          subscriptionId,
+          preferredPeer,
+          activePeer: session.peerKey || null
+        }, 'DelegationDebug: forwarding message to peer');
+      }
       const responses = await this.#withPeer(session, async (peerKey) => {
         requestCounter.inc({ relay: session.relayKey });
         return forwardMessageToPeerHyperswarm(
@@ -830,20 +922,54 @@ class PublicGatewayService {
       }, { preferredPeer });
 
       if (!Array.isArray(responses)) return;
+      const deliverable = [];
       for (const response of responses) {
         if (!response) continue;
-        if (session.ws.readyState === WebSocket.OPEN) {
+        if (Array.isArray(response) && response[0] === 'ACK') {
+          const ackSubscription = response[1] || null;
+          this.#handlePeerAck(session, ackSubscription, response.slice(2));
+          continue;
+        }
+        deliverable.push(response);
+      }
+      if (subscriptionId) {
+        this.logger.info?.({
+          tag: 'DelegationDebug',
+          stage: 'peer-responses',
+          relayKey: session.relayKey,
+          connectionKey: session.connectionKey,
+          subscriptionId,
+          deliverableCount: deliverable.length,
+          pendingDelegatedMessages: Array.isArray(session.pendingDelegatedMessages)
+            ? session.pendingDelegatedMessages.length
+            : 0
+        }, 'DelegationDebug: peer responses processed');
+      }
+      if (deliverable.length && session.ws.readyState === WebSocket.OPEN) {
+        for (const response of deliverable) {
           session.ws.send(JSON.stringify(response));
         }
       }
       if (pendingEntry) {
-        const queue = session.pendingDelegatedMessages;
-        if (Array.isArray(queue)) {
-          const idx = queue.indexOf(pendingEntry);
-          if (idx !== -1) queue.splice(idx, 1);
-        }
+        pendingEntry.preferredPeer = preferredPeer || null;
+        pendingEntry.latestSentAt = Date.now();
+      }
+      if (session.delegateReqToPeers && session.delegationReady && Array.isArray(session.pendingDelegatedMessages) && session.pendingDelegatedMessages.length) {
+        this.#scheduleDelegationFallback(session);
       }
     } catch (error) {
+      if (subscriptionId) {
+        this.logger.info?.({
+          tag: 'DelegationDebug',
+          stage: 'forward-error',
+          relayKey: session.relayKey,
+          connectionKey: session.connectionKey,
+          subscriptionId,
+          error: error?.message || error,
+          allowQueue,
+          delegateReqToPeers: session?.delegateReqToPeers === true
+        }, 'DelegationDebug: forwardLegacyMessage error');
+      }
       const awaitingPeer = error?.message === 'delegated-session-awaiting-peer';
       if (allowQueue && awaitingPeer && session?.delegateReqToPeers) {
         if (pendingEntry) {
@@ -859,13 +985,16 @@ class PublicGatewayService {
             queuedAt: Date.now(),
             subscriptionId
           });
+          pendingEntry = session.pendingDelegatedMessages[session.pendingDelegatedMessages.length - 1];
         }
         this.logger.debug?.('Queued delegated relay message while awaiting peer', {
           relayKey: session?.relayKey,
           connectionKey: session?.connectionKey,
           queueLength: session.pendingDelegatedMessages.length
         });
-        this.#scheduleDelegationFallback(session);
+        if (session.delegationReady) {
+          this.#scheduleDelegationFallback(session);
+        }
         return;
       }
 
@@ -875,7 +1004,7 @@ class PublicGatewayService {
       } else {
         this.#cleanupSession(session.connectionKey);
       }
-      if (session?.delegateReqToPeers && Array.isArray(session.pendingDelegatedMessages) && session.pendingDelegatedMessages.length) {
+      if (session?.delegateReqToPeers && session.delegationReady && Array.isArray(session.pendingDelegatedMessages) && session.pendingDelegatedMessages.length) {
         this.#scheduleDelegationFallback(session);
       }
     }
@@ -2172,6 +2301,7 @@ class PublicGatewayService {
       session.peerIndex = session.peers.indexOf(peerKey);
 
       session.localOnly = false;
+      session.delegationReady = true;
       await this.#flushPendingDelegatedMessages(session, peerKey);
 
       const snapshots = this.relayWebsocketController?.getSubscriptionSnapshot(session.connectionKey) || [];
@@ -2234,14 +2364,29 @@ class PublicGatewayService {
 
   #scheduleDelegationFallback(session) {
     if (!session || session.delegateReqToPeers !== true) return;
+    if (session.delegationReady !== true) return;
     if (!Array.isArray(session.pendingDelegatedMessages) || !session.pendingDelegatedMessages.length) return;
     const connectionKey = session.connectionKey;
     if (this.delegationFallbackTimers.has(connectionKey)) return;
+    this.logger.info?.({
+      tag: 'DelegationDebug',
+      stage: 'fallback-scheduled',
+      relayKey: session.relayKey,
+      connectionKey,
+      pendingDelegatedMessages: session.pendingDelegatedMessages.length
+    }, 'DelegationDebug: scheduling delegation fallback');
     const timer = setTimeout(async () => {
       this.delegationFallbackTimers.delete(connectionKey);
       if (!this.sessions.has(connectionKey)) return;
       if (session.delegateReqToPeers !== true) return;
       if (!Array.isArray(session.pendingDelegatedMessages) || !session.pendingDelegatedMessages.length) return;
+      this.logger.info?.({
+        tag: 'DelegationDebug',
+        stage: 'fallback-firing',
+        relayKey: session.relayKey,
+        connectionKey,
+        pendingDelegatedMessages: session.pendingDelegatedMessages.length
+      }, 'DelegationDebug: delegation fallback timer firing');
       this.logger?.debug?.('[PublicGateway] Delegation fallback triggered', {
         relayKey: session.relayKey,
         connectionKey
@@ -2259,6 +2404,58 @@ class PublicGatewayService {
     if (timer) {
       clearTimeout(timer);
       this.delegationFallbackTimers.delete(connectionKey);
+    }
+  }
+
+  #removePendingDelegatedMessage(session, subscriptionId = null) {
+    if (!session || !Array.isArray(session.pendingDelegatedMessages)) return;
+    if (!session.pendingDelegatedMessages.length) return;
+    if (subscriptionId === null || subscriptionId === undefined) {
+      session.pendingDelegatedMessages.shift();
+      return;
+    }
+    const originalLength = session.pendingDelegatedMessages.length;
+    session.pendingDelegatedMessages = session.pendingDelegatedMessages.filter((entry) => entry?.subscriptionId !== subscriptionId);
+    if (session.pendingDelegatedMessages.length !== originalLength) {
+      this.logger?.debug?.('[PublicGateway] Removed pending delegated message after peer ack', {
+        relayKey: session.relayKey,
+        connectionKey: session.connectionKey,
+        subscriptionId
+      });
+    }
+  }
+
+  #handlePeerAck(session, subscriptionId = null, ackPayload = []) {
+    if (!session) return;
+    this.logger?.debug?.('[PublicGateway] Received delegated subscription ACK from peer', {
+      relayKey: session.relayKey,
+      connectionKey: session.connectionKey,
+      subscriptionId,
+      payload: ackPayload
+    });
+    this.logger.info?.({
+      tag: 'DelegationDebug',
+      stage: 'peer-ack',
+      relayKey: session.relayKey,
+      connectionKey: session.connectionKey,
+      subscriptionId,
+      payload: Array.isArray(ackPayload) && ackPayload.length ? ackPayload : null,
+      pendingDelegatedMessages: Array.isArray(session.pendingDelegatedMessages)
+        ? session.pendingDelegatedMessages.length
+        : 0
+    }, 'DelegationDebug: peer ACK received');
+    session.delegationReady = true;
+    session.localOnly = false;
+    this.#removePendingDelegatedMessage(session, subscriptionId);
+    this.#cancelDelegationFallback(session);
+    if (Array.isArray(session.pendingDelegatedMessages) && session.pendingDelegatedMessages.length) {
+      this.#flushPendingDelegatedMessages(session).catch((error) => {
+        this.logger?.debug?.('[PublicGateway] Failed to flush pending delegated messages after ack', {
+          relayKey: session.relayKey,
+          connectionKey: session.connectionKey,
+          error: error?.message || error
+        });
+      });
     }
   }
 
@@ -2302,15 +2499,30 @@ class PublicGatewayService {
       if (session.localOnly && session.peers.length) {
         session.localOnly = false;
       }
+      const wasReady = session.delegationReady === true;
+      session.delegationReady = true;
+      this.logger.info?.({
+        tag: 'DelegationDebug',
+        stage: 'delegation-enabled',
+        relayKey: session.relayKey,
+        connectionKey: session.connectionKey,
+        peerKey,
+        wasReady,
+        pendingDelegatedMessages: Array.isArray(session.pendingDelegatedMessages)
+          ? session.pendingDelegatedMessages.length
+          : 0
+      }, 'DelegationDebug: delegation enabled for session');
       if (Array.isArray(session.pendingDelegatedMessages) && session.pendingDelegatedMessages.length) {
         this.#cancelDelegationFallback(session);
-        this.#flushPendingDelegatedMessages(session, peerKey).catch((error) => {
-          this.logger?.debug?.('[PublicGateway] Failed to flush pending delegated messages after enabling delegation', {
-            relayKey: session.relayKey,
-            connectionKey: session.connectionKey,
-            error: error?.message || error
+        if (!wasReady) {
+          this.#flushPendingDelegatedMessages(session, peerKey).catch((error) => {
+            this.logger?.debug?.('[PublicGateway] Failed to flush pending delegated messages after enabling delegation', {
+              relayKey: session.relayKey,
+              connectionKey: session.connectionKey,
+              error: error?.message || error
+            });
           });
-        });
+        }
       } else {
         this.#cancelDelegationFallback(session);
       }

@@ -131,13 +131,53 @@ export default class RelayWebsocketController {
     const subscriptionState = this.#getSubscriptionState(session.connectionKey, subscriptionId);
     const lastReturnedAt = subscriptionState?.lastReturnedAt ?? null;
 
+    const pendingDelegatedMessages = Array.isArray(session.pendingDelegatedMessages)
+      ? session.pendingDelegatedMessages.length
+      : 0;
+    this.logger.info?.({
+      tag: 'DelegationDebug',
+      stage: 'req-received',
+      relayKey: session.relayKey,
+      connectionKey: session.connectionKey,
+      subscriptionId,
+      delegateReqToPeers: session.delegateReqToPeers === true,
+      delegationReady: session.delegationReady === true,
+      localOnly: session.localOnly === true,
+      peerKey: session.peerKey || null,
+      peerCount: Array.isArray(session.peers) ? session.peers.length : 0,
+      pendingDelegatedMessages,
+      lastReturnedAt
+    }, 'DelegationDebug: REQ received');
+
     const localResult = await this.#serveReqFromHyperbee(session, subscriptionId, filters, lastReturnedAt);
     if (localResult?.handled) {
+      this.logger.info?.({
+        tag: 'DelegationDebug',
+        stage: 'req-served-local',
+        relayKey: session.relayKey,
+        connectionKey: session.connectionKey,
+        subscriptionId,
+        delivered: localResult.delivered || 0,
+        latestTimestamp: localResult.latestTimestamp ?? null
+      }, 'DelegationDebug: REQ served locally');
       if (Number.isFinite(localResult.latestTimestamp)) {
         this.#updateSubscriptionCursor(session.connectionKey, subscriptionId, localResult.latestTimestamp);
       }
       return;
     }
+
+    this.logger.info?.({
+      tag: 'DelegationDebug',
+      stage: 'req-delegating',
+      relayKey: session.relayKey,
+      connectionKey: session.connectionKey,
+      subscriptionId,
+      dispatcherEnabled: this.featureFlags?.dispatcherEnabled && !!this.dispatcher,
+      delegateReqToPeers: session.delegateReqToPeers === true,
+      localOnly: session.localOnly === true,
+      peerKey: session.peerKey || null,
+      peerCount: Array.isArray(session.peers) ? session.peers.length : 0
+    }, 'DelegationDebug: Delegating REQ to peers');
 
     const dispatcherEnabled = this.featureFlags?.dispatcherEnabled && !!this.dispatcher;
 
@@ -195,9 +235,10 @@ export default class RelayWebsocketController {
   }
 
   async #forwardLegacy(session, rawMessage, targetPeer = null, context = {}) {
+    const storePending = context?.storePending === true;
     const subscriptionId = context?.subscriptionId || null;
     if (session?.localOnly) {
-      if (session?.delegateReqToPeers) {
+    if (session?.delegateReqToPeers && !storePending) {
         if (!Array.isArray(session.pendingDelegatedMessages)) {
           session.pendingDelegatedMessages = [];
         }

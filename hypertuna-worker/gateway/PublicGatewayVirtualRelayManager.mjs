@@ -223,6 +223,7 @@ export default class PublicGatewayVirtualRelayManager {
 
     if (typeof sendResponse === 'function') {
       sendResponse(['NOTICE', `Subscription ${subscriptionId} registered for ${this.identifier}`]);
+      sendResponse(['ACK', subscriptionId, 'registered']);
     }
   }
 
