@@ -2102,9 +2102,28 @@ async function registerWithGateway(relayProfileInfo = null, options = {}) {
     const replicaStateEntry = publicGatewayState?.relays?.[PUBLIC_GATEWAY_REPLICA_IDENTIFIER] || null;
 
     if (replicaInfo || replicaStateEntry) {
+      const metadata = (replicaStateEntry && replicaStateEntry.metadata) || {};
+      const normalizePath = (value) => {
+        if (!value || typeof value !== 'string') return null;
+        const trimmed = value.trim();
+        if (!trimmed) return null;
+        return trimmed.replace(/^\//, '').replace(/\/+$/, '');
+      };
+      const canonicalGatewayPath = normalizePath(metadata.gatewayPath) || 'relay';
+      const aliasCandidates = Array.isArray(metadata.pathAliases)
+        ? metadata.pathAliases.map((alias) => normalizePath(alias)).filter(Boolean)
+        : [];
+      aliasCandidates.push('relay');
+      aliasCandidates.push('public-gateway/hyperbee');
+      const pathAliases = Array.from(
+        new Set(
+          aliasCandidates
+            .filter((alias) => alias && alias !== canonicalGatewayPath)
+        )
+      );
+
       let replicaEntry = relayList.find((entry) => entry?.identifier === PUBLIC_GATEWAY_REPLICA_IDENTIFIER);
       if (!replicaEntry) {
-        const metadata = (replicaStateEntry && replicaStateEntry.metadata) || {};
         replicaEntry = {
           identifier: PUBLIC_GATEWAY_REPLICA_IDENTIFIER,
           name: metadata.name || 'Public Gateway Relay Replica',
@@ -2113,10 +2132,20 @@ async function registerWithGateway(relayProfileInfo = null, options = {}) {
           isPublic: true,
           metadataUpdatedAt: metadata.metadataUpdatedAt || Date.now(),
           metadataEventId: metadata.metadataEventId || null,
-          gatewayPath: metadata.gatewayPath || 'public-gateway/hyperbee'
+          gatewayPath: canonicalGatewayPath,
+          pathAliases
         };
         relayList.push(replicaEntry);
+      } else {
+        replicaEntry.name = metadata.name || replicaEntry.name;
+        replicaEntry.description = metadata.description || replicaEntry.description;
+        replicaEntry.avatarUrl = metadata.avatarUrl || replicaEntry.avatarUrl || null;
+        replicaEntry.metadataUpdatedAt = metadata.metadataUpdatedAt || replicaEntry.metadataUpdatedAt || Date.now();
+        replicaEntry.metadataEventId = metadata.metadataEventId || replicaEntry.metadataEventId || null;
       }
+
+      replicaEntry.gatewayPath = canonicalGatewayPath;
+      replicaEntry.pathAliases = pathAliases;
 
       replicaEntry.isGatewayReplica = true;
 

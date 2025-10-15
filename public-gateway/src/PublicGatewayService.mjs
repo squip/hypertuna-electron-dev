@@ -88,12 +88,15 @@ class PublicGatewayService {
         : !!config?.features?.dispatcherEnabled,
       tokenEnforcementEnabled: !!config?.features?.tokenEnforcementEnabled
     };
+    this.internalRelayKey = 'public-gateway:hyperbee';
     this.relayConfig = this.#normalizeRelayConfig(config?.relay);
+    this.relayCanonicalPath = this.relayConfig?.canonicalPath || this.#toGatewayPath(this.internalRelayKey);
+    this.relayPathAliases = Array.isArray(this.relayConfig?.aliasPaths) ? this.relayConfig.aliasPaths : [];
+    this.relayAliasMap = this.#buildRelayAliasMap(this.relayPathAliases, this.internalRelayKey);
     this.relayHost = null;
     this.relayTelemetryUnsub = null;
     this.relayWebsocketController = null;
     this.hyperbeeAdapter = null;
-    this.internalRelayKey = 'public-gateway:hyperbee';
     this.internalRegistrationInterval = null;
     this.dispatcher = this.featureFlags.dispatcherEnabled
       ? new RelayDispatcherService({ logger: this.logger, policy: this.config.dispatcher })
@@ -340,14 +343,63 @@ class PublicGatewayService {
       || process.env.GATEWAY_RELAY_STORAGE
       || resolve(process.env.STORAGE_DIR || process.cwd(), 'gateway-relay');
     const statsIntervalMs = Number(raw?.statsIntervalMs);
+    const legacyPath = this.#toGatewayPath(this.internalRelayKey);
+    const canonicalPath = this.#normalizePathValue(raw?.canonicalPath)
+      || (legacyPath ? this.#normalizePathValue(legacyPath) : 'relay')
+      || 'relay';
+    const aliasInput = Array.isArray(raw?.aliasPaths) ? raw.aliasPaths : [];
+    const aliasSet = new Set();
+    const addAlias = (value) => {
+      const normalized = this.#normalizePathValue(value);
+      if (normalized) {
+        aliasSet.add(normalized);
+      }
+    };
+    addAlias(canonicalPath);
+    aliasInput.forEach(addAlias);
+    if (legacyPath) {
+      addAlias(legacyPath);
+    }
     return {
       storageDir: baseDir,
       datasetNamespace: raw?.datasetNamespace || 'public-gateway-relay',
       adminPublicKey: raw?.adminPublicKey || process.env.GATEWAY_RELAY_ADMIN_PUBLIC_KEY || null,
       adminSecretKey: raw?.adminSecretKey || process.env.GATEWAY_RELAY_ADMIN_SECRET_KEY || null,
       statsIntervalMs: Number.isFinite(statsIntervalMs) && statsIntervalMs > 0 ? statsIntervalMs : undefined,
-      replicationTopic: raw?.replicationTopic || null
+      replicationTopic: raw?.replicationTopic || null,
+      canonicalPath,
+      aliasPaths: Array.from(aliasSet)
     };
+  }
+
+  #buildRelayAliasMap(paths = [], relayKey = this.internalRelayKey) {
+    const map = new Map();
+    if (!relayKey) return map;
+    const pathList = Array.isArray(paths) ? [...paths] : [];
+    const canonical = this.#normalizePathValue(this.relayCanonicalPath);
+    if (canonical) {
+      pathList.push(canonical);
+    }
+    const legacyPath = this.#toGatewayPath(this.internalRelayKey);
+    if (legacyPath) {
+      pathList.push(legacyPath);
+    }
+    for (const rawPath of pathList) {
+      const normalizedPath = this.#normalizePathValue(rawPath);
+      if (!normalizedPath) continue;
+      map.set(normalizedPath, relayKey);
+      const colonIdentifier = this.#toColonIdentifier(normalizedPath);
+      if (colonIdentifier) {
+        map.set(colonIdentifier, relayKey);
+      }
+    }
+    return map;
+  }
+
+  #resolveRelayKeyFromPath(value) {
+    const normalized = this.#normalizePathValue(value);
+    if (!normalized) return null;
+    return this.relayAliasMap?.get(normalized) || null;
   }
 
   #isHyperbeeRelayEnabled() {
@@ -436,7 +488,16 @@ class PublicGatewayService {
     if (!this.relayHost || !this.registrationStore?.upsertRelay) return;
 
     const timestamp = new Date().toISOString();
-    const gatewayPath = this.internalRelayKey.replace(':', '/');
+    const canonicalGatewayPath = this.#normalizePathValue(this.relayCanonicalPath)
+      || this.#toGatewayPath(this.internalRelayKey)
+      || this.internalRelayKey.replace(':', '/');
+    const aliasSet = new Set(
+      (this.relayPathAliases || [])
+        .map((value) => this.#normalizePathValue(value))
+        .filter(Boolean)
+    );
+    aliasSet.delete(canonicalGatewayPath);
+    const pathAliases = Array.from(aliasSet);
 
     const registration = {
       relayKey: this.internalRelayKey,
@@ -451,7 +512,8 @@ class PublicGatewayService {
         requiresAuth: false,
         isPublic: true,
         isGatewayReplica: true,
-        gatewayPath,
+        gatewayPath: canonicalGatewayPath,
+        pathAliases,
         gatewayRelay: this.#getRelayHostInfo()
       }
     };
@@ -1271,6 +1333,20 @@ class PublicGatewayService {
   async #resolveRelayTarget(identifier) {
     if (!identifier) return null;
 
+    const aliasRelayKey = this.#resolveRelayKeyFromPath(identifier);
+    if (aliasRelayKey) {
+      const registration = await this.registrationStore.getRelay(aliasRelayKey);
+      if (registration) {
+        const driveIdentifier = this.#extractDriveIdentifier(registration, aliasRelayKey);
+        if (driveIdentifier) {
+          return {
+            relayKey: aliasRelayKey,
+            driveIdentifier
+          };
+        }
+      }
+    }
+
     const direct = await this.registrationStore.getRelay(identifier);
     if (direct) {
       const driveIdentifier = this.#extractDriveIdentifier(direct, identifier);
@@ -1309,6 +1385,20 @@ class PublicGatewayService {
         const colonFromMetadata = this.#toColonIdentifier(metadataPath);
         if (colonFromMetadata && identifier === colonFromMetadata) {
           return { relayKey, driveIdentifier: colonFromMetadata };
+        }
+      }
+      const metadataAliases = Array.isArray(registration?.metadata?.pathAliases)
+        ? registration.metadata.pathAliases
+        : [];
+      for (const alias of metadataAliases) {
+        const normalizedAlias = this.#normalizePathValue(alias);
+        if (!normalizedAlias) continue;
+        if (identifier === normalizedAlias) {
+          return { relayKey, driveIdentifier };
+        }
+        const colonFromAlias = this.#toColonIdentifier(normalizedAlias);
+        if (colonFromAlias && identifier === colonFromAlias) {
+          return { relayKey, driveIdentifier: colonFromAlias };
         }
       }
 
@@ -1550,13 +1640,27 @@ class PublicGatewayService {
     };
     const hasDispatcher = Object.values(dispatcherInfo).some((value) => value !== null);
 
+    const canonicalGatewayPath = this.#normalizePathValue(this.relayCanonicalPath)
+      || this.#toGatewayPath(this.internalRelayKey)
+      || null;
+    const aliasSet = new Set(
+      (this.relayPathAliases || [])
+        .map((value) => this.#normalizePathValue(value))
+        .filter(Boolean)
+    );
+    if (canonicalGatewayPath) {
+      aliasSet.delete(canonicalGatewayPath);
+    }
+
     return {
       hyperbeeKey: this.relayHost.getPublicKey(),
       discoveryKey: this.relayHost.getDiscoveryKey(),
       replicationTopic: this.relayConfig?.replicationTopic || null,
       defaultTokenTtl: sanitizePositive(registrationConfig.defaultTokenTtl),
       tokenRefreshWindowSeconds: sanitizePositive(registrationConfig.tokenRefreshWindowSeconds),
-      dispatcher: hasDispatcher ? dispatcherInfo : null
+      dispatcher: hasDispatcher ? dispatcherInfo : null,
+      gatewayPath: canonicalGatewayPath || null,
+      pathAliases: Array.from(aliasSet)
     };
   }
 
@@ -2074,8 +2178,11 @@ class PublicGatewayService {
   #parseWebSocketRequest(req) {
     const base = this.config.publicBaseUrl || 'https://hypertuna.com';
     const parsed = new URL(req.url, base);
-    const parts = parsed.pathname.split('/').filter(Boolean);
-    const relayKey = parts.length >= 2 ? `${parts[0]}:${parts[1]}` : parts[0] || null;
+    let relayKey = this.#resolveRelayKeyFromPath(parsed.pathname);
+    if (!relayKey) {
+      const parts = parsed.pathname.split('/').filter(Boolean);
+      relayKey = parts.length >= 2 ? `${parts[0]}:${parts[1]}` : parts[0] || null;
+    }
     const token = parsed.searchParams.get('token');
     return { relayKey, token };
   }

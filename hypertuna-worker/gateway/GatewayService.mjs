@@ -31,7 +31,8 @@ import { updatePublicGatewaySettings } from '../../shared/config/PublicGatewaySe
 const MAX_LOG_ENTRIES = 500;
 const DEFAULT_PORT = 8443;
 const PUBLIC_GATEWAY_RELAY_KEY = 'public-gateway:hyperbee';
-const PUBLIC_GATEWAY_RELAY_PATH = 'public-gateway/hyperbee';
+const PUBLIC_GATEWAY_RELAY_PATH = 'relay';
+const PUBLIC_GATEWAY_RELAY_PATH_ALIASES = ['public-gateway/hyperbee'];
 
 class MessageQueue {
   constructor() {
@@ -1013,7 +1014,7 @@ export class GatewayService extends EventEmitter {
       metadataCopy.identifier = metadataCopy.identifier || relayKey;
       metadataCopy.name = metadataCopy.name || this.publicGatewaySettings?.resolvedDisplayName || 'Public Gateway Relay';
       metadataCopy.description = metadataCopy.description || 'Replicated public gateway relay dataset';
-      metadataCopy.gatewayPath = this.#getPublicGatewayRelayPath();
+      this.#applyPublicGatewayPathMetadata(metadataCopy);
       metadataCopy.isPublic = true;
       if (metadataCopy.requiresAuth === undefined) {
         metadataCopy.requiresAuth = false;
@@ -2505,7 +2506,38 @@ export class GatewayService extends EventEmitter {
   }
 
   #getPublicGatewayRelayPath() {
-    return PUBLIC_GATEWAY_RELAY_PATH;
+    return this._normalizeGatewayPath(null, PUBLIC_GATEWAY_RELAY_PATH, null);
+  }
+
+  #getPublicGatewayRelayPathAliases() {
+    return PUBLIC_GATEWAY_RELAY_PATH_ALIASES
+      .map((alias) => this._normalizeGatewayPath(null, alias, null))
+      .filter(Boolean);
+  }
+
+  #applyPublicGatewayPathMetadata(target = {}) {
+    if (!target || typeof target !== 'object') return target;
+    const normalizePath = (value) => this._normalizeGatewayPath(null, value, null);
+    const canonicalPath = normalizePath(this.#getPublicGatewayRelayPath());
+    if (canonicalPath) {
+      target.gatewayPath = canonicalPath;
+    }
+    const aliasSet = new Set();
+    const existingAliases = Array.isArray(target.pathAliases) ? target.pathAliases : [];
+    for (const alias of existingAliases) {
+      const normalizedAlias = normalizePath(alias);
+      if (normalizedAlias && normalizedAlias !== canonicalPath) {
+        aliasSet.add(normalizedAlias);
+      }
+    }
+    for (const alias of this.#getPublicGatewayRelayPathAliases()) {
+      const normalizedAlias = normalizePath(alias);
+      if (normalizedAlias && normalizedAlias !== canonicalPath) {
+        aliasSet.add(normalizedAlias);
+      }
+    }
+    target.pathAliases = Array.from(aliasSet);
+    return target;
   }
 
   #isPublicGatewayRelayKey(relayKey) {
@@ -2552,7 +2584,7 @@ export class GatewayService extends EventEmitter {
     if (!metadata.description) {
       metadata.description = 'Replicated public gateway relay dataset';
     }
-    metadata.gatewayPath = this.#getPublicGatewayRelayPath();
+    this.#applyPublicGatewayPathMetadata(metadata);
     metadata.isPublic = true;
     metadata.isGatewayReplica = true;
 

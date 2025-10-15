@@ -1,6 +1,8 @@
 import { readFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 
+const LEGACY_PUBLIC_GATEWAY_PATH = 'public-gateway/hyperbee';
+
 const DEFAULT_CONFIG = {
   host: '0.0.0.0',
   port: Number(process.env.PORT) || 4430,
@@ -45,7 +47,9 @@ const DEFAULT_CONFIG = {
     adminPublicKey: process.env.GATEWAY_RELAY_ADMIN_PUBLIC_KEY || null,
     adminSecretKey: process.env.GATEWAY_RELAY_ADMIN_SECRET_KEY || null,
     statsIntervalMs: Number(process.env.GATEWAY_RELAY_STATS_INTERVAL_MS || 15000),
-    replicationTopic: process.env.GATEWAY_RELAY_REPLICATION_TOPIC || null
+    replicationTopic: process.env.GATEWAY_RELAY_REPLICATION_TOPIC || null,
+    canonicalPath: process.env.GATEWAY_RELAY_CANONICAL_PATH || 'relay',
+    aliasPaths: parseRelayAliasPaths(process.env.GATEWAY_RELAY_ALIAS_PATHS)
   },
   features: {
     hyperbeeRelayEnabled: process.env.GATEWAY_FEATURE_HYPERBEE_RELAY === 'true',
@@ -123,7 +127,47 @@ function loadConfig(overrides = {}) {
     merged.discovery.openAccess = false;
   }
 
+  merged.relay = normalizeRelaySettings(merged.relay);
+
   return merged;
+}
+
+function parseRelayAliasPaths(input) {
+  if (!input) return null;
+  if (Array.isArray(input)) return input.map((value) => (typeof value === 'string' ? value.trim() : value)).filter((value) => typeof value === 'string' && value.length);
+  return String(input)
+    .split(',')
+    .map((value) => value.trim())
+    .filter((value) => value.length);
+}
+
+function normalizeGatewayPathValue(value) {
+  if (!value || typeof value !== 'string') return null;
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  return trimmed.replace(/^\/+/, '').replace(/\/+$/, '');
+}
+
+function normalizeRelaySettings(relayConfig = {}) {
+  const result = { ...relayConfig };
+  const canonicalPath = normalizeGatewayPathValue(result.canonicalPath) || 'relay';
+  const aliasInput = Array.isArray(result.aliasPaths) ? result.aliasPaths : parseRelayAliasPaths(result.aliasPaths);
+  const aliasSet = new Set();
+  const addAlias = (value) => {
+    const normalized = normalizeGatewayPathValue(value);
+    if (normalized) {
+      aliasSet.add(normalized);
+    }
+  };
+
+  addAlias(canonicalPath);
+  (aliasInput || []).forEach(addAlias);
+  addAlias(LEGACY_PUBLIC_GATEWAY_PATH);
+  addAlias('relay');
+
+  result.canonicalPath = canonicalPath;
+  result.aliasPaths = Array.from(aliasSet);
+  return result;
 }
 
 export {
