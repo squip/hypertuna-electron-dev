@@ -220,23 +220,59 @@ export class HypertunaUtils {
     }
 
     static resolvePfpUrl(url, isHypertunaPfp = false) {
-        if (!url) return url;
-        if (!isHypertunaPfp) return url;
+        if (!url) {
+            console.log('[Avatar] resolvePfpUrl called without URL', { isHypertunaPfp });
+            return url;
+        }
+        if (!isHypertunaPfp) {
+            return url;
+        }
 
         const cachedSettings = this.getCachedGatewaySettings();
-        const base = (cachedSettings.gatewayUrl || this.getCachedGatewayUrl() || '').replace(/\/$/, '');
-        if (!base) return url;
+        const baseCandidate = cachedSettings.gatewayUrl || this.getCachedGatewayUrl() || '';
+        const base = baseCandidate.replace(/\/$/, '');
+        const context = {
+            url,
+            baseCandidate,
+            base,
+            isHypertunaPfp
+        };
+
+        if (!base) {
+            console.warn('[Avatar] resolvePfpUrl missing gateway base', context);
+            return url;
+        }
 
         try {
             const parsed = new URL(url, base);
             if (!parsed.pathname.startsWith('/pfp/')) {
+                console.log('[Avatar] resolvePfpUrl non-pfp path', {
+                    ...context,
+                    resolved: url,
+                    pathname: parsed.pathname
+                });
                 return url;
             }
-            return `${base}${parsed.pathname}${parsed.search || ''}`;
-        } catch (_) {
+            const resolved = `${base}${parsed.pathname}${parsed.search || ''}`;
+            console.log('[Avatar] resolvePfpUrl resolved', {
+                ...context,
+                resolved
+            });
+            return resolved;
+        } catch (error) {
             if (url.startsWith('/pfp/')) {
-                return `${base}${url}`;
+                const resolved = `${base}${url}`;
+                console.warn('[Avatar] resolvePfpUrl fallback applied', {
+                    ...context,
+                    resolved,
+                    error: error?.message
+                });
+                return resolved;
             }
+            console.warn('[Avatar] resolvePfpUrl failed to resolve', {
+                ...context,
+                error: error?.message
+            });
         }
         return url;
     }

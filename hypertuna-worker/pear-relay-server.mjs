@@ -200,44 +200,52 @@ export async function connectStoredRelays() {
     connectedRelays = await autoConnectStoredRelays(config);
     console.log(`[RelayServer] Auto-connected to ${connectedRelays.length} relays`);
 
-    if (connectedRelays.length > 0 && config.registerWithGateway) {
+    if (config.registerWithGateway) {
       console.log('[RelayServer] Registering auto-connected relays with gateway...');
 
-      for (const relayKey of connectedRelays) {
+      if (connectedRelays.length > 0) {
+        for (const relayKey of connectedRelays) {
+          try {
+            const profile = await getRelayProfileByKey(relayKey);
+            if (!profile) continue;
+
+            await registerWithGateway(profile);
+
+            let userAuthToken = null;
+            if (profile.auth_config?.requiresAuth && config.nostr_pubkey_hex) {
+              const authorizedUsers = calculateAuthorizedUsers(
+                profile.auth_config.auth_adds || [],
+                profile.auth_config.auth_removes || []
+              );
+              const userAuth = authorizedUsers.find(u => u.pubkey === config.nostr_pubkey_hex);
+              userAuthToken = userAuth?.token || null;
+            }
+
+            const identifierPath = profile.public_identifier
+              ? profile.public_identifier.replace(':', '/')
+              : relayKey;
+            const baseUrl = `${buildGatewayWebsocketBase(config)}/${identifierPath}`;
+            const connectionUrl = userAuthToken ? `${baseUrl}?token=${userAuthToken}` : baseUrl;
+
+            if (global.sendMessage) {
+              global.sendMessage({
+                type: 'relay-registration-complete',
+                relayKey,
+                publicIdentifier: profile.public_identifier,
+                gatewayUrl: connectionUrl,
+                authToken: userAuthToken,
+                timestamp: new Date().toISOString()
+              });
+            }
+          } catch (regError) {
+            console.error(`[RelayServer] Failed to register relay ${relayKey}:`, regError);
+          }
+        }
+      } else {
         try {
-          const profile = await getRelayProfileByKey(relayKey);
-          if (!profile) continue;
-
-          await registerWithGateway(profile);
-
-          let userAuthToken = null;
-          if (profile.auth_config?.requiresAuth && config.nostr_pubkey_hex) {
-            const authorizedUsers = calculateAuthorizedUsers(
-              profile.auth_config.auth_adds || [],
-              profile.auth_config.auth_removes || []
-            );
-            const userAuth = authorizedUsers.find(u => u.pubkey === config.nostr_pubkey_hex);
-            userAuthToken = userAuth?.token || null;
-          }
-
-          const identifierPath = profile.public_identifier
-            ? profile.public_identifier.replace(':', '/')
-            : relayKey;
-          const baseUrl = `${buildGatewayWebsocketBase(config)}/${identifierPath}`;
-          const connectionUrl = userAuthToken ? `${baseUrl}?token=${userAuthToken}` : baseUrl;
-
-          if (global.sendMessage) {
-            global.sendMessage({
-              type: 'relay-registration-complete',
-              relayKey,
-              publicIdentifier: profile.public_identifier,
-              gatewayUrl: connectionUrl,
-              authToken: userAuthToken,
-              timestamp: new Date().toISOString()
-            });
-          }
+          await registerWithGateway();
         } catch (regError) {
-          console.error(`[RelayServer] Failed to register relay ${relayKey}:`, regError);
+          console.error('[RelayServer] Failed to register gateway metadata with no connected relays:', regError);
         }
       }
     }
@@ -521,7 +529,23 @@ function handlePeerConnection(stream, peerInfo) {
     healthState.services.protocolStatus = 'connected';
     
     // Check if this is the gateway
-    const isGatewayHandshake = handshake && (handshake.role === 'gateway' || handshake.isGateway);
+    const gatewayIndicators = {
+      role: handshake?.role || null,
+      isGateway: !!handshake?.isGateway,
+      gatewayReplica: !!handshake?.gatewayReplica
+    };
+    const isGatewayHandshake = handshake && (
+      handshake.role === 'gateway' ||
+      handshake.isGateway === true ||
+      handshake.role === 'gateway-replica' ||
+      handshake.gatewayReplica === true
+    );
+    console.log('[RelayServer] Gateway detection check:', {
+      ...gatewayIndicators,
+      isGatewayHandshake,
+      hasKnownGatewayKey: !!config.gatewayPublicKey,
+      matchesKnownGatewayKey: !!(config.gatewayPublicKey && publicKey.toLowerCase() === config.gatewayPublicKey.toLowerCase())
+    });
 
     if (isGatewayHandshake) {
       console.log('[RelayServer] >>> GATEWAY IDENTIFIED FROM HANDSHAKE <<<');
@@ -690,7 +714,9 @@ function setGatewayConnection(protocol, publicKey) {
 // Process pending registrations
 async function processPendingRegistrations() {
   if (!gatewayConnection) {
-    console.log('[RelayServer] Cannot process pending registrations - no gateway connection');
+    console.log('[RelayServer] Cannot process pending registrations - no gateway connection', {
+      pendingCount: pendingRegistrations.length
+    });
     return;
   }
   
@@ -2249,10 +2275,17 @@ async function registerWithGateway(relayProfileInfo = null, options = {}) {
     }
 
     if (!gatewayConnection) {
-      console.log('[RelayServer] Gateway connection unavailable - queuing registration for later processing');
+      console.log('[RelayServer] Gateway connection unavailable - queuing registration for later processing', {
+        skipQueue,
+        pendingCount: pendingRegistrations.length,
+        hasGatewayConnection: !!gatewayConnection
+      });
       if (!skipQueue) {
         pendingRegistrations.push(relayProfileInfo || null);
-        console.log(`[RelayServer] Pending registrations queued: ${pendingRegistrations.length}`);
+        console.log('[RelayServer] Pending registrations queued', {
+          pendingCount: pendingRegistrations.length,
+          enqueuedWithProfile: !!relayProfileInfo
+        });
       }
       console.log('[RelayServer] ========================================');
       return { queued: true };
@@ -2341,7 +2374,10 @@ async function registerWithGateway(relayProfileInfo = null, options = {}) {
     console.error('[RelayServer] Gateway registration via Hyperswarm FAILED:', error.message);
     if (!skipQueue) {
       pendingRegistrations.push(relayProfileInfo || null);
-      console.log('[RelayServer] Registration re-queued due to failure');
+      console.log('[RelayServer] Registration re-queued due to failure', {
+        pendingCount: pendingRegistrations.length,
+        enqueuedWithProfile: !!relayProfileInfo
+      });
     }
     try {
       if (global.sendMessage && relayProfileInfo) {

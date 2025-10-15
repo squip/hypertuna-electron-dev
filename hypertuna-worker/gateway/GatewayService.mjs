@@ -1181,11 +1181,19 @@ export class GatewayService extends EventEmitter {
     const generalPeers = this._getPeersWithPfpDrives().filter((peerKey) => !ownerPeers.includes(peerKey));
     const candidates = [...ownerPeers, ...generalPeers];
 
-    if (!candidates.length) return null;
+    if (!candidates.length) {
+      this.log('warn', `[PublicGateway] No candidate peers for PFP fetch owner=${owner || 'n/a'} file=${file}`);
+      return null;
+    }
+
+    this.log('debug', `[PublicGateway] Attempting PFP fetch owner=${owner || 'n/a'} file=${file} candidates=${candidates.length}`);
 
     for (const peerKey of candidates) {
       const peer = this.activePeers.find(p => p.publicKey === peerKey);
-      if (!peer) continue;
+      if (!peer) {
+        this.log('debug', `[PublicGateway] Candidate peer missing from active list ${peerKey.slice(0, 8)} owner=${owner || 'n/a'}`);
+        continue;
+      }
       let healthy = this.peerHealthManager.isPeerHealthy(peerKey);
       if (!healthy) {
         try {
@@ -1201,20 +1209,23 @@ export class GatewayService extends EventEmitter {
         const stream = await requestPfpFromPeer(peer, owner || null, file, this.connectionPool);
         peer.lastSeen = Date.now();
         if ((stream.statusCode || 200) === 200) {
+          this.log('info', `[PublicGateway] PFP proxy success owner=${owner || 'n/a'} file=${file} peer=${peerKey.slice(0, 8)}`);
           return stream;
         }
 
         if ((stream.statusCode || 500) === 404) {
+          this.log('debug', `[PublicGateway] Peer responded 404 for PFP owner=${owner || 'n/a'} file=${file} peer=${peerKey.slice(0, 8)}`);
           await this._drainStream(stream);
           continue;
         }
 
         return stream;
       } catch (error) {
-        this.log('warn', `Failed to proxy pfp from peer ${peerKey.slice(0, 8)}: ${error.message}`);
+        this.log('warn', `[PublicGateway] Failed to proxy PFP owner=${owner || 'n/a'} file=${file} peer=${peerKey.slice(0, 8)} error=${error.message}`);
       }
     }
 
+    this.log('warn', `[PublicGateway] Exhausted peers without PFP owner=${owner || 'n/a'} file=${file}`);
     return null;
   }
 
@@ -2244,6 +2255,8 @@ export class GatewayService extends EventEmitter {
     peer.nostrPubkeyHex = nostrPubkeyHex || previousOwner || null;
     peer.pfpDriveKey = pfpDriveKey || previousDriveKey || null;
 
+    this.log('debug', `[PublicGateway] registerPeerMetadata update ${publicKey.slice(0, 8)} owner=${peer.nostrPubkeyHex ? peer.nostrPubkeyHex.slice(0, 8) : 'none'} pfpDrive=${peer.pfpDriveKey ? peer.pfpDriveKey.slice(0, 8) : 'none'}`);
+
     if (peer.nostrPubkeyHex) {
       this._addOwnerMapping(peer.nostrPubkeyHex, publicKey);
     }
@@ -2416,6 +2429,12 @@ export class GatewayService extends EventEmitter {
       if (!payload.publicKey) {
         payload.publicKey = publicKey;
       }
+
+      this.log('debug', '[PublicGateway] register request payload', {
+        peer: publicKey.slice(0, 8),
+        owner: (payload.nostrPubkeyHex || payload.nostr_pubkey_hex || '').slice(0, 8) || null,
+        hasPfpDrive: !!(payload.pfpDriveKey || payload.pfp_drive_key)
+      });
 
       const result = await this.registerPeerMetadata(payload, {
         source: 'hyperswarm',

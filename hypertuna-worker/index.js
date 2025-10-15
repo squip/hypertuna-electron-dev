@@ -103,6 +103,36 @@ async function initializeGatewayOptionsFromSettings() {
   gatewayOptions.hostname = gatewayOptions.hostname || '127.0.0.1'
 }
 
+async function syncGatewayPeerMetadata(reason = 'unspecified') {
+  if (!config?.nostr_pubkey_hex || !config?.swarmPublicKey || !config?.pfpDriveKey) {
+    pendingGatewayMetadataSync = true
+    return
+  }
+  if (!gatewayService) {
+    pendingGatewayMetadataSync = true
+    return
+  }
+
+  try {
+    await gatewayService.registerPeerMetadata({
+      publicKey: config.swarmPublicKey,
+      nostrPubkeyHex: config.nostr_pubkey_hex,
+      pfpDriveKey: config.pfpDriveKey,
+      mode: 'hyperswarm',
+      address: config.proxy_server_address || `${gatewayOptions.hostname || '127.0.0.1'}:${gatewayOptions.port || 8443}`
+    }, { source: reason, skipConnect: true })
+    pendingGatewayMetadataSync = false
+    console.log('[Worker] Synced gateway peer metadata', {
+      reason,
+      owner: config.nostr_pubkey_hex.slice(0, 8),
+      pfpDriveKey: config.pfpDriveKey.slice(0, 8)
+    })
+  } catch (error) {
+    pendingGatewayMetadataSync = true
+    console.warn('[Worker] Failed to sync gateway peer metadata:', error?.message || error)
+  }
+}
+
 async function ensurePublicGatewaySettingsLoaded() {
   if (publicGatewaySettings) return publicGatewaySettings
   try {
@@ -138,6 +168,11 @@ async function startGatewayService(options = {}) {
       }
       sendMessage({ type: 'gateway-status', status })
       if (status?.running) {
+        if (pendingGatewayMetadataSync) {
+          syncGatewayPeerMetadata('gateway-status-running').catch((err) => {
+            console.warn('[Worker] Deferred gateway metadata sync failed on status:', err?.message || err)
+          })
+        }
         const { httpUrl, proxyHost, wsProtocol } = deriveGatewayHostFromStatus(status)
         if (!gatewaySettingsApplied) {
           try {
@@ -157,6 +192,11 @@ async function startGatewayService(options = {}) {
       publicGatewayStatusCache = state
       sendMessage({ type: 'public-gateway-status', state })
     })
+    if (pendingGatewayMetadataSync) {
+      syncGatewayPeerMetadata('gateway-service-initialized').catch((err) => {
+        console.warn('[Worker] Deferred gateway metadata sync failed:', err?.message || err)
+      })
+    }
   }
 
   await gatewayService.updatePublicGatewayConfig(publicGatewaySettings)
@@ -197,6 +237,11 @@ async function startGatewayService(options = {}) {
     gatewaySettingsApplied = false
     await gatewayService.start(mergedOptions)
     gatewayOptions = mergedOptions
+    if (pendingGatewayMetadataSync) {
+      syncGatewayPeerMetadata('gateway-started').catch((err) => {
+        console.warn('[Worker] Deferred gateway metadata sync failed after start:', err?.message || err)
+      })
+    }
   } catch (error) {
     console.error('[Worker] Failed to start gateway service:', error)
     throw error
@@ -272,6 +317,7 @@ let gatewaySettingsApplied = false
 let gatewayOptions = { port: 8443, hostname: '127.0.0.1', listenHost: '127.0.0.1' }
 let publicGatewaySettings = null
 let publicGatewayStatusCache = null
+let pendingGatewayMetadataSync = false
 
 async function appendFilekeyDbEntry (relayKey, fileHash) {
   if (!config?.driveKey || !config?.nostr_pubkey_hex) {
@@ -1673,6 +1719,11 @@ async function main() {
     const pfpConfig = { ...config, storage: global.userConfig.storage, pfpDriveKey: config.pfpDriveKey }
     await initializePfpHyperdrive(pfpConfig);
     config.pfpDriveKey = pfpConfig.pfpDriveKey;
+    if (config.pfpDriveKey) {
+      syncGatewayPeerMetadata('pfp-drive-ready').catch((err) => {
+        console.warn('[Worker] Gateway metadata sync failed (pfp-drive-ready):', err?.message || err)
+      })
+    }
 
     if ((!hadDriveKey && config.driveKey) || (!hadPfpDriveKey && config.pfpDriveKey)) {
       try {

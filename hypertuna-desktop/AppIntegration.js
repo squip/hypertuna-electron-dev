@@ -1596,6 +1596,13 @@ function integrateNostrRelays(App) {
             if (!this.currentUser.pictureTagUrl) this.currentUser.pictureTagUrl = null;
             this.currentUser.pictureIsHypertunaPfp = !!this.currentUser.pictureIsHypertunaPfp;
             this.currentUser.tempAvatarPreview = null;
+
+            console.log('[Avatar] loadUserFromLocalStorage', {
+                hasPicture: !!this.currentUser.picture,
+                picturePreview: this.currentUser.picture ? this.currentUser.picture.slice(0, 60) : null,
+                pictureTagUrl: this.currentUser.pictureTagUrl,
+                pictureIsHypertunaPfp: this.currentUser.pictureIsHypertunaPfp
+            });
             
             // Check for Hypertuna configuration
             ConfigLogger.log('LOAD', {
@@ -1719,12 +1726,14 @@ function integrateNostrRelays(App) {
         
         // Try to get profile from nostr client cache
         let profile = null;
+        let profileSource = 'nostr-cache';
         if (this.nostr && this.nostr.client) {
             profile = this.nostr.client.cachedProfiles.get(this.currentUser.pubkey);
         }
         
         // If no profile found, use basic info
         if (!profile) {
+            profileSource = 'local-fallback';
             profile = {
                 name: this.currentUser.name || 'User_' + NostrUtils.truncatePubkey(this.currentUser.pubkey),
                 about: this.currentUser.about || '',
@@ -1752,19 +1761,27 @@ function integrateNostrRelays(App) {
         
         const name = profile.name || 'User_' + NostrUtils.truncatePubkey(this.currentUser.pubkey);
         let resolvedPicture = null;
+        let resolvedPictureSource = null;
         if (this.currentUser?.tempAvatarPreview) {
             resolvedPicture = this.currentUser.tempAvatarPreview;
+            resolvedPictureSource = 'temp-preview';
         } else if (profile) {
             const tagUrl = profile.pictureTagUrl || profile.picture || this.currentUser.picture || null;
             if (tagUrl) {
                 resolvedPicture = HypertunaUtils.resolvePfpUrl(tagUrl, profile.pictureIsHypertunaPfp);
+                resolvedPictureSource = profile.pictureIsHypertunaPfp ? 'hypertuna-tag' : 'direct-url';
             }
         }
         
-        console.log('Updating profile display with:', {
-            name: profile.name,
-            about: profile.about ? profile.about.substring(0, 30) + '...' : undefined,
-            picture: profile.picture ? 'present' : undefined
+        console.log('[Avatar] updateProfileDisplay invoked', {
+            profileSource,
+            hasTempPreview: !!this.currentUser?.tempAvatarPreview,
+            tagUrl: profile.pictureTagUrl || null,
+            rawPicture: profile.picture || null,
+            currentUserPicture: this.currentUser.picture || null,
+            pictureIsHypertunaPfp: profile.pictureIsHypertunaPfp,
+            resolvedPictureSource,
+            resolvedPicture: resolvedPicture || null
         });
         
         // Update profile display on auth page with null checks
@@ -1836,13 +1853,38 @@ function integrateNostrRelays(App) {
             const avatar = document.querySelector(selector);
             if (avatar) {
                 if (resolvedPicture) {
-                    console.log(`Setting profile picture from URL: ${resolvedPicture}`);
-                    avatar.innerHTML = `<img src="${resolvedPicture}" alt="${name}" style="width: 100%; height: 100%; border-radius: 50%; object-fit: cover;">`;
+                    console.log('[Avatar] applying profile picture', { selector, resolvedPicture });
+                    const img = document.createElement('img');
+                    img.src = resolvedPicture;
+                    img.alt = name;
+                    img.style.width = '100%';
+                    img.style.height = '100%';
+                    img.style.borderRadius = '50%';
+                    img.style.objectFit = 'cover';
+                    img.addEventListener('load', () => {
+                        console.log('[Avatar] profile image loaded', {
+                            selector,
+                            resolvedPicture,
+                            naturalWidth: img.naturalWidth,
+                            naturalHeight: img.naturalHeight
+                        });
+                    });
+                    img.addEventListener('error', () => {
+                        console.error('[Avatar] profile image failed to load', {
+                            selector,
+                            resolvedPicture,
+                            timestamp: new Date().toISOString()
+                        });
+                    });
+                    avatar.innerHTML = '';
+                    avatar.appendChild(img);
                 } else {
-                    console.log(`Using initials for profile avatar: ${name.charAt(0).toUpperCase()}`);
+                    console.log('[Avatar] using initials for profile avatar', { selector, initial: name.charAt(0).toUpperCase() });
                     // Use first character of name as avatar
                     avatar.innerHTML = `<span>${name.charAt(0).toUpperCase()}</span>`;
                 }
+            } else {
+                console.warn('[Avatar] avatar container not found', { selector });
             }
         };
         
@@ -1953,6 +1995,14 @@ function integrateNostrRelays(App) {
     App.finalizePendingAvatarUpload = async function(pendingAvatar) {
         if (!pendingAvatar) return;
 
+        console.log('[Avatar] finalizePendingAvatarUpload invoked', {
+            owner: pendingAvatar.owner,
+            fileHash: pendingAvatar.fileHash,
+            pictureUrl: pendingAvatar.pictureUrl,
+            tagUrl: pendingAvatar.tagUrl,
+            hasPreview: !!pendingAvatar.preview
+        });
+
         if (this.currentUser?.expectedPfpFileHash && this.currentUser.expectedPfpFileHash !== pendingAvatar.fileHash) {
             console.warn('Ignoring stale avatar upload confirmation for', pendingAvatar.fileHash);
             return;
@@ -1975,6 +2025,11 @@ function integrateNostrRelays(App) {
         this.currentUser.pictureIsHypertunaPfp = true;
         this.currentUser.expectedPfpFileHash = null;
         this.saveUserToLocalStorage();
+        console.log('[Avatar] finalizePendingAvatarUpload persisted', {
+            currentUserPicture: this.currentUser.picture,
+            pictureTagUrl: this.currentUser.pictureTagUrl,
+            pictureIsHypertunaPfp: this.currentUser.pictureIsHypertunaPfp
+        });
         this.updateProfileDisplay();
         console.log('[Avatar] finalized uploaded image', { owner: pendingAvatar.owner, fileHash: pendingAvatar.fileHash });
     };
@@ -5091,6 +5146,26 @@ App.setupFollowingModalListeners = function() {
             };
         }
 
+        const pictureSourceLog = pictureSource ? {
+            fromPending: !!pictureSource.fromPending,
+            fromHypertuna: !!pictureSource.fromHypertuna,
+            fromForcePicture: !!forcePicture,
+            hasPreview: !!pictureSource.preview,
+            pictureUrl: pictureSource.pictureUrl,
+            tagUrl: pictureSource.tagUrl,
+            fileHash: pictureSource.fileHash,
+            mimeType: pictureSource.mimeType
+        } : null;
+
+        console.log('[Avatar] updateProfile prepared', {
+            silent,
+            omitPendingAvatar,
+            hasForcePicture: !!forcePicture,
+            nameLength: name.length,
+            aboutLength: about.length,
+            pictureSource: pictureSourceLog
+        });
+
         if (pictureSource?.pictureUrl) {
             const preferHypertuna = (pictureSource.fromPending || pictureSource.fromHypertuna || !!forcePicture) && pictureSource.tagUrl;
             if (preferHypertuna) {
@@ -5130,6 +5205,11 @@ App.setupFollowingModalListeners = function() {
             }
 
             this.saveUserToLocalStorage();
+            console.log('[Avatar] updateProfile persisted', {
+                currentUserPicture: this.currentUser.picture,
+                pictureTagUrl: this.currentUser.pictureTagUrl,
+                pictureIsHypertunaPfp: this.currentUser.pictureIsHypertunaPfp
+            });
             this.updateProfileDisplay();
 
             if (!silent) {

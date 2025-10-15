@@ -28,7 +28,8 @@ class NostrIntegration {
         this.client = new NostrGroupClient();
         this.relayUrls = [
             // Default relays - can be configured by the user
-            'wss://relay.nostr.band'
+            // 'wss://relay.nostr.band'
+            'wss://hypertuna.com/relay'
         ];
         
         // Track last update to prevent excessive updates
