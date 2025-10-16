@@ -103,7 +103,97 @@ async function initializeGatewayOptionsFromSettings() {
   gatewayOptions.hostname = gatewayOptions.hostname || '127.0.0.1'
 }
 
-async function syncGatewayPeerMetadata(reason = 'unspecified') {
+function normalizeGatewayPathFragment(fragment) {
+  if (typeof fragment !== 'string') return null
+  const trimmed = fragment.trim()
+  if (!trimmed) return null
+  return trimmed.replace(/^\//, '').replace(/\/+$/, '')
+}
+
+function resolveRelayIdentifierPath(identifier) {
+  if (!identifier || typeof identifier !== 'string') return null
+  return identifier.includes(':') ? identifier.replace(':', '/') : identifier
+}
+
+async function buildGatewayRelayMetadataSnapshot(precomputedRelays = null) {
+  if (!relayServer?.getActiveRelays) {
+    return { entries: [], relayCount: 0 }
+  }
+
+  try {
+    const activeRelays = Array.isArray(precomputedRelays)
+      ? precomputedRelays
+      : await relayServer.getActiveRelays()
+
+    const entries = []
+
+    for (const relay of activeRelays) {
+      if (!relay) continue
+      const {
+        relayKey,
+        publicIdentifier,
+        name,
+        description,
+        connectionUrl,
+        createdAt,
+        isActive = true
+      } = relay
+
+      const primaryIdentifier = publicIdentifier || relayKey
+      if (!primaryIdentifier) continue
+
+      const gatewayPath = normalizeGatewayPathFragment(resolveRelayIdentifierPath(primaryIdentifier))
+      const effectiveConnectionUrl = connectionUrl || `${buildGatewayWebsocketBase(config)}/${gatewayPath || primaryIdentifier}`
+
+      const baseMetadata = {
+        identifier: primaryIdentifier,
+        name,
+        description,
+        gatewayPath: gatewayPath || normalizeGatewayPathFragment(primaryIdentifier),
+        connectionUrl: effectiveConnectionUrl,
+        isPublic: isActive !== false,
+        metadataUpdatedAt: createdAt || null
+      }
+
+      const aliasSet = new Set()
+      if (relayKey && relayKey !== primaryIdentifier) {
+        const normalizedAlias = normalizeGatewayPathFragment(relayKey)
+        if (normalizedAlias) {
+          aliasSet.add(normalizedAlias)
+        }
+      }
+
+      if (aliasSet.size > 0) {
+        baseMetadata.pathAliases = Array.from(aliasSet)
+      }
+
+      entries.push(baseMetadata)
+
+      if (relayKey && relayKey !== primaryIdentifier) {
+        const aliasPath = normalizeGatewayPathFragment(relayKey)
+        const aliasConnectionUrl = `${buildGatewayWebsocketBase(config)}/${aliasPath || relayKey}`
+        const aliasMetadata = {
+          identifier: relayKey,
+          name,
+          description,
+          gatewayPath: aliasPath || relayKey,
+          connectionUrl: aliasConnectionUrl,
+          isPublic: isActive !== false,
+          metadataUpdatedAt: createdAt || null,
+          pathAliases: gatewayPath ? [gatewayPath] : []
+        }
+        entries.push(aliasMetadata)
+      }
+    }
+
+    return { entries, relayCount: activeRelays.length }
+  } catch (error) {
+    console.warn('[Worker] Failed to enumerate relays for gateway sync:', error?.message || error)
+    return { entries: [], relayCount: 0 }
+  }
+}
+
+async function syncGatewayPeerMetadata(reason = 'unspecified', options = {}) {
   if (!config?.nostr_pubkey_hex || !config?.swarmPublicKey || !config?.pfpDriveKey) {
     pendingGatewayMetadataSync = true
     return
@@ -114,18 +204,24 @@ async function syncGatewayPeerMetadata(reason = 'unspecified') {
   }
 
   try {
+    const { relays: precomputedRelays } = options
+    const { entries, relayCount } = await buildGatewayRelayMetadataSnapshot(precomputedRelays)
+
     await gatewayService.registerPeerMetadata({
       publicKey: config.swarmPublicKey,
       nostrPubkeyHex: config.nostr_pubkey_hex,
       pfpDriveKey: config.pfpDriveKey,
       mode: 'hyperswarm',
-      address: config.proxy_server_address || `${gatewayOptions.hostname || '127.0.0.1'}:${gatewayOptions.port || 8443}`
+      address: config.proxy_server_address || `${gatewayOptions.hostname || '127.0.0.1'}:${gatewayOptions.port || 8443}`,
+      relays: entries
     }, { source: reason, skipConnect: true })
     pendingGatewayMetadataSync = false
     console.log('[Worker] Synced gateway peer metadata', {
       reason,
       owner: config.nostr_pubkey_hex.slice(0, 8),
-      pfpDriveKey: config.pfpDriveKey.slice(0, 8)
+      pfpDriveKey: config.pfpDriveKey.slice(0, 8),
+      relayCount,
+      aliasEntries: Math.max(entries.length - relayCount, 0)
     })
   } catch (error) {
     pendingGatewayMetadataSync = true
@@ -1320,6 +1416,7 @@ async function handleMessageObject(message) {
           }
 
           const relays = await relayServer.getActiveRelays()
+          await syncGatewayPeerMetadata('relay-created', { relays })
           const relaysAuth = await addAuthInfoToRelays(relays)
           sendMessage({
             type: 'relay-update',
@@ -1357,6 +1454,7 @@ async function handleMessageObject(message) {
           })
 
           const relays = await relayServer.getActiveRelays()
+          await syncGatewayPeerMetadata('relay-joined', { relays })
           const relaysAuth = await addAuthInfoToRelays(relays)
           sendMessage({
             type: 'relay-update',
@@ -1388,6 +1486,7 @@ async function handleMessageObject(message) {
           })
 
           const relays = await relayServer.getActiveRelays()
+          await syncGatewayPeerMetadata('relay-disconnected', { relays })
           const relaysAuth = await addAuthInfoToRelays(relays)
           sendMessage({
             type: 'relay-update',
@@ -1790,6 +1889,8 @@ async function main() {
         }
       })()
 
+      global.waitForGatewayReady = () => gatewayReadyPromise
+
       const connectRelaysPromise = (async () => {
         try {
           return await relayServer.connectStoredRelays()
@@ -1805,6 +1906,13 @@ async function main() {
 
       if (Array.isArray(connectedRelays)) {
         config.relays = connectedRelays
+      }
+
+      try {
+        const relaysSnapshot = await relayServer.getActiveRelays()
+        await syncGatewayPeerMetadata('auto-connect-complete', { relays: relaysSnapshot })
+      } catch (syncError) {
+        console.warn('[Worker] Gateway metadata sync failed (auto-connect-complete):', syncError?.message || syncError)
       }
 
       if (!isShuttingDown) {

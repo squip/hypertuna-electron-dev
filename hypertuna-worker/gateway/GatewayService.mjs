@@ -2321,6 +2321,20 @@ export class GatewayService extends EventEmitter {
           nextMetadata.gatewayPath = gatewayPath;
         }
 
+        if (Array.isArray(relayObj.pathAliases)) {
+          const aliasSet = new Set(Array.isArray(nextMetadata.pathAliases) ? nextMetadata.pathAliases : []);
+          for (const rawAlias of relayObj.pathAliases) {
+            if (typeof rawAlias !== 'string') continue;
+            const normalizedAlias = rawAlias.trim().replace(/^\//, '').replace(/\/+$/, '');
+            if (!normalizedAlias) continue;
+            if (gatewayPath && normalizedAlias === gatewayPath) continue;
+            aliasSet.add(normalizedAlias);
+          }
+          if (aliasSet.size > 0) {
+            nextMetadata.pathAliases = Array.from(aliasSet);
+          }
+        }
+
         if (typeof relayObj.isPublic === 'boolean') {
           nextMetadata.isPublic = relayObj.isPublic;
         } else if (nextMetadata.isPublic === undefined) {
@@ -2767,6 +2781,8 @@ export class GatewayService extends EventEmitter {
       return;
     }
 
+    const candidateList = Array.from(candidateIdentifiers);
+    this.log('warn', `[PublicGateway] Rejecting websocket connection for unknown relay path "${strippedPath}" candidates=${candidateList.length ? candidateList.join(',') : 'none'} activeRelays=${this.activeRelays.size}`);
     ws.close(1008, 'Invalid relay key');
   }
 

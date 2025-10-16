@@ -210,33 +210,6 @@ export async function connectStoredRelays() {
             if (!profile) continue;
 
             await registerWithGateway(profile);
-
-            let userAuthToken = null;
-            if (profile.auth_config?.requiresAuth && config.nostr_pubkey_hex) {
-              const authorizedUsers = calculateAuthorizedUsers(
-                profile.auth_config.auth_adds || [],
-                profile.auth_config.auth_removes || []
-              );
-              const userAuth = authorizedUsers.find(u => u.pubkey === config.nostr_pubkey_hex);
-              userAuthToken = userAuth?.token || null;
-            }
-
-            const identifierPath = profile.public_identifier
-              ? profile.public_identifier.replace(':', '/')
-              : relayKey;
-            const baseUrl = `${buildGatewayWebsocketBase(config)}/${identifierPath}`;
-            const connectionUrl = userAuthToken ? `${baseUrl}?token=${userAuthToken}` : baseUrl;
-
-            if (global.sendMessage) {
-              global.sendMessage({
-                type: 'relay-registration-complete',
-                relayKey,
-                publicIdentifier: profile.public_identifier,
-                gatewayUrl: connectionUrl,
-                authToken: userAuthToken,
-                timestamp: new Date().toISOString()
-              });
-            }
           } catch (regError) {
             console.error(`[RelayServer] Failed to register relay ${relayKey}:`, regError);
           }
@@ -2330,6 +2303,17 @@ async function registerWithGateway(relayProfileInfo = null, options = {}) {
     }
 
     if (global.sendMessage) {
+      const readinessFn = (typeof global.waitForGatewayReady === 'function') ? global.waitForGatewayReady : null;
+      if (readinessFn) {
+        try {
+          await readinessFn();
+        } catch (waitError) {
+          console.warn('[RelayServer] Proceeding despite gateway readiness wait failure:', waitError?.message || waitError);
+        }
+        if (global.waitForGatewayReady === readinessFn) {
+          delete global.waitForGatewayReady;
+        }
+      }
       global.sendMessage({
         type: 'gateway-registered',
         data: ack || { statusCode: response.statusCode }
