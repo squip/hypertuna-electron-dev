@@ -1539,6 +1539,13 @@ async fetchMultipleProfiles(pubkeys) {
             const identifier = relay.publicIdentifier || relay.relayKey;
             if (!identifier) continue;
 
+            const isGatewayReplica = relay.isGatewayReplica === true
+                || (relay.metadata && relay.metadata.isGatewayReplica === true)
+                || identifier === 'public-gateway:hyperbee';
+            if (isGatewayReplica || !relay.publicIdentifier) {
+                continue;
+            }
+
             const requiresAuth = typeof relay.requiresAuth === 'boolean' ? relay.requiresAuth : false;
             const connectionUrl = relay.connectionUrl || relay.gatewayUrl || null;
             const baseUrl = connectionUrl ? this._getBaseRelayUrl(connectionUrl) : null;
@@ -1585,10 +1592,9 @@ async fetchMultipleProfiles(pubkeys) {
             if (baseUrl) {
                 const groupTag = ['group', identifier, baseUrl, relayName, 'hypertuna:relay'];
                 const rTag = ['r', baseUrl, 'hypertuna:relay'];
+                publicTags.push(groupTag, rTag);
                 if (requiresAuth) {
                     privateTags.push(groupTag, rTag);
-                } else {
-                    publicTags.push(groupTag, rTag);
                 }
                 shouldPublishSnapshot = true;
             }
