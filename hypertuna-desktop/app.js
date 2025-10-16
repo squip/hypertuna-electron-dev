@@ -2470,6 +2470,14 @@ function hydrateRelayListFromCache() {
   if (Array.isArray(cachedRelays) && cachedRelays.length) {
     relays = cachedRelays
     renderRelayListContent(cachedRelays, { showEmpty: false })
+    const client = window.App?.nostr?.client
+    const ingestFn = client?.ingestStoredRelays
+    if (typeof ingestFn === 'function') {
+      Promise.resolve(ingestFn.call(client, cachedRelays))
+        .catch((error) => {
+          console.warn('[App] Failed to ingest cached relays into Nostr client:', error)
+        })
+    }
     relayCacheHydrated = true
   }
 }
@@ -2482,6 +2490,15 @@ function updateRelayList(relayData) {
   
   if (relays.length) {
     saveRelayCache(relays)
+  }
+
+  const client = window.App?.nostr?.client
+  const ingestFn = client?.ingestStoredRelays
+  if (typeof ingestFn === 'function') {
+    Promise.resolve(ingestFn.call(client, relays))
+      .catch((error) => {
+        console.warn('[App] Failed to ingest relays into Nostr client:', error)
+      })
   }
 
   const shouldShowEmpty = relayInitializationComplete && relays.length === 0

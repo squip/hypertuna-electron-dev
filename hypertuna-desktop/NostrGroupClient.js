@@ -1436,20 +1436,21 @@ async fetchMultipleProfiles(pubkeys) {
      */
     async fetchUserRelayList() {
         if (!this.user || !this.user.pubkey) return;
-    
+
         return new Promise((resolve) => {
             const subId = `relaylist-${this.user.pubkey.substring(0,8)}`;
             let received = false;
-    
-            const timeoutId = setTimeout(async () => {
+
+            const timeoutId = setTimeout(() => {
                 this.relayManager.unsubscribe(subId);
                 if (!received) {
-                    await this._createEmptyRelayList();
+                    console.warn('[NostrGroupClient] Relay list fetch timed out; using stored state');
+                    this.relayListLoaded = true;
+                    this.emit('relaylist:update', { ids: Array.from(this.userRelayIds) });
                 }
-                console.log('Fetched user relay list event:', this.userRelayListEvent);
                 resolve();
             }, 5000);
-    
+
             this.relayManager.subscribe(subId, [
                 { kinds: [NostrEvents.KIND_USER_RELAY_LIST], authors: [this.user.pubkey], limit: 1 }
             ], async (event) => {
@@ -1464,43 +1465,44 @@ async fetchMultipleProfiles(pubkeys) {
     }
 
     async _parseRelayListEvent(event) {
-        this.userRelayIds.clear();
-        if (!event) return;
-        
-        event.tags.forEach(t => {
-            if (t[0] === 'group' && t[1] && t[t.length - 1] === 'hypertuna:relay') {
-                this.userRelayIds.add(t[1]);
-            }
-        });
-    
-        if (!event.content) {
-            this.relayListLoaded = true;  // ADD THIS LINE
-            console.log('Parsed relay list. Current user relay IDs:', Array.from(this.userRelayIds));
+        const ids = new Set(this.userRelayIds);
+        if (!event) {
+            this.userRelayIds = ids;
+            this.relayListLoaded = true;
             this.emit('relaylist:update', { ids: Array.from(this.userRelayIds) });
             return;
         }
-    
-        let decoded = null;
-        try {
-            decoded = await NostrUtils.decrypt(this.user.privateKey, this.user.pubkey, event.content);
-        } catch (e) {
+
+        event.tags.forEach(t => {
+            if (t[0] === 'group' && t[1] && t[t.length - 1] === 'hypertuna:relay') {
+                ids.add(t[1]);
+            }
+        });
+
+        if (event.content) {
+            let decoded = null;
             try {
-                decoded = event.content;
-            } catch {}
+                decoded = await NostrUtils.decrypt(this.user.privateKey, this.user.pubkey, event.content);
+            } catch (e) {
+                try {
+                    decoded = event.content;
+                } catch (_) {}
+            }
+
+            if (decoded) {
+                try {
+                    const arr = JSON.parse(decoded);
+                    arr.forEach(t => {
+                        if (Array.isArray(t) && t[0] === 'group' && t[1] && t[t.length - 1] === 'hypertuna:relay') {
+                            ids.add(t[1]);
+                        }
+                    });
+                } catch (_) {}
+            }
         }
-    
-        if (decoded) {
-            try {
-                const arr = JSON.parse(decoded);
-                arr.forEach(t => {
-                    if (Array.isArray(t) && t[0] === 'group' && t[1] && t[t.length - 1] === 'hypertuna:relay') {
-                        this.userRelayIds.add(t[1]);
-                    }
-                });
-            } catch {}
-        }
-        
-        this.relayListLoaded = true;  // ADD THIS LINE
+
+        this.userRelayIds = ids;
+        this.relayListLoaded = true;
         console.log('Parsed relay list. Current user relay IDs:', Array.from(this.userRelayIds));
         this.emit('relaylist:update', { ids: Array.from(this.userRelayIds) });
     }
@@ -1513,6 +1515,116 @@ async fetchMultipleProfiles(pubkeys) {
         this.relayListLoaded = true;
         this.emit('relaylist:update', { ids: Array.from(this.userRelayIds) });
         console.log('Created empty user relay list event');
+    }
+
+    async ingestStoredRelays(relayEntries = []) {
+        if (!Array.isArray(relayEntries)) {
+            return;
+        }
+
+        if (relayEntries.length === 0) {
+            if (!this.relayListLoaded) {
+                this.relayListLoaded = true;
+                this.emit('relaylist:update', { ids: Array.from(this.userRelayIds) });
+            }
+            return;
+        }
+
+        const publicTags = [];
+        const privateTags = [];
+        let shouldPublishSnapshot = false;
+
+        for (const relay of relayEntries) {
+            if (!relay) continue;
+            const identifier = relay.publicIdentifier || relay.relayKey;
+            if (!identifier) continue;
+
+            const requiresAuth = typeof relay.requiresAuth === 'boolean' ? relay.requiresAuth : false;
+            const connectionUrl = relay.connectionUrl || relay.gatewayUrl || null;
+            const baseUrl = connectionUrl ? this._getBaseRelayUrl(connectionUrl) : null;
+            const relayName = relay.name || '';
+            const authToken = relay.userAuthToken || relay.authToken || null;
+
+            this.userRelayIds.add(identifier);
+            if (connectionUrl) {
+                this.groupRelayUrls.set(identifier, connectionUrl);
+            }
+
+            if (authToken) {
+                this.relayAuthTokens.set(identifier, authToken);
+            }
+
+            const readiness = this.relayReadyStates.get(identifier) || {};
+            this.relayReadyStates.set(identifier, {
+                ...readiness,
+                isInitialized: true,
+                isRegistered: true,
+                relayUrl: connectionUrl || readiness.relayUrl || null,
+                requiresAuth,
+                authToken: authToken || readiness.authToken || null
+            });
+
+            if (!this.pendingRelayConnections.has(identifier)) {
+                if (connectionUrl) {
+                    this.queueRelayConnection(identifier, connectionUrl);
+                } else if (baseUrl) {
+                    this.queueRelayConnection(identifier, baseUrl);
+                }
+            } else {
+                const connection = this.pendingRelayConnections.get(identifier);
+                if (connection) {
+                    connection.isInitialized = true;
+                    connection.isRegistered = true;
+                    connection.requiresAuth = requiresAuth;
+                    if (connectionUrl) {
+                        connection.relayUrl = connectionUrl;
+                    }
+                }
+            }
+
+            if (baseUrl) {
+                const groupTag = ['group', identifier, baseUrl, relayName, 'hypertuna:relay'];
+                const rTag = ['r', baseUrl, 'hypertuna:relay'];
+                if (requiresAuth) {
+                    privateTags.push(groupTag, rTag);
+                } else {
+                    publicTags.push(groupTag, rTag);
+                }
+                shouldPublishSnapshot = true;
+            }
+        }
+
+        this.relayListLoaded = true;
+        this.emit('relaylist:update', { ids: Array.from(this.userRelayIds) });
+
+        if (!this.user || !this.user.privateKey || !shouldPublishSnapshot) {
+            return;
+        }
+
+        const existingIdsCount = Array.isArray(this.userRelayListEvent?.tags)
+            ? this.userRelayListEvent.tags.filter(tag => tag[0] === 'group' && tag[tag.length - 1] === 'hypertuna:relay').length
+            : 0;
+
+        const needsSnapshot =
+            !this.userRelayListEvent ||
+            (!existingIdsCount && (publicTags.length || privateTags.length));
+
+        if (needsSnapshot) {
+            try {
+                const snapshotEvent = await NostrEvents.createUserRelayListEvent(publicTags, privateTags, this.user.privateKey);
+                this.userRelayListEvent = snapshotEvent;
+                const rawDiscovery = this.relayManager?.discoveryRelays;
+                const discoveryRelays = rawDiscovery
+                    ? (Array.isArray(rawDiscovery) ? rawDiscovery : Array.from(rawDiscovery))
+                    : [];
+                if (discoveryRelays.length) {
+                    await this.relayManager.publishToRelays(snapshotEvent, discoveryRelays);
+                }
+                console.log('[NostrGroupClient] Published relay list snapshot derived from stored relays');
+            } catch (error) {
+                console.warn('[NostrGroupClient] Failed to publish relay list snapshot:', error);
+            }
+        }
     }
 
     async updateUserRelayList(publicIdentifier, gatewayUrl, isPublic, add = true) {
