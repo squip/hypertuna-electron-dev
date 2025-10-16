@@ -271,6 +271,16 @@ class NostrIntegration {
                 this._initialGroupsLoaded = true;
                 this.app.loadGroups();
             }
+            if (typeof this.app === 'object') {
+                this.app.discoverRelaysCache = null;
+                this.app.discoverRelaysCacheTime = 0;
+            }
+            if (typeof this.app.loadDiscoverRelays === 'function') {
+                const force = this.app.currentListView === 'discover';
+                this.app.loadDiscoverRelays(force).catch((err) => {
+                    console.warn('Failed to refresh discover relays after relay list update:', err);
+                });
+            }
         });
 
         // Invite updates

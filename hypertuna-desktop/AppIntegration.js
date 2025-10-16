@@ -4210,6 +4210,7 @@ App.loadDiscoverRelays = async function(force = false) {
         const followRelayMap = await this.nostr.client.discoverRelaysFromFollows();
         const userRelayIds = this.nostr.client.userRelayIds || new Set();
         const entries = [];
+        const seenIdentifiers = new Set();
         const gatewayBaseUrl = await this.resolveLocalGatewayBase();
 
         for (const [identifier, relayInfo] of this.gatewayPeerRelayMap.entries()) {
@@ -4218,6 +4219,16 @@ App.loadDiscoverRelays = async function(force = false) {
             const metadata = relayInfo.metadata && typeof relayInfo.metadata === 'object'
                 ? relayInfo.metadata
                 : {};
+            const mappedIdentifier = this.nostr?.client?.internalToPublicMap?.get(identifier);
+            const canonicalIdentifier = mappedIdentifier || metadata.identifier || identifier;
+            if (metadata.isGatewayReplica === true || canonicalIdentifier === 'public-gateway:hyperbee') {
+                console.log('[Discover] Skipping gateway replica relay', canonicalIdentifier);
+                continue;
+            }
+            if (seenIdentifiers.has(canonicalIdentifier)) {
+                console.log('[Discover] Already processed relay', canonicalIdentifier);
+                continue;
+            }
             const followerInfo = followRelayMap.get(identifier);
             const followerCount = followerInfo?.followerCount || 0;
 
@@ -4228,14 +4239,20 @@ App.loadDiscoverRelays = async function(force = false) {
                     : true);
 
             if (!isPublic && followerCount === 0) {
+                console.log('[Discover] Skipping private relay with zero followers', canonicalIdentifier);
                 continue;
             }
 
-            if (userRelayIds instanceof Set && userRelayIds.has(identifier)) {
+            if (userRelayIds instanceof Set && (userRelayIds.has(canonicalIdentifier) || userRelayIds.has(identifier))) {
+                console.log('[Discover] Skipping relay due to userRelayIds match', canonicalIdentifier, {
+                    hasCanonical: userRelayIds.has(canonicalIdentifier),
+                    hasRaw: userRelayIds.has(identifier)
+                });
                 continue;
             }
 
-            if (typeof this.nostr.isGroupMember === 'function' && this.nostr.isGroupMember(identifier, this.currentUser.pubkey)) {
+            if (typeof this.nostr.isGroupMember === 'function' && this.nostr.isGroupMember(canonicalIdentifier, this.currentUser.pubkey)) {
+                console.log('[Discover] Skipping relay due to group membership', canonicalIdentifier);
                 continue;
             }
 
@@ -4251,13 +4268,14 @@ App.loadDiscoverRelays = async function(force = false) {
                         : 0;
 
             const groupData = followerInfo?.group || null;
-            const hypertunaId = groupData?.hypertunaId || identifier;
+            const hypertunaId = groupData?.hypertunaId || canonicalIdentifier;
             const avatarUrl = metadata.avatarUrl || (groupData ? this.resolveGroupAvatar(groupData) : null);
             const gatewayPath = this.normalizeGatewayPath(identifier, metadata);
             const connectionUrl = gatewayPath ? `${gatewayBaseUrl}/${gatewayPath}` : null;
 
             entries.push({
-                identifier,
+                identifier: canonicalIdentifier,
+                sourceIdentifier: identifier,
                 hypertunaId,
                 name,
                 description,
@@ -4272,9 +4290,14 @@ App.loadDiscoverRelays = async function(force = false) {
                 metadataEventId: metadata.metadataEventId || null
             });
 
+            seenIdentifiers.add(canonicalIdentifier);
+            if (canonicalIdentifier !== identifier) {
+                seenIdentifiers.add(identifier);
+            }
+
             if (connectionUrl && this.nostr?.client) {
                 try {
-                    this.nostr.client.queueRelayConnection(identifier, connectionUrl);
+                    this.nostr.client.queueRelayConnection(canonicalIdentifier, connectionUrl);
                 } catch (err) {
                     console.warn('Failed to queue relay connection', identifier, err);
                 }
