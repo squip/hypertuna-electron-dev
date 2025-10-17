@@ -17,6 +17,12 @@ class HyperswarmConnection {
     this.connectPromise = null;
     this.lastUsed = Date.now();
     this.connectionAttempts = 0;
+    this.lastHealthyAt = 0;
+    this.failureCount = 0;
+    this._lifecycleCleanup = null;
+    this._connectionClosed = false;
+    this.lastDisconnectAt = 0;
+    this.lastError = null;
   }
   
   async connect() {
@@ -31,6 +37,8 @@ class HyperswarmConnection {
 
     this.connectionAttempts++;
     this.connecting = true;
+    this._connectionClosed = false;
+    this.failureCount = 0;
     this.logger?.info?.('Hyperswarm connect initiating', {
       peer: this.publicKey,
       attempt: this.connectionAttempts
@@ -54,6 +62,7 @@ class HyperswarmConnection {
         this.protocol = new RelayProtocolWithGateway(connection, false, handshakeData);
         this.pool._configureProtocol(this.publicKey, this.protocol, { isServer: false, connection: this });
         this.logger?.info?.('Protocol instance created for peer', { peer: this.publicKey });
+        this._bindLifecycleHandlers();
 
         await new Promise((resolve, reject) => {
           const timeout = setTimeout(() => {
@@ -62,15 +71,14 @@ class HyperswarmConnection {
 
           const cleanup = () => {
             clearTimeout(timeout);
-            this.protocol.removeListener('open', onOpen);
-            this.protocol.removeListener('close', onClose);
-            this.protocol.removeListener('error', onError);
+            this.protocol?.removeListener('open', onOpen);
+            this.protocol?.removeListener('close', onClose);
+            this.protocol?.removeListener('error', onError);
           };
 
           const onOpen = () => {
             cleanup();
-            this.connected = true;
-            this.connecting = false;
+            this.markConnected();
             this.logger?.info?.('Protocol handshake open', { peer: this.publicKey });
             resolve();
           };
@@ -102,14 +110,7 @@ class HyperswarmConnection {
         await this._identifyAsGateway();
       } catch (err) {
         this.connected = false;
-        if (this.protocol) {
-          this.protocol.destroy();
-          this.protocol = null;
-        }
-        if (this.stream) {
-          this.stream.destroy();
-          this.stream = null;
-        }
+        this._handleConnectionClosed('handshake-error', err, { forceDestroy: true });
         this.logger?.error?.('Hyperswarm connect failed', {
           peer: this.publicKey,
           attempt: this.connectionAttempts,
@@ -163,6 +164,105 @@ class HyperswarmConnection {
         error: err?.message || err
       });
       throw err;
+    }
+  }
+
+  markConnected() {
+    this._connectionClosed = false;
+    this.connected = true;
+    this.connecting = false;
+    this.lastUsed = Date.now();
+    this.failureCount = 0;
+    this.lastHealthyAt = Date.now();
+    this._bindLifecycleHandlers();
+  }
+
+  _bindLifecycleHandlers() {
+    this._removeLifecycleHandlers();
+
+    const stream = this.stream;
+    const protocol = this.protocol;
+    if (!stream && !protocol) return;
+
+    const onStreamClose = () => this._handleConnectionClosed('stream-close');
+    const onStreamEnd = () => this._handleConnectionClosed('stream-end');
+    const onStreamError = (err) => this._handleConnectionClosed('stream-error', err);
+
+    if (stream) {
+      stream.once?.('close', onStreamClose);
+      stream.once?.('end', onStreamEnd);
+      stream.once?.('error', onStreamError);
+    }
+
+    const onProtocolClose = () => this._handleConnectionClosed('protocol-close');
+    const onProtocolDestroy = () => this._handleConnectionClosed('protocol-destroy');
+    const onProtocolError = (err) => this._handleConnectionClosed('protocol-error', err);
+
+    if (protocol) {
+      protocol.once?.('close', onProtocolClose);
+      protocol.once?.('destroy', onProtocolDestroy);
+      protocol.once?.('error', onProtocolError);
+    }
+
+    this._lifecycleCleanup = () => {
+      if (stream) {
+        stream.removeListener?.('close', onStreamClose);
+        stream.removeListener?.('end', onStreamEnd);
+        stream.removeListener?.('error', onStreamError);
+      }
+      if (protocol) {
+        protocol.removeListener?.('close', onProtocolClose);
+        protocol.removeListener?.('destroy', onProtocolDestroy);
+        protocol.removeListener?.('error', onProtocolError);
+      }
+    };
+  }
+
+  _removeLifecycleHandlers() {
+    if (typeof this._lifecycleCleanup === 'function') {
+      try {
+        this._lifecycleCleanup();
+      } catch (_) {}
+    }
+    this._lifecycleCleanup = null;
+  }
+
+  _handleConnectionClosed(reason = 'unknown', error = null, { forceDestroy = false } = {}) {
+    const firstClosure = !this._connectionClosed;
+
+    if (firstClosure) {
+      this._connectionClosed = true;
+      this.connected = false;
+      this.connecting = false;
+      this.connectPromise = null;
+      this.lastDisconnectAt = Date.now();
+      this.lastError = error || null;
+      this.failureCount += 1;
+      this.lastHealthyAt = 0;
+      this._removeLifecycleHandlers();
+
+      const current = this.pool?.connections?.get(this.publicKey);
+      if (current === this) {
+        this.pool.connections.delete(this.publicKey);
+        this.pool._releasePeerDiscovery?.(this.publicKey);
+      }
+
+      this.pool?._onConnectionClosed?.(this.publicKey, { reason, error });
+    }
+
+    if (forceDestroy) {
+      if (this.protocol) {
+        try { this.protocol.removeAllListeners?.(); } catch (_) {}
+        try { this.protocol.destroy(); } catch (_) {}
+      }
+      if (this.stream) {
+        try { this.stream.destroy(error instanceof Error ? error : undefined); } catch (_) {}
+      }
+    }
+
+    if (firstClosure || forceDestroy) {
+      this.protocol = null;
+      this.stream = null;
     }
   }
   
@@ -272,7 +372,10 @@ class HyperswarmConnection {
       await this.connect();
     }
     this.lastUsed = Date.now();
-    return this.protocol.sendHealthCheck();
+    const response = await this.protocol.sendHealthCheck();
+    this.lastHealthyAt = Date.now();
+    this.failureCount = 0;
+    return response;
   }
 
   async sendTelemetry(payload) {
@@ -283,19 +386,13 @@ class HyperswarmConnection {
     return this.protocol.sendTelemetry(payload);
   }
   
-  destroy() {
+  destroy(reason = 'manual-destroy', error = null) {
     this.logger?.info?.('Destroying hyperswarm connection', {
       peer: this.publicKey,
-      connected: this.connected
+      connected: this.connected,
+      reason
     });
-    if (this.protocol) {
-      this.protocol.destroy();
-    }
-    if (this.stream) {
-      this.stream.destroy();
-    }
-    this.connected = false;
-    this.connecting = false;
+    this._handleConnectionClosed(reason, error, { forceDestroy: true });
   }
 }
 
@@ -351,6 +448,10 @@ class EnhancedHyperswarmPool {
     this.peerDiscoveries = new Map();
     this.options = options || {};
     this.logger = options.logger || console;
+    const rawInterval = Number(options.healthIntervalMs);
+    this.healthIntervalMs = Number.isFinite(rawInterval) && rawInterval > 0 ? rawInterval : 30000;
+    this._healthTimer = null;
+    this._healthSweepRunning = false;
   }
 
   async initialize() {
@@ -390,7 +491,7 @@ class EnhancedHyperswarmPool {
           peer: publicKey,
           reason: existing.connected ? 'existing-stream-closed' : 'existing-connection-inactive'
         });
-        existing.destroy();
+        existing.destroy('duplicate-replacement');
       }
       const conn = new HyperswarmConnection(publicKey, this.swarm, this, this.logger);
       conn.stream = connection;
@@ -401,7 +502,9 @@ class EnhancedHyperswarmPool {
         wrapper: conn
       });
       conn.protocol = new RelayProtocolWithGateway(connection, true, handshakeData);
-      conn.connected = true;
+      conn.connecting = true;
+      conn._bindLifecycleHandlers();
+      conn.protocol.once('open', () => conn.markConnected());
       this._configureProtocol(publicKey, conn.protocol, { isServer: true, peerInfo, connection: conn });
       this.connections.set(publicKey, conn);
       this.logger?.info?.('Registered inbound hyperswarm connection', { peer: publicKey });
@@ -411,6 +514,7 @@ class EnhancedHyperswarmPool {
     this.topicDiscovery = this.swarm.join(topic, { server: false, client: true });
     await this.topicDiscovery.flushed();
     this.logger?.info?.('Hyperswarm topic joined', { topic: 'hypertuna-relay-network' });
+    this._startHealthMonitor();
     this.initialized = true;
   }
   
@@ -515,6 +619,37 @@ class EnhancedHyperswarmPool {
     }
   }
 
+  _onConnectionClosed(publicKey, { reason, error } = {}) {
+    if (this.options.onConnectionClosed) {
+      try {
+        this.options.onConnectionClosed({ publicKey, reason, error });
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.warn('[EnhancedHyperswarmPool] onConnectionClosed handler error:', err);
+      }
+      return;
+    }
+    const context = {
+      peer: publicKey,
+      reason: reason || 'unknown'
+    };
+    if (error) {
+      context.error = error instanceof Error ? error.message : error;
+    }
+    this.logger?.info?.('Hyperswarm connection closed', context);
+  }
+
+  _emitHealthUpdate(publicKey, details = {}) {
+    if (typeof this.options.onHealth === 'function') {
+      try {
+        this.options.onHealth({ publicKey, ...details });
+      } catch (error) {
+        // eslint-disable-next-line no-console
+        console.warn('[EnhancedHyperswarmPool] onHealth handler error:', error);
+      }
+    }
+  }
+
   _buildHandshakeData(isServer, context = {}) {
     if (typeof this.options.handshakeBuilder !== 'function') {
       return {};
@@ -536,10 +671,70 @@ class EnhancedHyperswarmPool {
     }
   }
 
+  _startHealthMonitor() {
+    if (this._healthTimer || !this.healthIntervalMs || this.healthIntervalMs <= 0) {
+      return;
+    }
+
+    const runSweep = async () => {
+      if (!this.initialized) return;
+      await this._performHealthSweep().catch((error) => {
+        this.logger?.debug?.('Hyperswarm health sweep failed', {
+          error: error?.message || error
+        });
+      });
+    };
+
+    this._healthTimer = setInterval(() => {
+      if (this._healthSweepRunning) return;
+      runSweep();
+    }, this.healthIntervalMs);
+
+    this._healthTimer.unref?.();
+  }
+
+  async _performHealthSweep() {
+    if (this._healthSweepRunning) return;
+    this._healthSweepRunning = true;
+    try {
+      const entries = Array.from(this.connections.entries());
+      for (const [publicKey, connection] of entries) {
+        await this._checkConnectionHealth(publicKey, connection);
+      }
+    } finally {
+      this._healthSweepRunning = false;
+    }
+  }
+
+  async _checkConnectionHealth(publicKey, connection) {
+    if (!connection || connection.connecting) return;
+    try {
+      await connection.healthCheck();
+      this._emitHealthUpdate(publicKey, {
+        healthy: true,
+        lastHealthyAt: connection.lastHealthyAt
+      });
+    } catch (error) {
+      this.logger?.warn?.('Hyperswarm connection health check failed', {
+        peer: publicKey,
+        error: error?.message || error
+      });
+      this._emitHealthUpdate(publicKey, {
+        healthy: false,
+        error: error instanceof Error ? error : new Error(String(error))
+      });
+      connection.destroy('health-check-failed', error instanceof Error ? error : new Error(String(error)));
+    }
+  }
+
   async destroy() {
     this.logger?.info?.('Destroying hyperswarm pool, closing connections', {
       connectionCount: this.connections.size
     });
+    if (this._healthTimer) {
+      clearInterval(this._healthTimer);
+      this._healthTimer = null;
+    }
     for (const connection of this.connections.values()) {
       connection.destroy();
     }

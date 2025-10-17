@@ -13,3 +13,15 @@
 3. **Operational coherence**
    - All new logic must be compatible with existing accounts (no regression for users who already have relays or custom gateway preferences).
    - Keep logging and error-handling concise; new retries or background operations should surface actionable warnings without flooding the console.
+
+4. **Public gateway peer connection reliability**
+   - **Task 4.1 – Hyperswarm connection lifecycle hardening**
+     - Ensure each `HyperswarmConnection` reacts to `stream` and `protocol` closure or errors by resetting its `connected` state, cleaning up listeners, and removing itself from the shared pool so future lookups trigger a fresh dial.
+   - **Task 4.2 – Prefer healthy sockets on inbound connections**
+     - Update the pool’s `swarm.on('connection')` handler to validate whether an existing wrapper is still healthy before keeping it; if the active stream is stale, swap in the new connection and tear down the old wrapper.
+   - **Task 4.3 – Active health sweep for registered peers**
+     - Add a periodic health-check loop that pings each pooled connection via the existing protocol health endpoint; failed checks must mark the wrapper as unhealthy and trigger cleanup/removal from the pool.
+   - **Task 4.4 – Registration store stale peer pruning**
+     - Track `lastSeen` timestamps per peer during registration merges and proactive health checks, and remove peers that have not re-registered or failed recent health checks so routing tables never include offline entries.
+   - **Task 4.5 – Routing resilience**
+     - Adjust `PublicGatewayService` peer selection helpers (`#withPeer`, `#withRelayPeerKey`, delegation flows) to skip unhealthy peers, rotate to viable alternatives, and optionally fall back to local replicas if no remote peers remain.

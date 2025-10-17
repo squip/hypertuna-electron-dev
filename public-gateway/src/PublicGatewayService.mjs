@@ -112,6 +112,8 @@ class PublicGatewayService {
       onProtocol: this.#onProtocolCreated.bind(this),
       onHandshake: this.#onProtocolHandshake.bind(this),
       onTelemetry: this.#handlePeerTelemetry.bind(this),
+      onConnectionClosed: this.#onPoolConnectionClosed.bind(this),
+      onHealth: this.#onPoolConnectionHealth.bind(this),
       handshakeBuilder: this.#buildHandshakePayload.bind(this)
     });
 
@@ -668,7 +670,7 @@ class PublicGatewayService {
     const delegateReqToPeers = metadata?.delegateReqToPeers === true
       || registration?.gatewayReplica?.delegateReqToPeers === true;
 
-    const availablePeers = this.#getPeersFromRegistration(registration);
+    const availablePeers = this.#getUsablePeersFromRegistration(registration);
     this.logger.info?.('Initializing websocket session - relay registration fetched', {
       relayKey,
       peerCount: availablePeers.length,
@@ -1134,7 +1136,7 @@ class PublicGatewayService {
         } else {
           const registration = await this.registrationStore.getRelay(session.relayKey);
           if (registration) {
-            session.peers = this.#getPeersFromRegistration(registration);
+            session.peers = this.#getUsablePeersFromRegistration(registration);
           }
 
           if (!session.localOnly
@@ -1240,6 +1242,10 @@ class PublicGatewayService {
     return [];
   }
 
+  #getUsablePeersFromRegistration(registration) {
+    return this.#getPeersFromRegistration(registration).filter((peer) => this.#isPeerUsable(peer));
+  }
+
   #supportsLocalRelay(registration) {
     if (!registration) return false;
     if (!this.relayHost) return false;
@@ -1247,7 +1253,7 @@ class PublicGatewayService {
     const delegateReqToPeers = metadata.delegateReqToPeers === true
       || registration.gatewayReplica?.delegateReqToPeers === true;
     if (delegateReqToPeers) {
-      const peerCount = this.#getPeersFromRegistration(registration).length;
+      const peerCount = this.#getUsablePeersFromRegistration(registration).length;
       if (peerCount > 0) return false;
     }
 
@@ -1258,7 +1264,7 @@ class PublicGatewayService {
   }
 
   #selectPeer(registration) {
-    const peers = this.#getPeersFromRegistration(registration);
+    const peers = this.#getUsablePeersFromRegistration(registration);
     if (!peers.length) return null;
 
     const relayKey = registration.relayKey || registration.identifier || peers[0];
@@ -1293,7 +1299,7 @@ class PublicGatewayService {
       throw error;
     }
 
-    const peers = this.#getPeersFromRegistration(registration);
+    const peers = this.#getUsablePeersFromRegistration(registration);
     if (!peers.length) {
       const error = new Error('Relay has no available peers');
       error.statusCode = 503;
@@ -1307,15 +1313,28 @@ class PublicGatewayService {
       const index = (startIndex + attempt) % peers.length;
       const peerKey = peers[index];
 
+      if (!this.#isPeerUsable(peerKey)) {
+        this.logger?.debug?.('Skipping unreachable peer for relay request', {
+          relayKey,
+          peerKey
+        });
+        continue;
+      }
+
       try {
         await this.connectionPool.getConnection(peerKey);
         this.relayPeerIndex.set(relayKey, (index + 1) % peers.length);
+        this.#markPeerReachable(peerKey, { relayKey, timestamp: Date.now() });
         return handler(peerKey, registration);
       } catch (error) {
         lastError = error;
         this.logger.warn?.('Failed to use peer for drive request', {
           relayKey,
           peerKey,
+          error: error?.message || error
+        });
+        this.#markPeerUnreachable(peerKey, {
+          reason: 'get-connection-failed',
           error: error?.message || error
         });
       }
@@ -1509,9 +1528,20 @@ class PublicGatewayService {
       const peerKey = this.#currentPeer(session);
       if (!peerKey) break;
 
+      if (!this.#isPeerUsable(peerKey)) {
+        this.logger?.debug?.('Skipping unreachable peer for session', {
+          relayKey: session.relayKey,
+          peerKey
+        });
+        this.#advancePeer(session);
+        attempts += 1;
+        continue;
+      }
+
       try {
         const result = await handler(peerKey);
         session.peerKey = peerKey;
+        this.#markPeerReachable(peerKey, { relayKey: session.relayKey, timestamp: Date.now() });
         this.logger.info?.('Peer operation succeeded', {
           relayKey: session.relayKey,
           peerKey
@@ -1616,6 +1646,217 @@ class PublicGatewayService {
         });
       }
     }
+  }
+
+  #isPeerUsable(peerKey) {
+    if (!peerKey || typeof peerKey !== 'string') return false;
+    const metadata = this.peerMetadata.get(peerKey);
+    if (!metadata) return true;
+    if (metadata.unreachableSince) {
+      return false;
+    }
+    return true;
+  }
+
+  #markPeerReachable(peerKey, { relayKey = null, timestamp = Date.now(), lastHealthyAt = null } = {}) {
+    if (!peerKey) return;
+    const entry = this.peerMetadata.get(peerKey) || {};
+    entry.lastSeen = timestamp;
+    entry.unreachableSince = null;
+    entry.lastHealthyAt = lastHealthyAt || entry.lastHealthyAt || timestamp;
+    entry.lastDisconnectReason = null;
+    entry.lastError = null;
+    entry.removalInProgress = false;
+    if (!(entry.relays instanceof Set)) {
+      entry.relays = new Set(entry.relays || []);
+    }
+    if (relayKey) {
+      entry.relays.add(relayKey);
+    }
+    this.peerMetadata.set(peerKey, entry);
+  }
+
+  #markPeerUnreachable(peerKey, { reason = 'unknown', error = null } = {}) {
+    if (!peerKey) return;
+    const entry = this.peerMetadata.get(peerKey) || {};
+    const timestamp = Date.now();
+    entry.unreachableSince = entry.unreachableSince || timestamp;
+    entry.lastDisconnectReason = reason;
+    if (error) {
+      entry.lastError = error instanceof Error ? error.message : error;
+    }
+    if (entry.removalInProgress) {
+      this.peerMetadata.set(peerKey, entry);
+      return;
+    }
+    entry.removalInProgress = true;
+    this.peerMetadata.set(peerKey, entry);
+    this.#purgePeerFromSessions(peerKey);
+    void this.#removePeerFromAllRegistrations(peerKey, {
+      reason,
+      error,
+      timestamp,
+      candidateRelays: entry.relays instanceof Set ? Array.from(entry.relays) : null
+    }).finally(() => {
+      const current = this.peerMetadata.get(peerKey);
+      if (current) {
+        current.removalInProgress = false;
+        this.peerMetadata.set(peerKey, current);
+      }
+    });
+  }
+
+  #purgePeerFromSessions(peerKey) {
+    for (const session of this.sessions.values()) {
+      if (!Array.isArray(session.peers) || !session.peers.length) continue;
+      const originalLength = session.peers.length;
+      session.peers = session.peers.filter((value) => value !== peerKey);
+      if (session.subscriptionPeers instanceof Map) {
+        for (const [subscriptionId, assignedPeer] of session.subscriptionPeers.entries()) {
+          if (assignedPeer === peerKey) {
+            session.subscriptionPeers.delete(subscriptionId);
+          }
+        }
+      }
+      if (originalLength !== session.peers.length) {
+        session.peerIndex = session.peerIndex || 0;
+        if (session.peerKey === peerKey) {
+          session.peerIndex = 0;
+          session.peerKey = this.#currentPeer(session);
+        } else if (session.peerIndex >= session.peers.length) {
+          session.peerIndex = 0;
+        }
+      }
+    }
+  }
+
+  async #listAllRelayKeys() {
+    if (typeof this.registrationStore.getAllRelayKeys === 'function') {
+      try {
+        const keys = await this.registrationStore.getAllRelayKeys();
+        if (Array.isArray(keys)) {
+          return keys;
+        }
+      } catch (error) {
+        this.logger?.debug?.('Failed to list relay keys via store implementation', {
+          error: error?.message || error
+        });
+      }
+    }
+
+    if (this.registrationStore?.items instanceof Map) {
+      return Array.from(this.registrationStore.items.keys());
+    }
+
+    return [];
+  }
+
+  async #removePeerFromAllRegistrations(peerKey, { reason = 'unknown', error = null, candidateRelays = null } = {}) {
+    if (!peerKey) return;
+    let relayKeys = Array.isArray(candidateRelays) && candidateRelays.length
+      ? Array.from(new Set(candidateRelays))
+      : null;
+    if (!relayKeys) {
+      relayKeys = await this.#listAllRelayKeys();
+    }
+
+    if (!Array.isArray(relayKeys) || !relayKeys.length) return;
+
+    for (const relayKey of relayKeys) {
+      try {
+        const registration = await this.registrationStore.getRelay(relayKey);
+        if (!registration) continue;
+
+        const peers = this.#getPeersFromRegistration(registration);
+        if (!peers.includes(peerKey)) continue;
+
+        const updatedPeers = peers.filter((value) => value !== peerKey);
+        const metadata = { ...(registration.metadata || {}) };
+
+        if (metadata.peerStates && typeof metadata.peerStates === 'object') {
+          const peerStates = { ...metadata.peerStates };
+          delete peerStates[peerKey];
+          metadata.peerStates = peerStates;
+        }
+
+        const record = {
+          ...registration,
+          peers: updatedPeers,
+          metadata,
+          updatedAt: Date.now()
+        };
+
+        await this.registrationStore.upsertRelay(relayKey, record);
+
+        if (!updatedPeers.length) {
+          this.relayPeerIndex.delete(relayKey);
+        } else {
+          const nextIndex = (this.relayPeerIndex.get(relayKey) || 0) % updatedPeers.length;
+          this.relayPeerIndex.set(relayKey, nextIndex);
+        }
+
+        this.logger?.info?.('Removed unreachable peer from relay registration', {
+          relayKey,
+          peer: peerKey,
+          reason
+        });
+      } catch (removalError) {
+        this.logger?.warn?.('Failed to remove unreachable peer from relay registration', {
+          relayKey,
+          peer: peerKey,
+          error: removalError?.message || removalError
+        });
+      }
+    }
+
+    const entry = this.peerMetadata.get(peerKey);
+    if (entry?.relays instanceof Set) {
+      if (Array.isArray(relayKeys) && relayKeys.length) {
+        relayKeys.forEach((relayKey) => entry.relays.delete(relayKey));
+      } else {
+        entry.relays.clear();
+      }
+      this.peerMetadata.set(peerKey, entry);
+    }
+  }
+
+  #shouldPrunePeerOnDisconnect(reason) {
+    if (!reason) return true;
+    const transientReasons = new Set(['manual-destroy', 'duplicate-replacement']);
+    return !transientReasons.has(reason);
+  }
+
+  #onPoolConnectionClosed({ publicKey, reason, error }) {
+    if (!publicKey) return;
+    const entry = this.peerMetadata.get(publicKey) || {};
+    entry.lastDisconnectAt = Date.now();
+    entry.lastDisconnectReason = reason || 'unknown';
+    if (error) {
+      entry.lastError = error instanceof Error ? error.message : error;
+    }
+    this.peerMetadata.set(publicKey, entry);
+
+    if (this.#shouldPrunePeerOnDisconnect(reason)) {
+      if (reason === 'health-check-failed' && entry.unreachableSince) {
+        return;
+      }
+      this.#markPeerUnreachable(publicKey, { reason, error });
+    }
+  }
+
+  #onPoolConnectionHealth({ publicKey, healthy, lastHealthyAt, error }) {
+    if (!publicKey) return;
+    if (healthy) {
+      this.#markPeerReachable(publicKey, {
+        timestamp: lastHealthyAt || Date.now(),
+        lastHealthyAt: lastHealthyAt || Date.now()
+      });
+      return;
+    }
+    this.#markPeerUnreachable(publicKey, {
+      reason: 'health-check-failed',
+      error: error?.message || error
+    });
   }
 
   #getRelayHostInfo() {
@@ -1922,6 +2163,7 @@ class PublicGatewayService {
     peerEntry.registration = payload;
     peerEntry.lastRegistrationAt = now;
     this.peerMetadata.set(peerKey, peerEntry);
+    this.#markPeerReachable(peerKey, { timestamp: now });
 
     this.#emitPublicGatewayStatus();
 
@@ -2012,6 +2254,15 @@ class PublicGatewayService {
     }
 
     metadata.lastPeerUpdateAt = now;
+    const peerStates = { ...(metadata.peerStates || {}) };
+    const existingState = peerStates[peerKey] || {};
+    peerStates[peerKey] = {
+      ...existingState,
+      lastSeen: now,
+      lastHealthyAt: existingState.lastHealthyAt || now,
+      unreachableSince: null
+    };
+    metadata.peerStates = peerStates;
 
     const record = {
       relayKey,
@@ -2087,6 +2338,7 @@ class PublicGatewayService {
     }
 
     await this.registrationStore.upsertRelay(relayKey, record);
+    this.#markPeerReachable(peerKey, { relayKey, timestamp: now });
   }
 
   async #upsertInternalReplicaPeer(peerKey, { gatewayRelay = {}, replicaMetrics = null, replicaTelemetry = null, delegateReqToPeers = null } = {}) {
@@ -2311,6 +2563,7 @@ class PublicGatewayService {
     entry.handshake = handshake;
     entry.lastHandshakeAt = Date.now();
     this.peerMetadata.set(publicKey, entry);
+    this.#markPeerReachable(publicKey, { timestamp: entry.lastHandshakeAt });
 
     const isReplica = handshake.gatewayReplica === true
       || handshake.role === 'gateway-replica'
