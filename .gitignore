@@ -52,6 +52,7 @@ legacy-pear-codebase/
 hyperswarm-documentation/
 holepunchto-documentation/
 hyperbeam-documentation/
+test-logs/
 jspm_packages/
 deploy/.env
 
