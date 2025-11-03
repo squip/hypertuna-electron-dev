@@ -70,6 +70,17 @@ const blindPeerBytesGauge = new client.Gauge({
   help: 'Bytes allocated by the blind-peer storage subsystem'
 });
 
+const blindPeerGcRunsCounter = new client.Counter({
+  name: 'gateway_blind_peer_gc_runs_total',
+  help: 'Count of hygiene/GC runs triggered for the blind-peer service'
+});
+
+const blindPeerEvictionsCounter = new client.Counter({
+  name: 'gateway_blind_peer_evictions_total',
+  help: 'Count of blind-peer core evictions performed by hygiene',
+  labelNames: ['reason']
+});
+
 register.registerMetric(sessionGauge);
 register.registerMetric(peerGauge);
 register.registerMetric(requestCounter);
@@ -82,6 +93,8 @@ register.registerMetric(relayTokenRevocationCounter);
 register.registerMetric(blindPeerActiveGauge);
 register.registerMetric(blindPeerTrustedPeersGauge);
 register.registerMetric(blindPeerBytesGauge);
+register.registerMetric(blindPeerGcRunsCounter);
+register.registerMetric(blindPeerEvictionsCounter);
 
 function metricsMiddleware(path = '/metrics') {
   return async (req, res, next) => {
@@ -109,5 +122,7 @@ export {
   blindPeerActiveGauge,
   blindPeerTrustedPeersGauge,
   blindPeerBytesGauge,
+  blindPeerGcRunsCounter,
+  blindPeerEvictionsCounter,
   metricsMiddleware
 };

@@ -31,7 +31,9 @@ import {
   relayTokenRevocationCounter,
   blindPeerActiveGauge,
   blindPeerTrustedPeersGauge,
-  blindPeerBytesGauge
+  blindPeerBytesGauge,
+  blindPeerGcRunsCounter,
+  blindPeerEvictionsCounter
 } from './metrics.mjs';
 import MemoryRegistrationStore from './stores/MemoryRegistrationStore.mjs';
 import MessageQueue from './utils/MessageQueue.mjs';
@@ -142,6 +144,14 @@ class PublicGatewayService {
       setBytesAllocated: (bytes = 0) => {
         const value = Number(bytes);
         blindPeerBytesGauge.set(Number.isFinite(value) && value >= 0 ? value : 0);
+      },
+      incrementGcRuns: () => {
+        blindPeerGcRunsCounter.inc();
+      },
+      recordEvictions: ({ reason, count = 1 } = {}) => {
+        const label = typeof reason === 'string' && reason.trim().length ? reason.trim() : 'unknown';
+        const increment = Number.isFinite(count) && count > 0 ? count : 1;
+        blindPeerEvictionsCounter.labels(label).inc(increment);
       }
     };
   }
@@ -2023,8 +2033,8 @@ class PublicGatewayService {
     };
   }
 
-  #getBlindPeerSummary() {
-    const status = this.blindPeerService?.getStatus?.() || null;
+  #getBlindPeerSummary(statusOverride = null) {
+    const status = statusOverride || this.blindPeerService?.getStatus?.() || null;
     const trustedPeers = this.blindPeerService?.getTrustedPeers?.() || [];
     return {
       enabled: !!status?.enabled,
@@ -2033,7 +2043,10 @@ class PublicGatewayService {
       trustedPeerCount: status?.trustedPeerCount ?? trustedPeers.length,
       publicKey: status?.publicKey || this.blindPeerService?.getPublicKeyHex?.() || null,
       encryptionKey: status?.encryptionKey || this.blindPeerService?.getEncryptionKeyHex?.() || null,
-      trustedPeers
+      trustedPeers,
+      hygiene: status?.hygiene || null,
+      metadataTracked: status?.metadata?.trackedCores ?? null,
+      ownership: status?.ownership || null
     };
   }
 
@@ -2071,15 +2084,43 @@ class PublicGatewayService {
     });
   }
 
-  #handleBlindPeerStatus(_req, res) {
+  #handleBlindPeerStatus(req, res) {
     try {
-      const status = this.blindPeerService?.getStatus?.() || { enabled: false };
-      const summary = this.#getBlindPeerSummary();
-      res.json({
+      const query = req?.query || {};
+      const toBool = (value) => {
+        if (value === undefined || value === null) return false;
+        const str = String(value).trim().toLowerCase();
+        return str === '1' || str === 'true' || str === 'yes';
+      };
+      const parseLimit = (value, fallback) => {
+        const num = Number(value);
+        return Number.isFinite(num) && num > 0 ? Math.trunc(num) : fallback;
+      };
+
+      const includeDetail = toBool(query.detail);
+      const ownerLimit = parseLimit(query.owners, includeDetail ? 50 : 10);
+      const coresPerOwner = parseLimit(query.coresPerOwner, 25);
+
+      const status = this.blindPeerService?.getStatus?.({
+        ownerLimit,
+        includeCores: includeDetail,
+        coresPerOwner
+      }) || { enabled: false };
+      const summary = this.#getBlindPeerSummary(status);
+
+      const response = {
         status,
         summary,
         configured: !!this.config?.blindPeer?.enabled
-      });
+      };
+
+      if (includeDetail) {
+        response.detail = {
+          ownership: status?.ownership || null
+        };
+      }
+
+      res.json(response);
     } catch (error) {
       this.logger?.error?.('[PublicGateway] Failed to compose blind-peer status response', {
         err: error?.message || error
@@ -2486,13 +2527,20 @@ class PublicGatewayService {
         };
       }
 
-      if (metadata.replicaTelemetry) {
-        gatewayReplica.telemetry = metadata.replicaTelemetry;
-      }
+    if (metadata.replicaTelemetry) {
+      gatewayReplica.telemetry = metadata.replicaTelemetry;
+    }
 
-      record.gatewayReplica = gatewayReplica;
-    } else if (existing?.gatewayReplica) {
-      record.gatewayReplica = existing.gatewayReplica;
+    record.gatewayReplica = gatewayReplica;
+  } else if (existing?.gatewayReplica) {
+    record.gatewayReplica = existing.gatewayReplica;
+  }
+
+    const peerMirrorSummary = this.blindPeerService?.getPeerMirrorSummary?.(peerKey, {
+      includeCores: false
+    });
+    if (peerMirrorSummary) {
+      metadata.blindPeerMirrors = peerMirrorSummary;
     }
 
     record.blindPeer = this.#getBlindPeerSummary();
