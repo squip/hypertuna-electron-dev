@@ -3,6 +3,8 @@ import { resolve } from 'node:path';
 
 const LEGACY_PUBLIC_GATEWAY_PATH = 'public-gateway/hyperbee';
 
+const DEFAULT_BLIND_PEER_MAX_BYTES = 25 * 1024 ** 3;
+
 const DEFAULT_CONFIG = {
   host: '0.0.0.0',
   port: Number(process.env.PORT) || 4430,
@@ -64,6 +66,15 @@ const DEFAULT_CONFIG = {
     reassignOnLagBlocks: Number(process.env.GATEWAY_DISPATCHER_REASSIGN_LAG || 500),
     circuitBreakerThreshold: Number(process.env.GATEWAY_DISPATCHER_CB_THRESHOLD || 5),
     circuitBreakerDurationMs: Number(process.env.GATEWAY_DISPATCHER_CB_TIMEOUT_MS || 60000)
+  },
+  blindPeer: {
+    enabled: process.env.GATEWAY_BLINDPEER_ENABLED === 'true',
+    storageDir: process.env.GATEWAY_BLINDPEER_STORAGE || null,
+    maxBytes: Number(process.env.GATEWAY_BLINDPEER_MAX_BYTES) || DEFAULT_BLIND_PEER_MAX_BYTES,
+    gcIntervalMs: Number(process.env.GATEWAY_BLINDPEER_GC_INTERVAL_MS) || 300000,
+    dedupeBatchSize: Number(process.env.GATEWAY_BLINDPEER_DEDUPE_BATCH) || 100,
+    staleCoreTtlMs: Number(process.env.GATEWAY_BLINDPEER_STALE_TTL_MS) || (7 * 24 * 60 * 60 * 1000),
+    trustedPeersPersistPath: process.env.GATEWAY_BLINDPEER_TRUSTED_PATH || null
   }
 };
 
@@ -116,6 +127,10 @@ function loadConfig(overrides = {}) {
     dispatcher: {
       ...DEFAULT_CONFIG.dispatcher,
       ...(overrides.dispatcher || {})
+    },
+    blindPeer: {
+      ...DEFAULT_CONFIG.blindPeer,
+      ...(overrides.blindPeer || {})
     }
   };
 
@@ -128,6 +143,7 @@ function loadConfig(overrides = {}) {
   }
 
   merged.relay = normalizeRelaySettings(merged.relay);
+  merged.blindPeer = normalizeBlindPeerSettings(merged.blindPeer);
 
   return merged;
 }
@@ -168,6 +184,29 @@ function normalizeRelaySettings(relayConfig = {}) {
   result.canonicalPath = canonicalPath;
   result.aliasPaths = Array.from(aliasSet);
   return result;
+}
+
+function normalizeBlindPeerSettings(settings = {}) {
+  const sanitizePath = (value) => {
+    if (!value || typeof value !== 'string') return null;
+    const trimmed = value.trim();
+    return trimmed.length ? trimmed : null;
+  };
+
+  const toPositiveInt = (value, fallback) => {
+    const num = Number(value);
+    return Number.isFinite(num) && num > 0 ? Math.trunc(num) : fallback;
+  };
+
+  return {
+    enabled: !!settings.enabled,
+    storageDir: sanitizePath(settings.storageDir),
+    maxBytes: toPositiveInt(settings.maxBytes, DEFAULT_BLIND_PEER_MAX_BYTES),
+    gcIntervalMs: toPositiveInt(settings.gcIntervalMs, 300000),
+    dedupeBatchSize: toPositiveInt(settings.dedupeBatchSize, 100),
+    staleCoreTtlMs: toPositiveInt(settings.staleCoreTtlMs, 7 * 24 * 60 * 60 * 1000),
+    trustedPeersPersistPath: sanitizePath(settings.trustedPeersPersistPath)
+  };
 }
 
 export {

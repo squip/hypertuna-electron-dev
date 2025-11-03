@@ -8,6 +8,11 @@ const DEFAULT_SETTINGS = Object.freeze({
   baseUrl: 'https://hypertuna.com',
   sharedSecret: '',
   delegateReqToPeers: false,
+  blindPeerEnabled: false,
+  blindPeerKeys: [],
+  blindPeerEncryptionKey: null,
+  blindPeerReplicationTopic: null,
+  blindPeerMaxBytes: null,
   defaultTokenTtl: 3600,
   tokenRefreshWindowSeconds: 300,
   dispatcherMaxConcurrent: 3,
@@ -80,6 +85,37 @@ function normalizeSettings(raw = {}) {
 
   if (typeof raw.delegateReqToPeers === 'boolean') {
     normalized.delegateReqToPeers = raw.delegateReqToPeers;
+  }
+
+  if (typeof raw.blindPeerEnabled === 'boolean') {
+    normalized.blindPeerEnabled = raw.blindPeerEnabled;
+  }
+
+  if (raw.blindPeerKeys != null) {
+    const list = Array.isArray(raw.blindPeerKeys) ? raw.blindPeerKeys : [raw.blindPeerKeys];
+    const keys = Array.from(new Set(list.map((value) => {
+      if (typeof value !== 'string') return null;
+      const trimmed = value.trim();
+      return trimmed.length ? trimmed : null;
+    }).filter(Boolean)));
+    normalized.blindPeerKeys = keys;
+  }
+
+  if (typeof raw.blindPeerEncryptionKey === 'string') {
+    const value = raw.blindPeerEncryptionKey.trim();
+    normalized.blindPeerEncryptionKey = value || null;
+  }
+
+  if (typeof raw.blindPeerReplicationTopic === 'string') {
+    const value = raw.blindPeerReplicationTopic.trim();
+    normalized.blindPeerReplicationTopic = value || null;
+  }
+
+  if (raw.blindPeerMaxBytes != null) {
+    const bytes = Number(raw.blindPeerMaxBytes);
+    if (Number.isFinite(bytes) && bytes > 0) {
+      normalized.blindPeerMaxBytes = Math.trunc(bytes);
+    }
   }
 
   if (raw.defaultTokenTtl != null) {
@@ -299,6 +335,24 @@ function withDefaults(raw = {}) {
   ensurePositive('dispatcherReassignLagBlocks', DEFAULT_SETTINGS.dispatcherReassignLagBlocks);
   ensurePositive('dispatcherCircuitBreakerThreshold', DEFAULT_SETTINGS.dispatcherCircuitBreakerThreshold);
   ensurePositive('dispatcherCircuitBreakerTimeoutMs', DEFAULT_SETTINGS.dispatcherCircuitBreakerTimeoutMs);
+
+  const sanitizeString = (value) => {
+    if (typeof value !== 'string') return null;
+    const trimmed = value.trim();
+    return trimmed.length ? trimmed : null;
+  };
+
+  merged.blindPeerEnabled = !!merged.blindPeerEnabled;
+  merged.blindPeerKeys = Array.isArray(merged.blindPeerKeys)
+    ? Array.from(new Set(merged.blindPeerKeys.map(sanitizeString).filter(Boolean)))
+    : [];
+  merged.blindPeerEncryptionKey = sanitizeString(merged.blindPeerEncryptionKey);
+  merged.blindPeerReplicationTopic = sanitizeString(merged.blindPeerReplicationTopic);
+  if (!Number.isFinite(merged.blindPeerMaxBytes) || merged.blindPeerMaxBytes <= 0) {
+    merged.blindPeerMaxBytes = null;
+  } else {
+    merged.blindPeerMaxBytes = Math.trunc(merged.blindPeerMaxBytes);
+  }
 
   if (!merged.resolvedGatewayRelay) {
     merged.resolvedGatewayRelay = null;

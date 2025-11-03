@@ -21,6 +21,7 @@
     "autobase": "^6.4.0",
     "axios": "^1.6.2",
     "b4a": "^1.6.4",
+    "blind-peering": "^1.14.0",
     "compact-encoding": "^2.16.1",
     "corestore": "^6.14.2",
     "express": "^4.18.2",

@@ -1118,6 +1118,10 @@ export class GatewayService extends EventEmitter {
         }
       }
 
+      await this.#applyBlindPeerInfo(registrationResult.blindPeer || { enabled: false }, { persist: true }).catch((error) => {
+        this.log('warn', `[PublicGateway] Failed to persist blind peer announcement: ${error.message}`);
+      });
+
       if (this.#isPublicGatewayRelayKey(relayKey)) {
         await this.#registerPublicGatewayVirtualRelay(metadataCopy);
       }
@@ -1353,6 +1357,17 @@ export class GatewayService extends EventEmitter {
       this.log('debug', `[PublicGateway] Hyperswarm handshake payload peer=${publicKey} keys=${handshakeKeys.join(',')} payload=${serialized}`);
     }
 
+    if (Object.prototype.hasOwnProperty.call(handshake, 'blindPeerEnabled')) {
+      this.#applyBlindPeerInfo({
+        enabled: handshake.blindPeerEnabled,
+        publicKey: handshake.blindPeerPublicKey || null,
+        encryptionKey: handshake.blindPeerEncryptionKey || null,
+        maxBytes: handshake.blindPeerMaxBytes ?? null
+      }, { persist: false }).catch((error) => {
+        this.log('debug', `[PublicGateway] Failed to apply blind peer info from handshake: ${error.message}`);
+      });
+    }
+
     if (handshake.role === 'relay' || handshake.isGateway === false) {
       this.healthState.services.hyperswarmStatus = 'connected';
       this.healthState.services.protocolStatus = 'connected';
@@ -1586,6 +1601,12 @@ export class GatewayService extends EventEmitter {
       resolvedDispatcher: config.resolvedDispatcher || null,
       delegateReqToPeers: !!config.delegateReqToPeers,
       defaultTokenTtl: config.defaultTokenTtl || 3600,
+      blindPeer: {
+        enabled: !!config.blindPeerEnabled,
+        keys: Array.isArray(config.blindPeerKeys) ? [...config.blindPeerKeys] : [],
+        encryptionKey: config.blindPeerEncryptionKey || null,
+        maxBytes: config.blindPeerMaxBytes ?? null
+      },
       wsBase: enabled ? (config.resolvedWsUrl || this.publicGatewayWsBase) : null,
       lastUpdatedAt: this.publicGatewayStatusUpdatedAt,
       relays,
@@ -3492,6 +3513,40 @@ export class GatewayService extends EventEmitter {
     }
 
     return null;
+  }
+
+  async #applyBlindPeerInfo(info = {}, { persist = false } = {}) {
+    const enabled = !!info.enabled;
+    const publicKey = typeof info.publicKey === 'string' ? info.publicKey.trim() : null;
+    const encryptionKey = typeof info.encryptionKey === 'string' ? info.encryptionKey.trim() : null;
+    const maxBytes = Number.isFinite(info.maxBytes) && info.maxBytes > 0 ? Math.trunc(info.maxBytes) : null;
+
+    const current = this.publicGatewaySettings || {};
+    const currentKeys = Array.isArray(current.blindPeerKeys) ? current.blindPeerKeys : [];
+    const nextKeys = enabled && publicKey ? [publicKey] : [];
+
+    const changed =
+      current.blindPeerEnabled !== enabled
+      || current.blindPeerEncryptionKey !== encryptionKey
+      || current.blindPeerMaxBytes !== maxBytes
+      || currentKeys.length !== nextKeys.length
+      || currentKeys.some((value, index) => value !== nextKeys[index]);
+
+    if (!changed) return false;
+
+    this.publicGatewaySettings = {
+      ...current,
+      blindPeerEnabled: enabled,
+      blindPeerKeys: nextKeys,
+      blindPeerEncryptionKey: encryptionKey,
+      blindPeerMaxBytes: maxBytes
+    };
+
+    if (persist) {
+      await updatePublicGatewaySettings(this.publicGatewaySettings);
+    }
+
+    return true;
   }
 
   getPeersWithPfpDrive() {

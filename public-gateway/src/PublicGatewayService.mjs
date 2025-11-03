@@ -28,7 +28,10 @@ import {
   relayErrorCounter,
   relayTokenIssueCounter,
   relayTokenRefreshCounter,
-  relayTokenRevocationCounter
+  relayTokenRevocationCounter,
+  blindPeerActiveGauge,
+  blindPeerTrustedPeersGauge,
+  blindPeerBytesGauge
 } from './metrics.mjs';
 import MemoryRegistrationStore from './stores/MemoryRegistrationStore.mjs';
 import MessageQueue from './utils/MessageQueue.mjs';
@@ -39,6 +42,7 @@ import RelayDispatcherService from './relay/RelayDispatcherService.mjs';
 import RelayTokenService from './relay/RelayTokenService.mjs';
 import PublicGatewayHyperbeeAdapter from '../../shared/public-gateway/PublicGatewayHyperbeeAdapter.mjs';
 import { openHyperbeeReplicationChannel } from '../../shared/public-gateway/hyperbeeReplicationChannel.mjs';
+import BlindPeerService from './blind-peer/BlindPeerService.mjs';
 
 const DELEGATION_FALLBACK_MS = 1500;
 
@@ -126,6 +130,20 @@ class PublicGatewayService {
     this.peerMetadata = new Map();
     this.peerHyperbeeReplications = new Map();
     this.publicGatewayStatusUpdatedAt = null;
+    this.blindPeerService = null;
+    this.blindPeerMetrics = {
+      setActive: (active) => {
+        blindPeerActiveGauge.set(active ? 1 : 0);
+      },
+      setTrustedPeers: (count = 0) => {
+        const value = Number(count);
+        blindPeerTrustedPeersGauge.set(Number.isFinite(value) && value >= 0 ? value : 0);
+      },
+      setBytesAllocated: (bytes = 0) => {
+        const value = Number(bytes);
+        blindPeerBytesGauge.set(Number.isFinite(value) && value >= 0 ? value : 0);
+      }
+    };
   }
 
   async init() {
@@ -144,6 +162,18 @@ class PublicGatewayService {
     }
     if (this.#isHyperbeeRelayEnabled()) {
       await this.#ensureRelayHost();
+    }
+    if (this.config?.blindPeer) {
+      const blindPeerLogger = this.logger?.child
+        ? this.logger.child({ module: 'BlindPeerService' })
+        : this.logger;
+      this.blindPeerService = new BlindPeerService({
+        logger: blindPeerLogger,
+        config: this.config.blindPeer,
+        connectionPool: this.connectionPool,
+        metrics: this.blindPeerMetrics
+      });
+      await this.blindPeerService.initialize();
     }
     this.logger.info('PublicGatewayService initialized');
   }
@@ -174,6 +204,8 @@ class PublicGatewayService {
 
     this.healthInterval = setInterval(() => this.#collectMetrics(), 10000).unref();
     this.pruneInterval = setInterval(() => this.registrationStore.pruneExpired?.(), 60000).unref();
+
+    await this.blindPeerService?.start();
   }
 
   async stop() {
@@ -232,6 +264,8 @@ class PublicGatewayService {
       clearInterval(this.internalRegistrationInterval);
       this.internalRegistrationInterval = null;
     }
+
+    await this.blindPeerService?.stop();
 
     await this.connectionPool.destroy();
     await this.registrationStore?.disconnect?.();
@@ -2242,19 +2276,22 @@ class PublicGatewayService {
     }
 
     const peerEntry = this.peerMetadata.get(peerKey) || {};
-    peerEntry.registration = payload;
-    peerEntry.lastRegistrationAt = now;
-    this.peerMetadata.set(peerKey, peerEntry);
-    this.#markPeerReachable(peerKey, { timestamp: now });
+   peerEntry.registration = payload;
+   peerEntry.lastRegistrationAt = now;
+   this.peerMetadata.set(peerKey, peerEntry);
+   this.#markPeerReachable(peerKey, { timestamp: now });
+    this.blindPeerService?.addTrustedPeer(peerKey);
 
     this.#emitPublicGatewayStatus();
 
+    const blindPeerInfo = this.blindPeerService?.getAnnouncementInfo?.();
     return {
       statusCode: 200,
       headers: { 'content-type': 'application/json' },
       body: Buffer.from(JSON.stringify({
         status: 'ok',
-        hyperbee: this.#getRelayHostInfo()
+        hyperbee: this.#getRelayHostInfo(),
+        blindPeer: blindPeerInfo && blindPeerInfo.enabled ? blindPeerInfo : { enabled: false }
       }))
     };
   }
@@ -2422,6 +2459,7 @@ class PublicGatewayService {
     await this.registrationStore.upsertRelay(relayKey, record);
     this.#syncSessionsWithRelay(relayKey, record);
     this.#markPeerReachable(peerKey, { relayKey, timestamp: now });
+    this.blindPeerService?.addTrustedPeer(peerKey);
   }
 
   async #upsertInternalReplicaPeer(peerKey, { gatewayRelay = {}, replicaMetrics = null, replicaTelemetry = null, delegateReqToPeers = null } = {}) {
@@ -2592,6 +2630,7 @@ class PublicGatewayService {
     const cleanup = () => {
       this.peerMetadata.delete(publicKey);
       this.#detachHyperbeeReplication(publicKey);
+      this.blindPeerService?.removeTrustedPeer(publicKey);
     };
     protocol.once('close', cleanup);
     protocol.once('destroy', cleanup);
@@ -2627,6 +2666,16 @@ class PublicGatewayService {
     const hyperbee = this.hyperbeeAdapter?.hyperbee || null;
     if (hyperbee) {
       payload.hyperbeeVersion = hyperbee.version || 0;
+    }
+
+    const blindPeerInfo = this.blindPeerService?.getAnnouncementInfo?.();
+    if (blindPeerInfo?.enabled) {
+      payload.blindPeerEnabled = true;
+      payload.blindPeerPublicKey = blindPeerInfo.publicKey || null;
+      payload.blindPeerEncryptionKey = blindPeerInfo.encryptionKey || null;
+      payload.blindPeerMaxBytes = blindPeerInfo.maxBytes ?? null;
+    } else {
+      payload.blindPeerEnabled = false;
     }
 
     return payload;

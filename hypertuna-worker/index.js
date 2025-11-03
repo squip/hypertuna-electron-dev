@@ -41,7 +41,10 @@ import {
   getPfpDriveKey,
   mirrorPfpDrive,
   watchDrive,
-  getReplicationHealth
+  getReplicationHealth,
+  getCorestore,
+  getLocalDrive,
+  getPfpDrive
 } from './hyperdrive-manager.mjs';
 import { ensureMirrorsForProviders, stopAllMirrors } from './mirror-sync-manager.mjs';
 import { NostrUtils } from './nostr-utils.js';
@@ -56,6 +59,7 @@ import {
   encryptSharedSecretToString,
   decryptSharedSecretFromString
 } from './challenge-manager.mjs'
+import BlindPeeringManager from './blind-peering-manager.mjs'
 
 const pearRuntime = globalThis?.Pear
 const __dirname = process.env.APP_DIR || pearRuntime?.config?.dir || process.cwd()
@@ -244,6 +248,58 @@ async function ensurePublicGatewaySettingsLoaded() {
   return publicGatewaySettings
 }
 
+async function ensureBlindPeeringManager(runtime = {}) {
+  await ensurePublicGatewaySettingsLoaded()
+  if (!blindPeeringManager) {
+    blindPeeringManager = new BlindPeeringManager({
+      logger: console,
+      settingsProvider: () => publicGatewaySettings
+    })
+  }
+
+  blindPeeringManager.configure(publicGatewaySettings)
+
+  if (runtime.start === true) {
+    await blindPeeringManager.start({
+      corestore: runtime.corestore,
+      wakeup: runtime.wakeup
+    })
+  }
+
+  return blindPeeringManager
+}
+
+async function seedBlindPeeringMirrors(manager) {
+  if (!manager?.started) return
+  const localDrive = getLocalDrive()
+  if (config?.driveKey && localDrive) {
+    manager.ensureHyperdriveMirror({
+      identifier: config.driveKey,
+      driveKey: config.driveKey,
+      type: 'drive',
+      drive: localDrive
+    })
+  }
+  const pfpDriveInstance = getPfpDrive()
+  if (config?.pfpDriveKey && pfpDriveInstance) {
+    manager.ensureHyperdriveMirror({
+      identifier: config.pfpDriveKey,
+      driveKey: config.pfpDriveKey,
+      type: 'pfp-drive',
+      isPfp: true,
+      drive: pfpDriveInstance
+    })
+  }
+  for (const [relayKey, relayManager] of activeRelays.entries()) {
+    if (!relayManager?.relay) continue
+    manager.ensureRelayMirror({
+      relayKey,
+      publicIdentifier: relayManager?.publicIdentifier || null,
+      autobase: relayManager.relay
+    })
+  }
+}
+
 async function startGatewayService(options = {}) {
   await ensurePublicGatewaySettingsLoaded()
 
@@ -284,9 +340,40 @@ async function startGatewayService(options = {}) {
         }
       }
     })
-    gatewayService.on('public-gateway-status', (state) => {
+    gatewayService.on('public-gateway-status', async (state) => {
       publicGatewayStatusCache = state
       sendMessage({ type: 'public-gateway-status', state })
+      if (!state?.blindPeer) return
+
+      try {
+        publicGatewaySettings = {
+          ...(publicGatewaySettings || {}),
+          blindPeerEnabled: !!state.blindPeer.enabled,
+          blindPeerKeys: Array.isArray(state.blindPeer.keys) ? [...state.blindPeer.keys] : [],
+          blindPeerEncryptionKey: state.blindPeer.encryptionKey || null,
+          blindPeerMaxBytes: state.blindPeer.maxBytes ?? null
+        }
+        const manager = await ensureBlindPeeringManager()
+        manager.configure({
+          blindPeerEnabled: state.blindPeer.enabled,
+          blindPeerKeys: state.blindPeer.keys,
+          blindPeerEncryptionKey: state.blindPeer.encryptionKey,
+          blindPeerMaxBytes: state.blindPeer.maxBytes
+        })
+
+        if (manager.enabled && !manager.started) {
+          await manager.start({
+            corestore: getCorestore(),
+            wakeup: null
+          })
+          await seedBlindPeeringMirrors(manager)
+          await manager.refreshFromBlindPeers('status-sync')
+        } else if (!manager.enabled && manager.started) {
+          await manager.stop()
+        }
+      } catch (error) {
+        console.warn('[Worker] Failed to reconcile blind peering manager from status update:', error?.message || error)
+      }
     })
     if (pendingGatewayMetadataSync) {
       syncGatewayPeerMetadata('gateway-service-initialized').catch((err) => {
@@ -333,6 +420,11 @@ async function startGatewayService(options = {}) {
     gatewaySettingsApplied = false
     await gatewayService.start(mergedOptions)
     gatewayOptions = mergedOptions
+    await ensureBlindPeeringManager({
+      start: true,
+      corestore: getCorestore(),
+      wakeup: null
+    })
     if (pendingGatewayMetadataSync) {
       syncGatewayPeerMetadata('gateway-started').catch((err) => {
         console.warn('[Worker] Deferred gateway metadata sync failed after start:', err?.message || err)
@@ -350,6 +442,9 @@ async function stopGatewayService() {
     await gatewayService.stop()
     publicGatewayStatusCache = gatewayService.getPublicGatewayState()
     sendMessage({ type: 'public-gateway-status', state: publicGatewayStatusCache })
+    if (blindPeeringManager) {
+      await blindPeeringManager.stop()
+    }
   } catch (error) {
     console.error('[Worker] Failed to stop gateway service:', error)
     throw error
@@ -408,6 +503,7 @@ let configReceived = false
 let storedParentConfig = null
 
 let gatewayService = null
+let blindPeeringManager = null
 let gatewayStatusCache = null
 let gatewaySettingsApplied = false
 let gatewayOptions = { port: 8443, hostname: '127.0.0.1', listenHost: '127.0.0.1' }
@@ -1211,6 +1307,21 @@ async function handleMessageObject(message) {
       try {
         const next = await updatePublicGatewaySettings(message.config || {})
         publicGatewaySettings = next
+        if (blindPeeringManager) {
+          blindPeeringManager.configure(next)
+          if (blindPeeringManager.enabled && !blindPeeringManager.started) {
+            try {
+              await blindPeeringManager.start({
+                corestore: getCorestore(),
+                wakeup: null
+              })
+            } catch (err) {
+              console.warn('[Worker] Failed to restart blind peering manager after config update:', err?.message || err)
+            }
+          } else if (!blindPeeringManager.enabled && blindPeeringManager.started) {
+            await blindPeeringManager.stop()
+          }
+        }
         if (gatewayService) {
           await gatewayService.updatePublicGatewayConfig(next)
           publicGatewayStatusCache = gatewayService.getPublicGatewayState()
@@ -1734,6 +1845,14 @@ async function cleanup() {
 
   // Stop all mirror watchers
   try { await stopAllMirrors() } catch (_) {}
+
+  if (blindPeeringManager) {
+    try {
+      await blindPeeringManager.stop()
+    } catch (err) {
+      console.warn('[Worker] Failed to stop blind peering manager:', err?.message || err)
+    }
+  }
   
   if (workerPipe) {
     try { workerPipe.end() } catch (err) { console.warn('[Worker] Failed to close pipe cleanly:', err?.message || err) }
@@ -1846,6 +1965,18 @@ async function main() {
     // Kick off mirror setup for all known relays/providers
     await ensureMirrorsForAllRelays().catch(err => console.error('[Worker] Mirror setup error:', err))
 
+    try {
+      const manager = await ensureBlindPeeringManager({
+        start: true,
+        corestore: getCorestore(),
+        wakeup: null
+      })
+      await seedBlindPeeringMirrors(manager)
+      await manager.refreshFromBlindPeers('startup')
+    } catch (error) {
+      console.warn('[Worker] Blind peering manager failed to start:', error?.message || error)
+    }
+
     sendMessage({
       type: 'status',
       message: 'Loading relay server...',
@@ -1950,6 +2081,14 @@ async function main() {
         reconcileRelayFiles().catch(err => console.error('[Worker] File reconciliation error:', err))
         ensureMirrorsForAllRelays().catch(err => console.error('[Worker] Mirror refresh error:', err))
         syncRemotePfpMirrors().catch(err => console.error('[Worker] PFP mirror error:', err))
+        if (blindPeeringManager?.started) {
+          seedBlindPeeringMirrors(blindPeeringManager).catch(err => {
+            console.warn('[Worker] Blind peering mirror seeding failed:', err?.message || err)
+          })
+          blindPeeringManager.refreshFromBlindPeers('periodic').catch(err => {
+            console.warn('[Worker] Blind peering periodic refresh failed:', err?.message || err)
+          })
+        }
       }
     }, 60000)
 

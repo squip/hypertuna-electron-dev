@@ -39,7 +39,8 @@ build/Release
 
 # Dependency directories
 hypertuna-worker/node_modules/
-hypertuna-worker/test/
+hypertuna-worker/test/*
+!hypertuna-worker/test/blind-peering-manager.test.js
 hypertuna-worker/package-lock.json
 hypertuna-desktop/node_modules/
 public-gateway/node_modules/

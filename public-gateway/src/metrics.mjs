@@ -55,6 +55,21 @@ const relayTokenRevocationCounter = new client.Counter({
   labelNames: ['result']
 });
 
+const blindPeerActiveGauge = new client.Gauge({
+  name: 'gateway_blind_peer_active',
+  help: 'Indicates whether the blind-peer service is active (1) or disabled (0)'
+});
+
+const blindPeerTrustedPeersGauge = new client.Gauge({
+  name: 'gateway_blind_peer_trusted_peers',
+  help: 'Number of trusted peers registered with the blind-peer service'
+});
+
+const blindPeerBytesGauge = new client.Gauge({
+  name: 'gateway_blind_peer_bytes_allocated',
+  help: 'Bytes allocated by the blind-peer storage subsystem'
+});
+
 register.registerMetric(sessionGauge);
 register.registerMetric(peerGauge);
 register.registerMetric(requestCounter);
@@ -64,6 +79,9 @@ register.registerMetric(relayErrorCounter);
 register.registerMetric(relayTokenIssueCounter);
 register.registerMetric(relayTokenRefreshCounter);
 register.registerMetric(relayTokenRevocationCounter);
+register.registerMetric(blindPeerActiveGauge);
+register.registerMetric(blindPeerTrustedPeersGauge);
+register.registerMetric(blindPeerBytesGauge);
 
 function metricsMiddleware(path = '/metrics') {
   return async (req, res, next) => {
@@ -88,5 +106,8 @@ export {
   relayTokenIssueCounter,
   relayTokenRefreshCounter,
   relayTokenRevocationCounter,
+  blindPeerActiveGauge,
+  blindPeerTrustedPeersGauge,
+  blindPeerBytesGauge,
   metricsMiddleware
 };

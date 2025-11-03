@@ -11,6 +11,9 @@
     "test": "node --test"
   },
   "dependencies": {
+    "blind-peer": "^2.9.2",
+    "blind-peer-encodings": "^3.1.0",
+    "hypercore-id-encoding": "^1.4.0",
     "express": "^4.19.2",
     "ws": "^8.18.0",
     "hyperswarm": "^4.14.0",
