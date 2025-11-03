@@ -223,6 +223,7 @@ export class GatewayService extends EventEmitter {
     this.publicGatewaySettings = this.#normalizePublicGatewayConfig(options.publicGateway);
     this.publicGatewayRegistrar = null;
     this.publicGatewayRelayState = new Map();
+    this.blindPeerSummary = null;
     this.publicGatewayRelayTokens = new Map();
     this.publicGatewayRelayTokenTimers = new Map();
     this.gatewayTelemetryTimers = new Map();
@@ -1041,33 +1042,35 @@ export class GatewayService extends EventEmitter {
     if (!peers.length) {
       try {
         await this.publicGatewayRegistrar.unregisterRelay(relayKey);
-        this.publicGatewayRelayState.set(relayKey, {
-          relayKey,
-          status: 'offline',
-          peerCount: 0,
-          lastSyncedAt: now,
-          message: 'No peers connected',
-          metadata: metadataCopy,
-          peers: [],
-          localConnectionUrl: this.#isPublicGatewayRelayKey(relayKey)
-            ? `${(this.config?.urls?.hostname || this.gatewayServer?.getServerUrls()?.hostname || 'ws://127.0.0.1:8443').replace(/\/$/, '')}/${this.#getPublicGatewayRelayPath()}`
-            : null,
-          requiresAuth: this.#isPublicGatewayRelayKey(relayKey) ? false : metadataCopy?.requiresAuth ?? true
-        });
+      this.publicGatewayRelayState.set(relayKey, {
+        relayKey,
+        status: 'offline',
+        peerCount: 0,
+        lastSyncedAt: now,
+        message: 'No peers connected',
+        metadata: metadataCopy,
+        peers: [],
+        blindPeer: this.blindPeerSummary || null,
+        localConnectionUrl: this.#isPublicGatewayRelayKey(relayKey)
+          ? `${(this.config?.urls?.hostname || this.gatewayServer?.getServerUrls()?.hostname || 'ws://127.0.0.1:8443').replace(/\/$/, '')}/${this.#getPublicGatewayRelayPath()}`
+          : null,
+        requiresAuth: this.#isPublicGatewayRelayKey(relayKey) ? false : metadataCopy?.requiresAuth ?? true
+      });
       } catch (error) {
         this.publicGatewayRelayState.set(relayKey, {
           relayKey,
           status: 'error',
           peerCount: 0,
           lastSyncedAt: now,
-          message: error.message,
-          metadata: metadataCopy,
-          peers: [],
-          localConnectionUrl: this.#isPublicGatewayRelayKey(relayKey)
-            ? `${(this.config?.urls?.hostname || this.gatewayServer?.getServerUrls()?.hostname || 'ws://127.0.0.1:8443').replace(/\/$/, '')}/${this.#getPublicGatewayRelayPath()}`
-            : null,
-          requiresAuth: this.#isPublicGatewayRelayKey(relayKey) ? false : metadataCopy?.requiresAuth ?? true
-        });
+        message: error.message,
+        metadata: metadataCopy,
+        peers: [],
+        blindPeer: this.blindPeerSummary || null,
+        localConnectionUrl: this.#isPublicGatewayRelayKey(relayKey)
+          ? `${(this.config?.urls?.hostname || this.gatewayServer?.getServerUrls()?.hostname || 'ws://127.0.0.1:8443').replace(/\/$/, '')}/${this.#getPublicGatewayRelayPath()}`
+          : null,
+        requiresAuth: this.#isPublicGatewayRelayKey(relayKey) ? false : metadataCopy?.requiresAuth ?? true
+      });
         this.log('warn', `[PublicGateway] Failed to unregister relay ${relayKey}: ${error.message}`);
       }
       this.#clearRelayToken(relayKey);
@@ -1084,6 +1087,9 @@ export class GatewayService extends EventEmitter {
       const registrationResult = await this.publicGatewayRegistrar.registerRelay(relayKey, payload);
       if (!registrationResult?.success) {
         throw new Error(registrationResult?.error || 'Registration rejected by gateway');
+      }
+      if (registrationResult.blindPeer) {
+        this.blindPeerSummary = registrationResult.blindPeer;
       }
       if (registrationResult.hyperbee?.hyperbeeKey) {
         try {
@@ -1138,6 +1144,7 @@ export class GatewayService extends EventEmitter {
         message: null,
         metadata: metadataCopy,
         peers,
+        blindPeer: registrationResult.blindPeer || this.blindPeerSummary || null,
         token: tokenInfo?.token || null,
         expiresAt: tokenInfo?.expiresAt || null,
         ttlSeconds: tokenInfo?.ttlSeconds || null,
@@ -1171,7 +1178,8 @@ export class GatewayService extends EventEmitter {
         lastSyncedAt: now,
         message: error.message,
         metadata: metadataCopy,
-        peers
+        peers,
+        blindPeer: this.blindPeerSummary || null
       });
       this.log('warn', `[PublicGateway] Failed to sync relay ${relayKey}: ${error.message}`);
       this.#scheduleRelayTokenRetry(relayKey);
@@ -1581,6 +1589,10 @@ export class GatewayService extends EventEmitter {
 
     const config = this.publicGatewaySettings || {};
     const enabled = !!(config.enabled && this.publicGatewayRegistrar?.isEnabled?.());
+    const summary = this.blindPeerSummary;
+    const defaultKeys = Array.isArray(config.blindPeerKeys) ? [...config.blindPeerKeys] : [];
+    const summaryKeys = summary?.publicKey ? [summary.publicKey] : [];
+    const blindPeerKeys = summaryKeys.length ? summaryKeys : defaultKeys;
 
     return {
       enabled,
@@ -1602,10 +1614,13 @@ export class GatewayService extends EventEmitter {
       delegateReqToPeers: !!config.delegateReqToPeers,
       defaultTokenTtl: config.defaultTokenTtl || 3600,
       blindPeer: {
-        enabled: !!config.blindPeerEnabled,
-        keys: Array.isArray(config.blindPeerKeys) ? [...config.blindPeerKeys] : [],
-        encryptionKey: config.blindPeerEncryptionKey || null,
-        maxBytes: config.blindPeerMaxBytes ?? null
+        enabled: summary?.enabled ?? !!config.blindPeerEnabled,
+        keys: blindPeerKeys,
+        encryptionKey: summary?.encryptionKey || config.blindPeerEncryptionKey || null,
+        maxBytes: config.blindPeerMaxBytes ?? null,
+        storageUsageBytes: summary?.storageUsageBytes ?? null,
+        trustedPeers: Array.isArray(summary?.trustedPeers) ? summary.trustedPeers : [],
+        summary: summary || null
       },
       wsBase: enabled ? (config.resolvedWsUrl || this.publicGatewayWsBase) : null,
       lastUpdatedAt: this.publicGatewayStatusUpdatedAt,
@@ -3516,6 +3531,9 @@ export class GatewayService extends EventEmitter {
   }
 
   async #applyBlindPeerInfo(info = {}, { persist = false } = {}) {
+    const summary = info && typeof info === 'object' ? { ...info } : null;
+    this.blindPeerSummary = summary;
+
     const enabled = !!info.enabled;
     const publicKey = typeof info.publicKey === 'string' ? info.publicKey.trim() : null;
     const encryptionKey = typeof info.encryptionKey === 'string' ? info.encryptionKey.trim() : null;

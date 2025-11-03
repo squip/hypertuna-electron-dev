@@ -346,20 +346,21 @@ async function startGatewayService(options = {}) {
       if (!state?.blindPeer) return
 
       try {
+        const blindPeerState = state.blindPeer || {}
+        const summary = blindPeerState.summary || null
+        const remoteKeys = Array.isArray(blindPeerState.keys) && blindPeerState.keys.length
+          ? blindPeerState.keys.filter(Boolean)
+          : summary?.publicKey ? [summary.publicKey] : []
+
         publicGatewaySettings = {
           ...(publicGatewaySettings || {}),
-          blindPeerEnabled: !!state.blindPeer.enabled,
-          blindPeerKeys: Array.isArray(state.blindPeer.keys) ? [...state.blindPeer.keys] : [],
-          blindPeerEncryptionKey: state.blindPeer.encryptionKey || null,
-          blindPeerMaxBytes: state.blindPeer.maxBytes ?? null
+          blindPeerEnabled: summary?.enabled ?? !!blindPeerState.enabled,
+          blindPeerKeys: remoteKeys,
+          blindPeerEncryptionKey: summary?.encryptionKey || blindPeerState.encryptionKey || null,
+          blindPeerMaxBytes: blindPeerState.maxBytes ?? publicGatewaySettings?.blindPeerMaxBytes ?? null
         }
+
         const manager = await ensureBlindPeeringManager()
-        manager.configure({
-          blindPeerEnabled: state.blindPeer.enabled,
-          blindPeerKeys: state.blindPeer.keys,
-          blindPeerEncryptionKey: state.blindPeer.encryptionKey,
-          blindPeerMaxBytes: state.blindPeer.maxBytes
-        })
 
         if (manager.enabled && !manager.started) {
           await manager.start({

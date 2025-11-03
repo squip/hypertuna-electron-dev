@@ -290,6 +290,8 @@ class PublicGatewayService {
       app.use(metricsMiddleware(this.config.metrics.path));
     }
 
+    app.get('/api/blind-peer', (req, res) => this.#handleBlindPeerStatus(req, res));
+
     app.get('/health', (_req, res) => {
       res.json({ status: 'ok' });
     });
@@ -2021,6 +2023,20 @@ class PublicGatewayService {
     };
   }
 
+  #getBlindPeerSummary() {
+    const status = this.blindPeerService?.getStatus?.() || null;
+    const trustedPeers = this.blindPeerService?.getTrustedPeers?.() || [];
+    return {
+      enabled: !!status?.enabled,
+      running: !!status?.running,
+      storageUsageBytes: status?.digest?.bytesAllocated ?? null,
+      trustedPeerCount: status?.trustedPeerCount ?? trustedPeers.length,
+      publicKey: status?.publicKey || this.blindPeerService?.getPublicKeyHex?.() || null,
+      encryptionKey: status?.encryptionKey || this.blindPeerService?.getEncryptionKeyHex?.() || null,
+      trustedPeers
+    };
+  }
+
   #coerceTimestamp(value) {
     if (value === null || value === undefined) return null;
     if (typeof value === 'number' && Number.isFinite(value)) {
@@ -2053,6 +2069,23 @@ class PublicGatewayService {
       peerCount,
       updatedAt: this.publicGatewayStatusUpdatedAt
     });
+  }
+
+  #handleBlindPeerStatus(_req, res) {
+    try {
+      const status = this.blindPeerService?.getStatus?.() || { enabled: false };
+      const summary = this.#getBlindPeerSummary();
+      res.json({
+        status,
+        summary,
+        configured: !!this.config?.blindPeer?.enabled
+      });
+    } catch (error) {
+      this.logger?.error?.('[PublicGateway] Failed to compose blind-peer status response', {
+        err: error?.message || error
+      });
+      res.status(500).json({ error: 'blind-peer-status-unavailable' });
+    }
   }
 
   #verifySignedPayload(payload, signature) {
@@ -2372,6 +2405,10 @@ class PublicGatewayService {
       metadata.delegateReqToPeers = relayPayload.delegateReqToPeers;
     }
 
+    const trustedInfo = this.blindPeerService?.getTrustedPeerInfo?.(peerKey) || null;
+
+    metadata.blindPeerTrusted = !!trustedInfo;
+    metadata.blindPeerTrustedSince = trustedInfo?.trustedSince || null;
     metadata.lastPeerUpdateAt = now;
     const peerStates = { ...(metadata.peerStates || {}) };
     const existingState = peerStates[peerKey] || {};
@@ -2379,7 +2416,9 @@ class PublicGatewayService {
       ...existingState,
       lastSeen: now,
       lastHealthyAt: existingState.lastHealthyAt || now,
-      unreachableSince: null
+      unreachableSince: null,
+      blindPeerTrusted: !!trustedInfo,
+      blindPeerTrustedSince: trustedInfo?.trustedSince || null
     };
     metadata.peerStates = peerStates;
 
@@ -2456,6 +2495,7 @@ class PublicGatewayService {
       record.gatewayReplica = existing.gatewayReplica;
     }
 
+    record.blindPeer = this.#getBlindPeerSummary();
     await this.registrationStore.upsertRelay(relayKey, record);
     this.#syncSessionsWithRelay(relayKey, record);
     this.#markPeerReachable(peerKey, { relayKey, timestamp: now });

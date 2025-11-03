@@ -1,6 +1,6 @@
 import { EventEmitter } from 'node:events';
-import { mkdir } from 'node:fs/promises';
-import { resolve } from 'node:path';
+import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { resolve, dirname } from 'node:path';
 import HypercoreId from 'hypercore-id-encoding';
 
 const DEFAULT_STORAGE_SUBDIR = 'blind-peer-data';
@@ -10,10 +10,20 @@ async function loadBlindPeerModule() {
   return mod?.default || mod;
 }
 
-function toHex(value) {
+function toKeyString(value) {
   if (!value) return null;
-  if (typeof value === 'string') return value;
-  return Buffer.isBuffer(value) ? value.toString('hex') : null;
+  try {
+    if (typeof value === 'string') {
+      return HypercoreId.encode(HypercoreId.decode(value));
+    }
+    const buf = Buffer.isBuffer(value) ? value : Buffer.from(value);
+    return HypercoreId.encode(buf);
+  } catch (_) {
+    if (typeof value === 'string') return value.trim() || null;
+    if (Buffer.isBuffer(value)) return value.toString('hex');
+    if (value instanceof Uint8Array) return Buffer.from(value).toString('hex');
+    return null;
+  }
 }
 
 function sanitizePeerKey(key) {
@@ -51,6 +61,11 @@ export default class BlindPeerService extends EventEmitter {
     this.running = false;
     this.storageDir = this.config.storageDir || null;
     this.trustedPeers = new Set();
+    this.trustedPeerMeta = new Map();
+    this.trustedPeersPersistPath = this.config.trustedPeersPersistPath
+      ? resolve(this.config.trustedPeersPersistPath)
+      : null;
+    this.trustedPeersLoaded = false;
     this.blindPeer = null;
     this.cleanupInterval = null;
   }
@@ -65,6 +80,7 @@ export default class BlindPeerService extends EventEmitter {
       return;
     }
 
+    await this.#loadTrustedPeersFromDisk();
     await this.#ensureStorageDir();
     this.initialized = true;
     this.logger?.info?.('[BlindPeer] Initialized', this.getStatus());
@@ -113,6 +129,10 @@ export default class BlindPeerService extends EventEmitter {
     if (!sanitized) return false;
     if (this.trustedPeers.has(sanitized)) return false;
     this.trustedPeers.add(sanitized);
+    const now = Date.now();
+    this.trustedPeerMeta.set(sanitized, {
+      trustedSince: now
+    });
 
     if (this.blindPeer?.addTrustedPubKey) {
       try {
@@ -127,6 +147,13 @@ export default class BlindPeerService extends EventEmitter {
 
     this.logger?.debug?.('[BlindPeer] Trusted peer added', { peerKey: sanitized });
     this.#updateTrustedPeers();
+    if (this.trustedPeersPersistPath) {
+      this.#persistTrustedPeers().catch((error) => {
+        this.logger?.warn?.('[BlindPeer] Failed to persist trusted peers', {
+          err: error?.message || error
+        });
+      });
+    }
     return true;
   }
 
@@ -136,7 +163,15 @@ export default class BlindPeerService extends EventEmitter {
     const removed = this.trustedPeers.delete(sanitized);
     if (removed) {
       this.logger?.debug?.('[BlindPeer] Trusted peer removed', { peerKey: sanitized });
+      this.trustedPeerMeta.delete(sanitized);
       this.#updateTrustedPeers();
+      if (this.trustedPeersPersistPath) {
+        this.#persistTrustedPeers().catch((error) => {
+          this.logger?.warn?.('[BlindPeer] Failed to persist trusted peers', {
+            err: error?.message || error
+          });
+        });
+      }
     }
     return removed;
   }
@@ -166,7 +201,7 @@ export default class BlindPeerService extends EventEmitter {
     try {
       const record = await this.blindPeer.addCore(request);
       this.logger?.info?.('[BlindPeer] Core mirror requested', {
-        key: toHex(key),
+        key: toKeyString(key),
         announce: request.announce,
         priority: request.priority
       });
@@ -174,7 +209,7 @@ export default class BlindPeerService extends EventEmitter {
       return { status: 'accepted', record };
     } catch (error) {
       this.logger?.warn?.('[BlindPeer] Failed to mirror core', {
-        key: toHex(key),
+        key: toKeyString(key),
         err: error?.message || error
       });
       throw error;
@@ -191,14 +226,14 @@ export default class BlindPeerService extends EventEmitter {
     try {
       const result = await this.blindPeer.addAutobase(autobase, targetKey);
       this.logger?.info?.('[BlindPeer] Autobase mirrored', {
-        target: toHex(targetKey),
+        target: toKeyString(targetKey),
         writers: Array.isArray(autobase.writers) ? autobase.writers.length : null
       });
       this.#updateMetrics();
       return { status: 'accepted', result };
     } catch (error) {
       this.logger?.warn?.('[BlindPeer] Failed to mirror autobase', {
-        target: toHex(targetKey),
+        target: toKeyString(targetKey),
         err: error?.message || error
       });
       throw error;
@@ -206,11 +241,37 @@ export default class BlindPeerService extends EventEmitter {
   }
 
   getPublicKeyHex() {
-    return this.blindPeer ? toHex(this.blindPeer.publicKey) : null;
+    return this.blindPeer ? toKeyString(this.blindPeer.publicKey) : null;
   }
 
   getEncryptionKeyHex() {
-    return this.blindPeer ? toHex(this.blindPeer.encryptionPublicKey) : null;
+    return this.blindPeer ? toKeyString(this.blindPeer.encryptionPublicKey) : null;
+  }
+
+  isTrustedPeer(peerKey) {
+    const sanitized = sanitizePeerKey(peerKey);
+    if (!sanitized) return false;
+    return this.trustedPeers.has(sanitized);
+  }
+
+  getTrustedPeerInfo(peerKey) {
+    const sanitized = sanitizePeerKey(peerKey);
+    if (!sanitized) return null;
+    const meta = this.trustedPeerMeta.get(sanitized);
+    if (!meta) return null;
+    return {
+      key: sanitized,
+      trustedSince: meta.trustedSince || null
+    };
+  }
+
+  getTrustedPeers() {
+    const peers = [];
+    for (const key of this.trustedPeers) {
+      const info = this.getTrustedPeerInfo(key) || { key, trustedSince: null };
+      peers.push(info);
+    }
+    return peers;
   }
 
   getStatus() {
@@ -222,6 +283,7 @@ export default class BlindPeerService extends EventEmitter {
       digest: this.blindPeer?.digest || null,
       publicKey: this.getPublicKeyHex(),
       encryptionKey: this.getEncryptionKeyHex(),
+      trustedPeers: this.getTrustedPeers(),
       config: {
         maxBytes: this.config.maxBytes,
         gcIntervalMs: this.config.gcIntervalMs,
@@ -292,5 +354,52 @@ export default class BlindPeerService extends EventEmitter {
 
   #updateTrustedPeers() {
     this.metrics.setTrustedPeers?.(this.trustedPeers.size);
+  }
+
+  async #loadTrustedPeersFromDisk() {
+    if (!this.trustedPeersPersistPath || this.trustedPeersLoaded) return;
+    try {
+      const raw = await readFile(this.trustedPeersPersistPath, 'utf8');
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) {
+        for (const entry of parsed) {
+          const key = sanitizePeerKey(entry?.key);
+          if (!key) continue;
+          this.trustedPeers.add(key);
+          const trustedSince = Number(entry?.trustedSince);
+          this.trustedPeerMeta.set(key, {
+            trustedSince: Number.isFinite(trustedSince) ? trustedSince : Date.now()
+          });
+        }
+      }
+      this.logger?.info?.('[BlindPeer] Loaded trusted peers from disk', {
+        count: this.trustedPeers.size,
+        path: this.trustedPeersPersistPath
+      });
+    } catch (error) {
+      if (error?.code !== 'ENOENT') {
+        this.logger?.warn?.('[BlindPeer] Failed to load trusted peers from disk', {
+          path: this.trustedPeersPersistPath,
+          err: error?.message || error
+        });
+      }
+    } finally {
+      this.trustedPeersLoaded = true;
+    }
+  }
+
+  async #persistTrustedPeers() {
+    if (!this.trustedPeersPersistPath) return;
+    const payload = this.getTrustedPeers();
+    try {
+      await mkdir(dirname(this.trustedPeersPersistPath), { recursive: true });
+      await writeFile(
+        this.trustedPeersPersistPath,
+        JSON.stringify(payload, null, 2),
+        'utf8'
+      );
+    } catch (error) {
+      throw error;
+    }
   }
 }
