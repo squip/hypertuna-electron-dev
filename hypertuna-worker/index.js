@@ -64,8 +64,11 @@ import BlindPeeringManager from './blind-peering-manager.mjs'
 const pearRuntime = globalThis?.Pear
 const __dirname = process.env.APP_DIR || pearRuntime?.config?.dir || process.cwd()
 const defaultStorageDir = process.env.STORAGE_DIR || pearRuntime?.config?.storage || join(process.cwd(), 'data')
+const BLIND_PEERING_METADATA_FILENAME = 'blind-peering-metadata.json'
 
 global.userConfig = global.userConfig || { storage: defaultStorageDir }
+
+const relayMirrorSubscriptions = new Map()
 
 function getGatewayWebsocketProtocol(config) {
   return config?.proxy_websocket_protocol === 'ws' ? 'ws' : 'wss'
@@ -250,6 +253,9 @@ async function ensurePublicGatewaySettingsLoaded() {
 
 async function ensureBlindPeeringManager(runtime = {}) {
   await ensurePublicGatewaySettingsLoaded()
+  const storageBase = (config && config.storage) ? config.storage : defaultStorageDir
+  const metadataPath = join(storageBase, BLIND_PEERING_METADATA_FILENAME)
+  const swarmKeyPair = deriveSwarmKeyPair(config)
   if (!blindPeeringManager) {
     blindPeeringManager = new BlindPeeringManager({
       logger: console,
@@ -257,13 +263,17 @@ async function ensureBlindPeeringManager(runtime = {}) {
     })
   }
 
+  blindPeeringManager.setMetadataPath(metadataPath)
   blindPeeringManager.configure(publicGatewaySettings)
 
   if (runtime.start === true) {
     await blindPeeringManager.start({
       corestore: runtime.corestore,
-      wakeup: runtime.wakeup
+      wakeup: runtime.wakeup,
+      swarmKeyPair
     })
+  } else if (swarmKeyPair) {
+    blindPeeringManager.runtime.swarmKeyPair = swarmKeyPair
   }
 
   return blindPeeringManager
@@ -297,7 +307,47 @@ async function seedBlindPeeringMirrors(manager) {
       publicIdentifier: relayManager?.publicIdentifier || null,
       autobase: relayManager.relay
     })
+    attachRelayMirrorHooks(relayKey, relayManager, manager)
   }
+}
+
+function attachRelayMirrorHooks(relayKey, relayManager, manager) {
+  if (!manager?.started) return
+  const autobase = relayManager?.relay
+  if (!autobase || typeof autobase.on !== 'function') return
+  if (relayMirrorSubscriptions.has(autobase)) return
+  const handler = () => {
+    manager.ensureRelayMirror({
+      relayKey,
+      publicIdentifier: relayManager?.publicIdentifier || null,
+      autobase
+    })
+    manager.refreshFromBlindPeers('relay-update').catch((error) => {
+      manager.logger?.warn?.('[BlindPeering] Relay update refresh failed', {
+        relayKey,
+        err: error?.message || error
+      })
+    })
+  }
+  autobase.on('update', handler)
+  relayMirrorSubscriptions.set(autobase, () => {
+    if (typeof autobase.off === 'function') {
+      autobase.off('update', handler)
+    } else if (typeof autobase.removeListener === 'function') {
+      autobase.removeListener('update', handler)
+    }
+  })
+}
+
+function cleanupRelayMirrorSubscriptions() {
+  for (const unsubscribe of relayMirrorSubscriptions.values()) {
+    try {
+      unsubscribe()
+    } catch (error) {
+      console.warn('[Worker] Failed to remove relay mirror subscription:', error?.message || error)
+    }
+  }
+  relayMirrorSubscriptions.clear()
 }
 
 async function startGatewayService(options = {}) {
@@ -365,7 +415,8 @@ async function startGatewayService(options = {}) {
         if (manager.enabled && !manager.started) {
           await manager.start({
             corestore: getCorestore(),
-            wakeup: null
+            wakeup: null,
+            swarmKeyPair: deriveSwarmKeyPair(config)
           })
           await seedBlindPeeringMirrors(manager)
           await manager.refreshFromBlindPeers('status-sync')
@@ -594,6 +645,38 @@ function startDriveWatcher () {
     } catch (_) {}
     if (type === 'add') await publishFilekeyEvent(relayKey, fileHash)
     else if (type === 'del') await publishFileDeletionEvent(relayKey, fileHash)
+
+    if (blindPeeringManager?.started) {
+      try {
+        if (config?.driveKey && identifier === config.driveKey) {
+          const localDrive = getLocalDrive()
+          if (localDrive) {
+            blindPeeringManager.ensureHyperdriveMirror({
+              identifier: config.driveKey,
+              driveKey: config.driveKey,
+              type: 'drive',
+              drive: localDrive
+            })
+          }
+        } else if (config?.pfpDriveKey && identifier === config.pfpDriveKey) {
+          const pfpDrive = getPfpDrive()
+          if (pfpDrive) {
+            blindPeeringManager.ensureHyperdriveMirror({
+              identifier: config.pfpDriveKey,
+              driveKey: config.pfpDriveKey,
+              type: 'pfp-drive',
+              isPfp: true,
+              drive: pfpDrive
+            })
+          }
+        }
+        blindPeeringManager.refreshFromBlindPeers('drive-watch').catch((error) => {
+          console.warn('[Worker] Blind peering drive-watch refresh failed:', error?.message || error)
+        })
+      } catch (error) {
+        console.warn('[Worker] Failed to update blind peering mirrors from drive watch:', error?.message || error)
+      }
+    }
   })
 }
 
@@ -628,6 +711,17 @@ function deriveSwarmPublicKey(cfg = {}) {
       if (key) return key;
     } catch (error) {
       console.warn('[Worker] Failed to derive swarm public key from seed:', error?.message || error);
+    }
+  }
+  return null;
+}
+
+function deriveSwarmKeyPair(cfg = {}) {
+  if (cfg?.proxy_seed && typeof cfg.proxy_seed === 'string') {
+    try {
+      return swarmCrypto.keyPair(b4a.from(cfg.proxy_seed, 'hex'));
+    } catch (error) {
+      console.warn('[Worker] Failed to derive swarm key pair from seed:', error?.message || error);
     }
   }
   return null;
@@ -1845,6 +1939,7 @@ async function cleanup() {
   try { await stopGatewayService() } catch (_) {}
 
   // Stop all mirror watchers
+  cleanupRelayMirrorSubscriptions()
   try { await stopAllMirrors() } catch (_) {}
 
   if (blindPeeringManager) {

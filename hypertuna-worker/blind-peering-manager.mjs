@@ -1,4 +1,6 @@
 import { EventEmitter } from 'node:events';
+import { readFile, writeFile, mkdir } from 'node:fs/promises';
+import { dirname } from 'node:path';
 import Hyperswarm from 'hyperswarm';
 import BlindPeering from 'blind-peering';
 import HypercoreId from 'hypercore-id-encoding';
@@ -23,7 +25,8 @@ export default class BlindPeeringManager extends EventEmitter {
 
     this.runtime = {
       corestore: null,
-      wakeup: null
+      wakeup: null,
+      swarmKeyPair: null
     };
 
     this.enabled = false;
@@ -33,6 +36,25 @@ export default class BlindPeeringManager extends EventEmitter {
     this.blindPeering = null;
     this.swarm = null;
     this.ownsSwarm = false;
+
+    this.metadataPath = null;
+    this.metadata = {
+      targets: {}
+    };
+    this.metadataLoaded = false;
+    this.metadataDirty = false;
+    this.metadataSaveTimer = null;
+
+    this.backoffConfig = {
+      initialDelayMs: 1000,
+      maxDelayMs: 60000,
+      maxAttempts: 6
+    };
+    this.refreshBackoff = {
+      attempt: 0,
+      timer: null,
+      inflight: null
+    };
   }
 
   configure(settings) {
@@ -68,7 +90,8 @@ export default class BlindPeeringManager extends EventEmitter {
 
     this.runtime = {
       corestore: runtime.corestore || this.runtime.corestore,
-      wakeup: runtime.wakeup || this.runtime.wakeup
+      wakeup: runtime.wakeup || this.runtime.wakeup,
+      swarmKeyPair: runtime.swarmKeyPair || this.runtime.swarmKeyPair || null
     };
 
     if (!this.runtime.corestore) {
@@ -80,7 +103,11 @@ export default class BlindPeeringManager extends EventEmitter {
         this.swarm = runtime.swarm;
         this.ownsSwarm = false;
       } else {
-        this.swarm = new Hyperswarm();
+        const swarmOptions = {};
+        if (this.runtime.swarmKeyPair?.publicKey && this.runtime.swarmKeyPair?.secretKey) {
+          swarmOptions.keyPair = this.runtime.swarmKeyPair;
+        }
+        this.swarm = new Hyperswarm(swarmOptions);
         this.ownsSwarm = true;
       }
     }
@@ -89,6 +116,8 @@ export default class BlindPeeringManager extends EventEmitter {
       mirrors: Array.from(this.trustedMirrors),
       pick: 2
     });
+
+    await this.#loadMetadata();
 
     this.started = true;
     this.logger?.info?.('[BlindPeering] Manager started', {
@@ -117,6 +146,11 @@ export default class BlindPeeringManager extends EventEmitter {
     }
     this.swarm = null;
     this.ownsSwarm = false;
+    if (this.metadataSaveTimer) {
+      clearTimeout(this.metadataSaveTimer);
+      this.metadataSaveTimer = null;
+    }
+    await this.#persistMetadata(true);
     this.logger?.info?.('[BlindPeering] Manager stopped');
     this.emit('stopped', this.getStatus());
   }
@@ -168,6 +202,7 @@ export default class BlindPeeringManager extends EventEmitter {
       updatedAt: Date.now()
     };
     this.mirrorTargets.set(`relay:${identifier}`, entry);
+    this.#recordMirrorMetadata(entry);
     this.logger?.debug?.('[BlindPeering] Relay mirror scheduled', {
       identifier,
       writers: Array.isArray(relayContext.coreRefs) ? relayContext.coreRefs.length : 0
@@ -187,6 +222,7 @@ export default class BlindPeeringManager extends EventEmitter {
       updatedAt: Date.now()
     };
     this.mirrorTargets.set(`drive:${identifier}`, entry);
+    this.#recordMirrorMetadata(entry);
     this.logger?.debug?.('[BlindPeering] Hyperdrive mirror scheduled', {
       identifier,
       pfp: !!driveContext.isPfp
@@ -220,22 +256,44 @@ export default class BlindPeeringManager extends EventEmitter {
   }
 
   async refreshFromBlindPeers(reason = 'startup') {
+    if (this.refreshBackoff.timer) {
+      clearTimeout(this.refreshBackoff.timer);
+      this.refreshBackoff.timer = null;
+    }
     if (!this.started) {
       this.logger?.debug?.('[BlindPeering] refresh skipped (not started)', { reason });
       return;
     }
-    this.logger?.info?.('[BlindPeering] Refresh requested', {
-      reason,
-      targets: this.mirrorTargets.size
-    });
-    try {
-      await this.blindPeering?.resume?.();
-    } catch (error) {
-      this.logger?.warn?.('[BlindPeering] Failed to resume blind-peering activity', {
-        error: error?.message || error
-      });
+    if (this.refreshBackoff.inflight) {
+      this.logger?.debug?.('[BlindPeering] Refresh skipped (in-flight)', { reason });
+      return this.refreshBackoff.inflight;
     }
-    this.emit('refresh-requested', { reason, targets: Array.from(this.mirrorTargets.values()) });
+    const attempt = Math.max(0, this.refreshBackoff.attempt);
+    const promise = (async () => {
+      this.logger?.info?.('[BlindPeering] Refresh requested', {
+        reason,
+        targets: this.mirrorTargets.size,
+        attempt
+      });
+      try {
+        await this.blindPeering?.resume?.();
+        this.refreshBackoff.attempt = 0;
+        this.emit('refresh-requested', { reason, targets: Array.from(this.mirrorTargets.values()) });
+      } catch (error) {
+        const attemptNext = attempt + 1;
+        this.logger?.warn?.('[BlindPeering] Failed to resume blind-peering activity', {
+          error: error?.message || error,
+          reason,
+          attempt: attemptNext
+        });
+        this.refreshBackoff.attempt = attemptNext;
+        this.#scheduleRefreshRetry(reason, attemptNext);
+      } finally {
+        this.refreshBackoff.inflight = null;
+      }
+    })();
+    this.refreshBackoff.inflight = promise;
+    return promise;
   }
 
   getStatus() {
@@ -245,5 +303,183 @@ export default class BlindPeeringManager extends EventEmitter {
       trustedMirrors: this.trustedMirrors.size,
       targets: this.mirrorTargets.size
     };
+  }
+
+  setMetadataPath(path) {
+    if (typeof path === 'string' && path.trim()) {
+      this.metadataPath = path.trim();
+    }
+  }
+
+  configureBackoff(options = {}) {
+    if (Number.isFinite(options.initialDelayMs) && options.initialDelayMs > 0) {
+      this.backoffConfig.initialDelayMs = Math.trunc(options.initialDelayMs);
+    }
+    if (Number.isFinite(options.maxDelayMs) && options.maxDelayMs > 0) {
+      this.backoffConfig.maxDelayMs = Math.trunc(options.maxDelayMs);
+    }
+    if (Number.isFinite(options.maxAttempts) && options.maxAttempts >= 0) {
+      this.backoffConfig.maxAttempts = Math.trunc(options.maxAttempts);
+    }
+  }
+
+  getMirrorMetadata() {
+    return {
+      ...this.metadata,
+      targets: { ...this.metadata.targets }
+    };
+  }
+
+  async #loadMetadata() {
+    if (this.metadataLoaded) return;
+    if (!this.metadataPath) {
+      this.metadataLoaded = true;
+      return;
+    }
+    try {
+      const raw = await readFile(this.metadataPath, 'utf8');
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed === 'object') {
+        if (parsed.targets && typeof parsed.targets === 'object') {
+          this.metadata.targets = parsed.targets;
+          for (const key of Object.keys(parsed.targets)) {
+            const entry = parsed.targets[key];
+            if (!entry || typeof entry !== 'object') continue;
+            const targetKey = `${entry.type || 'unknown'}:${entry.identifier || key}`;
+            if (!this.mirrorTargets.has(targetKey)) {
+              this.mirrorTargets.set(targetKey, {
+                type: entry.type || 'unknown',
+                identifier: entry.identifier || key,
+                context: { ...entry.context },
+                updatedAt: entry.updatedAt || Date.now()
+              });
+            }
+          }
+        }
+      }
+    } catch (error) {
+      if (error?.code !== 'ENOENT') {
+        this.logger?.warn?.('[BlindPeering] Failed to load persisted metadata', {
+          path: this.metadataPath,
+          err: error?.message || error
+        });
+      }
+    } finally {
+      this.metadataLoaded = true;
+    }
+  }
+
+  async #persistMetadata(force = false) {
+    if (!this.metadataPath) return;
+    if (!force && !this.metadataDirty) return;
+    try {
+      await mkdir(dirname(this.metadataPath), { recursive: true });
+      const payload = JSON.stringify({
+        targets: this.metadata.targets
+      }, null, 2);
+      await writeFile(this.metadataPath, payload, 'utf8');
+      this.metadataDirty = false;
+    } catch (error) {
+      this.logger?.warn?.('[BlindPeering] Failed to persist mirror metadata', {
+        path: this.metadataPath,
+        err: error?.message || error
+      });
+    }
+  }
+
+  #scheduleMetadataPersist() {
+    if (this.metadataSaveTimer) return;
+    this.metadataSaveTimer = setTimeout(() => {
+      this.metadataSaveTimer = null;
+      this.#persistMetadata().catch((error) => {
+        this.logger?.warn?.('[BlindPeering] Metadata persist task failed', {
+          err: error?.message || error
+        });
+      });
+    }, 2000);
+    this.metadataSaveTimer.unref?.();
+  }
+
+  #recordMirrorMetadata(entry) {
+    if (!entry || !entry.type || !entry.identifier) return;
+    const key = `${entry.type}:${entry.identifier}`;
+    const payload = this.#sanitizeMetadataEntry(entry);
+    if (!payload) return;
+    this.metadata.targets[key] = payload;
+    this.metadataDirty = true;
+    this.#scheduleMetadataPersist();
+  }
+
+  #sanitizeMetadataEntry(entry) {
+    const base = {
+      type: entry.type,
+      identifier: entry.identifier,
+      updatedAt: entry.updatedAt || Date.now()
+    };
+    if (entry.type === 'relay') {
+      const context = entry.context || {};
+      return {
+        ...base,
+        relayKey: context.relayKey || entry.identifier,
+        publicIdentifier: context.publicIdentifier || null,
+        lastWriterCount: Array.isArray(context.coreRefs) ? context.coreRefs.length : null,
+        announce: !!context.announce,
+        context: {
+          relayKey: context.relayKey || entry.identifier,
+          publicIdentifier: context.publicIdentifier || null
+        }
+      };
+    }
+    if (entry.type === 'drive') {
+      const context = entry.context || {};
+      return {
+        ...base,
+        driveKey: context.driveKey || entry.identifier,
+        isPfp: !!context.isPfp,
+        announce: true,
+        context: {
+          driveKey: context.driveKey || entry.identifier,
+          isPfp: !!context.isPfp
+        }
+      };
+    }
+    return {
+      ...base,
+      context: {}
+    };
+  }
+
+  #scheduleRefreshRetry(reason, attempt) {
+    if (attempt > this.backoffConfig.maxAttempts) {
+      this.logger?.warn?.('[BlindPeering] Refresh backoff aborted after max attempts', {
+        reason,
+        attempt
+      });
+      return;
+    }
+    if (this.refreshBackoff.timer) return;
+    const delay = this.#calculateBackoffDelay(attempt);
+    this.logger?.debug?.('[BlindPeering] Scheduling refresh retry', {
+      reason,
+      attempt,
+      delay
+    });
+    this.refreshBackoff.timer = setTimeout(() => {
+      this.refreshBackoff.timer = null;
+      this.refreshFromBlindPeers(reason).catch((error) => {
+        this.logger?.warn?.('[BlindPeering] Scheduled refresh failed', {
+          err: error?.message || error,
+          reason
+        });
+      });
+    }, delay);
+    this.refreshBackoff.timer.unref?.();
+  }
+
+  #calculateBackoffDelay(attempt) {
+    if (attempt <= 0) return this.backoffConfig.initialDelayMs;
+    const factor = 2 ** Math.max(0, attempt - 1);
+    const delay = this.backoffConfig.initialDelayMs * factor;
+    return Math.min(delay, this.backoffConfig.maxDelayMs);
   }
 }
