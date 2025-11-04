@@ -1,3 +1,5 @@
+import { EventEmitter } from 'node:events';
+
 const DEFAULT_POLICY = {
   maxConcurrentJobsPerPeer: 3,
   maxFailureRate: 0.4,
@@ -19,6 +21,16 @@ export default class RelayDispatcherService {
     this.policy = { ...DEFAULT_POLICY, ...policy };
     this.peerState = new Map();
     this.jobAssignments = new Map();
+    this.events = new EventEmitter();
+  }
+
+  on(eventName, handler) {
+    this.events.on(eventName, handler);
+    return () => this.events.off(eventName, handler);
+  }
+
+  off(eventName, handler) {
+    this.events.off(eventName, handler);
   }
 
   schedule(job = {}) {
@@ -61,13 +73,21 @@ export default class RelayDispatcherService {
     state.lastAssignedAt = now();
     this.jobAssignments.set(jobId, {
       peerId: best.peerId,
-      assignedAt: state.lastAssignedAt
+      assignedAt: state.lastAssignedAt,
+      job
     });
 
     this.logger?.debug?.('[RelayDispatcher] Job scheduled', {
       jobId,
       peerId: best.peerId,
       score: best.score
+    });
+
+    this.events.emit('assignment', {
+      jobId,
+      peerId: best.peerId,
+      assignedAt: state.lastAssignedAt,
+      job
     });
 
     return {
@@ -95,6 +115,13 @@ export default class RelayDispatcherService {
       peerId: assignment.peerId,
       deliveredCount: outcome.deliveredCount || 0
     });
+
+    this.events.emit('acknowledge', {
+      jobId,
+      peerId: assignment.peerId,
+      outcome,
+      job: assignment.job
+    });
   }
 
   fail(jobId, reason = {}) {
@@ -116,6 +143,12 @@ export default class RelayDispatcherService {
     }
 
     this.jobAssignments.delete(jobId);
+    this.events.emit('failure', {
+      jobId,
+      peerId: assignment?.peerId || null,
+      reason,
+      job: assignment?.job || null
+    });
   }
 
   reportPeerMetrics(peerId, metrics = {}) {
@@ -145,6 +178,7 @@ export default class RelayDispatcherService {
   shutdown() {
     this.peerState.clear();
     this.jobAssignments.clear();
+    this.events.removeAllListeners();
   }
 
   #ensurePeerState(peerId) {

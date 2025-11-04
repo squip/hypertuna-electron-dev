@@ -71,6 +71,7 @@ global.userConfig = global.userConfig || { storage: defaultStorageDir }
 
 const relayMirrorSubscriptions = new Map()
 let lastBlindPeerFingerprint = null
+let lastDispatcherAssignmentFingerprint = null
 
 function getGatewayWebsocketProtocol(config) {
   return config?.proxy_websocket_protocol === 'ws' ? 'ws' : 'wss'
@@ -422,42 +423,56 @@ async function startGatewayService(options = {}) {
         const remoteKeys = Array.isArray(blindPeerState.keys) && blindPeerState.keys.length
           ? blindPeerState.keys.filter(Boolean)
           : summary?.publicKey ? [summary.publicKey] : []
+        const previousSettings = publicGatewaySettings || {}
+        const manualKeys = Array.isArray(previousSettings.blindPeerManualKeys)
+          ? previousSettings.blindPeerManualKeys.filter(Boolean)
+          : []
 
         publicGatewaySettings = {
-          ...(publicGatewaySettings || {}),
+          ...previousSettings,
           blindPeerEnabled: summary?.enabled ?? !!blindPeerState.enabled,
           blindPeerKeys: remoteKeys,
+          blindPeerManualKeys: manualKeys,
           blindPeerEncryptionKey: summary?.encryptionKey || blindPeerState.encryptionKey || null,
-          blindPeerMaxBytes: blindPeerState.maxBytes ?? publicGatewaySettings?.blindPeerMaxBytes ?? null
+          blindPeerMaxBytes: blindPeerState.maxBytes ?? previousSettings.blindPeerMaxBytes ?? null
         }
 
         const manager = await ensureBlindPeeringManager()
         manager.configure(publicGatewaySettings)
         manager.markTrustedMirrors(remoteKeys)
 
-        const keysFingerprint = remoteKeys.join(',')
+        const dispatcherAssignments = Array.isArray(blindPeerState.dispatcherAssignments)
+          ? blindPeerState.dispatcherAssignments
+          : Array.isArray(summary?.dispatcherAssignments) ? summary.dispatcherAssignments : []
+        const ownPeerKey = config?.swarmPublicKey || deriveSwarmPublicKey(config)
+        const ownAssignments = dispatcherAssignments.filter((assignment) => assignment?.peerKey === ownPeerKey)
+        const dispatcherFingerprint = JSON.stringify(ownAssignments.map((assignment) => (
+          `${assignment?.jobId || ''}:${assignment?.relayKey || ''}:${assignment?.status || 'assigned'}`
+        )))
+        const keysFingerprint = Array.from(new Set([...remoteKeys, ...manualKeys].filter(Boolean))).join(',')
         const fingerprint = summary?.enabled
           ? `${summary.publicKey || ''}:${summary.encryptionKey || ''}:${summary.trustedPeerCount ?? remoteKeys.length}:${keysFingerprint}`
           : 'disabled'
 
-        if (manager.enabled && !manager.started) {
-          await manager.start({
-            corestore: getCorestore(),
-            wakeup: null,
-            swarmKeyPair: deriveSwarmKeyPair(config)
-          })
-          await seedBlindPeeringMirrors(manager)
-          await manager.refreshFromBlindPeers('status-sync')
-          await manager.rehydrateMirrors({
-            reason: 'status-sync',
-            timeoutMs: BLIND_PEER_REHYDRATION_TIMEOUT_MS
-          })
-          lastBlindPeerFingerprint = fingerprint
-        } else if (manager.enabled && manager.started) {
-          if (fingerprint !== lastBlindPeerFingerprint) {
+          if (manager.enabled && !manager.started) {
+            await manager.start({
+              corestore: getCorestore(),
+              wakeup: null,
+              swarmKeyPair: deriveSwarmKeyPair(config)
+            })
+            await seedBlindPeeringMirrors(manager)
+            await manager.refreshFromBlindPeers('status-sync')
+            await manager.rehydrateMirrors({
+              reason: 'status-sync',
+              timeoutMs: BLIND_PEER_REHYDRATION_TIMEOUT_MS
+            })
             lastBlindPeerFingerprint = fingerprint
-            try {
-              await manager.refreshFromBlindPeers('status-sync')
+            lastDispatcherAssignmentFingerprint = dispatcherFingerprint
+          } else if (manager.enabled && manager.started) {
+            if (fingerprint !== lastBlindPeerFingerprint) {
+              lastBlindPeerFingerprint = fingerprint
+              try {
+                await manager.refreshFromBlindPeers('status-sync')
             } catch (error) {
               console.warn('[Worker] Blind peering refresh failed on status update:', error?.message || error)
             }
@@ -466,17 +481,37 @@ async function startGatewayService(options = {}) {
               timeoutMs: BLIND_PEER_REHYDRATION_TIMEOUT_MS
             }).catch((error) => {
               console.warn('[Worker] Blind peering rehydration failed after status update:', error?.message || error)
-            })
+              })
+            }
+            if (dispatcherFingerprint !== lastDispatcherAssignmentFingerprint) {
+              lastDispatcherAssignmentFingerprint = dispatcherFingerprint
+              try {
+                await seedBlindPeeringMirrors(manager)
+              } catch (seedErr) {
+                console.warn('[Worker] Blind peering mirror seeding failed (dispatcher update):', seedErr?.message || seedErr)
+              }
+              try {
+                await manager.refreshFromBlindPeers('dispatcher-assignment')
+              } catch (refreshErr) {
+                console.warn('[Worker] Blind peering refresh failed on dispatcher update:', refreshErr?.message || refreshErr)
+              }
+              manager.rehydrateMirrors({
+                reason: 'dispatcher-assignment',
+                timeoutMs: BLIND_PEER_REHYDRATION_TIMEOUT_MS
+              }).catch((error) => {
+                console.warn('[Worker] Blind peering rehydration failed after dispatcher update:', error?.message || error)
+              })
+            }
+          } else if (!manager.enabled && manager.started) {
+            try {
+              await manager.clearAllMirrors({ reason: 'status-disabled' })
+            } catch (error) {
+              console.warn('[Worker] Failed to clear blind peering mirrors before shutdown:', error?.message || error)
+            }
+            await manager.stop()
+            lastBlindPeerFingerprint = fingerprint
+            lastDispatcherAssignmentFingerprint = dispatcherFingerprint
           }
-        } else if (!manager.enabled && manager.started) {
-          try {
-            await manager.clearAllMirrors({ reason: 'status-disabled' })
-          } catch (error) {
-            console.warn('[Worker] Failed to clear blind peering mirrors before shutdown:', error?.message || error)
-          }
-          await manager.stop()
-          lastBlindPeerFingerprint = fingerprint
-        }
       } catch (error) {
         console.warn('[Worker] Failed to reconcile blind peering manager from status update:', error?.message || error)
       }
@@ -1458,6 +1493,9 @@ async function handleMessageObject(message) {
         publicGatewaySettings = next
         if (blindPeeringManager) {
           blindPeeringManager.configure(next)
+          if (Array.isArray(next.blindPeerKeys) && next.blindPeerKeys.length) {
+            blindPeeringManager.markTrustedMirrors(next.blindPeerKeys)
+          }
           if (blindPeeringManager.enabled && !blindPeeringManager.started) {
             try {
               await blindPeeringManager.start({
@@ -1508,6 +1546,18 @@ async function handleMessageObject(message) {
             relays: {}
           }
         })
+      }
+      break
+    }
+
+    case 'get-blind-peering-status': {
+      try {
+        const manager = await ensureBlindPeeringManager()
+        const status = manager ? manager.getStatus() : { enabled: false, running: false }
+        const metadata = manager ? manager.getMirrorMetadata() : null
+        sendMessage({ type: 'blind-peering-status', status, metadata })
+      } catch (err) {
+        sendMessage({ type: 'error', message: `blind-peering-status failed: ${err.message}` })
       }
       break
     }
@@ -2034,6 +2084,7 @@ async function cleanup() {
       console.warn('[Worker] Failed to stop blind peering manager:', err?.message || err)
     }
     lastBlindPeerFingerprint = null
+    lastDispatcherAssignmentFingerprint = null
   }
   
   if (workerPipe) {

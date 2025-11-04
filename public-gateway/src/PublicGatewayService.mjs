@@ -133,6 +133,9 @@ class PublicGatewayService {
     this.peerHyperbeeReplications = new Map();
     this.publicGatewayStatusUpdatedAt = null;
     this.blindPeerService = null;
+    this.dispatcherAssignments = new Map();
+    this.dispatcherAssignmentTimers = new Map();
+    this.dispatcherListeners = [];
     this.blindPeerMetrics = {
       setActive: (active) => {
         blindPeerActiveGauge.set(active ? 1 : 0);
@@ -154,6 +157,18 @@ class PublicGatewayService {
         blindPeerEvictionsCounter.labels(label).inc(increment);
       }
     };
+
+    if (this.dispatcher) {
+      const assignmentListener = (event) => this.#handleDispatcherAssignment(event);
+      const acknowledgeListener = (event) => this.#handleDispatcherAcknowledge(event);
+      const failureListener = (event) => this.#handleDispatcherFailure(event);
+      this.dispatcherListeners.push({ event: 'assignment', handler: assignmentListener });
+      this.dispatcherListeners.push({ event: 'acknowledge', handler: acknowledgeListener });
+      this.dispatcherListeners.push({ event: 'failure', handler: failureListener });
+      this.dispatcher.on('assignment', assignmentListener);
+      this.dispatcher.on('acknowledge', acknowledgeListener);
+      this.dispatcher.on('failure', failureListener);
+    }
   }
 
   async init() {
@@ -277,6 +292,19 @@ class PublicGatewayService {
 
     await this.blindPeerService?.stop();
 
+    for (const timer of this.dispatcherAssignmentTimers.values()) {
+      clearTimeout(timer);
+    }
+    this.dispatcherAssignmentTimers.clear();
+    this.dispatcherAssignments.clear();
+
+    if (Array.isArray(this.dispatcherListeners) && this.dispatcher) {
+      for (const listener of this.dispatcherListeners) {
+        this.dispatcher.off(listener.event, listener.handler);
+      }
+    }
+    this.dispatcherListeners = [];
+
     await this.connectionPool.destroy();
     await this.registrationStore?.disconnect?.();
   }
@@ -301,6 +329,8 @@ class PublicGatewayService {
     }
 
     app.get('/api/blind-peer', (req, res) => this.#handleBlindPeerStatus(req, res));
+    app.post('/api/blind-peer/gc', (req, res) => this.#handleBlindPeerGc(req, res));
+    app.delete('/api/blind-peer/mirrors/:key', (req, res) => this.#handleBlindPeerDelete(req, res));
 
     app.get('/health', (_req, res) => {
       res.json({ status: 'ok' });
@@ -2046,7 +2076,10 @@ class PublicGatewayService {
       trustedPeers,
       hygiene: status?.hygiene || null,
       metadataTracked: status?.metadata?.trackedCores ?? null,
-      ownership: status?.ownership || null
+      ownership: status?.ownership || null,
+      dispatcherAssignments: status?.dispatcherAssignments
+        || this.blindPeerService?.getDispatcherAssignmentsSnapshot?.()
+        || this.#getDispatcherAssignmentsSnapshot()
     };
   }
 
@@ -2082,6 +2115,92 @@ class PublicGatewayService {
       peerCount,
       updatedAt: this.publicGatewayStatusUpdatedAt
     });
+  }
+
+  #handleDispatcherAssignment({ jobId, peerId, assignedAt, job }) {
+    const relayKey = job?.relayKey || job?.requester?.relayKey || null;
+    const filters = Array.isArray(job?.filters) ? job.filters : [];
+    const entry = {
+      jobId,
+      peerKey: peerId || null,
+      relayKey,
+      filters,
+      status: 'assigned',
+      assignedAt: assignedAt || Date.now(),
+      requester: job?.requester || null
+    };
+    this.dispatcherAssignments.set(jobId, entry);
+    if (peerId) {
+      this.blindPeerService?.addTrustedPeer(peerId);
+    }
+    this.blindPeerService?.recordDispatcherAssignment?.({
+      jobId,
+      peerKey: peerId || null,
+      relayKey,
+      filters,
+      requester: job?.requester || null
+    });
+    this.#emitPublicGatewayStatus();
+  }
+
+  #handleDispatcherAcknowledge({ jobId, peerId, outcome, job }) {
+    this.#completeDispatcherAssignment(jobId, 'acknowledged', {
+      peerKey: peerId || null,
+      outcome,
+      job
+    });
+  }
+
+  #handleDispatcherFailure({ jobId, peerId, reason, job }) {
+    this.#completeDispatcherAssignment(jobId, 'failed', {
+      peerKey: peerId || null,
+      reason,
+      job
+    });
+  }
+
+  #completeDispatcherAssignment(jobId, status, details = {}) {
+    if (!jobId) return;
+    const existing = this.dispatcherAssignments.get(jobId) || {
+      jobId,
+      relayKey: details?.job?.relayKey || details?.job?.requester?.relayKey || null,
+      peerKey: details?.peerKey || null,
+      filters: Array.isArray(details?.job?.filters) ? details.job.filters : [],
+      assignedAt: Date.now(),
+      requester: details?.job?.requester || null
+    };
+    existing.status = status;
+    existing.completedAt = Date.now();
+    existing.details = details || null;
+    this.dispatcherAssignments.set(jobId, existing);
+
+    this.blindPeerService?.clearDispatcherAssignment?.(jobId, {
+      status,
+      details,
+      assignment: existing
+    });
+
+    this.#scheduleDispatcherAssignmentCleanup(jobId);
+    this.#emitPublicGatewayStatus();
+  }
+
+  #scheduleDispatcherAssignmentCleanup(jobId, delayMs = 120000) {
+    if (!jobId) return;
+    if (this.dispatcherAssignmentTimers.has(jobId)) {
+      clearTimeout(this.dispatcherAssignmentTimers.get(jobId));
+    }
+    const timer = setTimeout(() => {
+      this.dispatcherAssignmentTimers.delete(jobId);
+      this.dispatcherAssignments.delete(jobId);
+      this.#emitPublicGatewayStatus();
+    }, delayMs);
+    timer.unref?.();
+    this.dispatcherAssignmentTimers.set(jobId, timer);
+  }
+
+  #getDispatcherAssignmentsSnapshot() {
+    return Array.from(this.dispatcherAssignments.values())
+      .sort((a, b) => (b.assignedAt || 0) - (a.assignedAt || 0));
   }
 
   #handleBlindPeerStatus(req, res) {
@@ -2126,6 +2245,53 @@ class PublicGatewayService {
         err: error?.message || error
       });
       res.status(500).json({ error: 'blind-peer-status-unavailable' });
+    }
+  }
+
+  async #handleBlindPeerGc(req, res) {
+    if (!this.blindPeerService) {
+      return res.status(503).json({ error: 'blind-peer-disabled' });
+    }
+    const reasonRaw = req?.body?.reason;
+    const reason = typeof reasonRaw === 'string' && reasonRaw.trim().length
+      ? reasonRaw.trim()
+      : 'manual';
+    try {
+      const result = await this.blindPeerService.runHygiene(reason);
+      res.json({ ok: true, result });
+    } catch (error) {
+      this.logger?.error?.('[PublicGateway] Manual blind peer GC failed', {
+        err: error?.message || error
+      });
+      res.status(500).json({ error: 'blind-peer-gc-failed', message: error?.message || String(error) });
+    }
+  }
+
+  async #handleBlindPeerDelete(req, res) {
+    if (!this.blindPeerService) {
+      return res.status(503).json({ error: 'blind-peer-disabled' });
+    }
+    const keyParam = req?.params?.key;
+    if (!keyParam || typeof keyParam !== 'string' || !keyParam.trim()) {
+      return res.status(400).json({ error: 'core-key-required' });
+    }
+    const reasonParam = typeof req?.query?.reason === 'string' ? req.query.reason
+      : (typeof req?.body?.reason === 'string' ? req.body.reason : null);
+    const reason = reasonParam && reasonParam.trim().length ? reasonParam.trim() : 'manual';
+    try {
+      await this.blindPeerService.deleteMirror(keyParam, { reason });
+      res.json({ ok: true, key: keyParam });
+    } catch (error) {
+      const isInputError = error?.message === 'invalid-core-key';
+      if (isInputError) {
+        return res.status(400).json({ error: 'invalid-core-key', message: 'Provided blind peer core key is invalid' });
+      }
+      this.logger?.warn?.('[PublicGateway] Blind peer mirror deletion failed', {
+        key: keyParam,
+        reason,
+        err: error?.message || error
+      });
+      res.status(500).json({ error: 'blind-peer-delete-failed', message: error?.message || String(error) });
     }
   }
 
@@ -2541,6 +2707,11 @@ class PublicGatewayService {
     });
     if (peerMirrorSummary) {
       metadata.blindPeerMirrors = peerMirrorSummary;
+      metadata.blindPeerMirrorCount = peerMirrorSummary.totalCores ?? null;
+      metadata.blindPeerMirrorAnnouncedCount = peerMirrorSummary.announcedCount ?? null;
+      metadata.blindPeerMirrorLastSeen = peerMirrorSummary.lastSeen || null;
+      metadata.blindPeerMirrorPriorityMax = peerMirrorSummary.priorityMax ?? null;
+      metadata.blindPeerMirrorPriorityMin = peerMirrorSummary.priorityMin ?? null;
     }
 
     record.blindPeer = this.#getBlindPeerSummary();

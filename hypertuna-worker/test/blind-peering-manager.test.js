@@ -55,3 +55,26 @@ test('blind peering manager tracks trusted mirrors', async t => {
   await fs.rm(tmp, { recursive: true, force: true })
   t.is(manager.started, false)
 })
+
+test('blind peering manager merges manual and dispatcher metadata', async t => {
+  const manualKey = HypercoreId.encode(Buffer.alloc(32, 4))
+  const handshakeKey = HypercoreId.encode(Buffer.alloc(32, 5))
+  const manager = new BlindPeeringManager({
+    logger: quietLogger,
+    settingsProvider: () => ({
+      blindPeerEnabled: true,
+      blindPeerManualKeys: [manualKey],
+      blindPeerKeys: [handshakeKey]
+    })
+  })
+
+  manager.configure()
+  const status = manager.getStatus()
+  t.is(status.handshakeMirrors, 1)
+  t.is(status.manualMirrors, 1)
+  t.is(status.trustedMirrors, 2)
+
+  const snapshot = manager.getMirrorMetadata()
+  t.ok(snapshot)
+  t.is(typeof status.refreshBackoff, 'object')
+})

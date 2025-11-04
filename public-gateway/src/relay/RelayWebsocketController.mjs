@@ -186,6 +186,7 @@ export default class RelayWebsocketController {
         const job = {
           id: subscriptionId,
           filters,
+          relayKey: session.relayKey,
           requester: {
             peerId: session.clientPubkey || session.connectionKey,
             relayKey: session.relayKey

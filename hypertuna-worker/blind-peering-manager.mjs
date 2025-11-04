@@ -91,6 +91,8 @@ export default class BlindPeeringManager extends EventEmitter {
 
     this.enabled = false;
     this.started = false;
+    this.handshakeMirrors = new Set();
+    this.manualMirrors = new Set();
     this.trustedMirrors = new Set();
     this.mirrorTargets = new Map();
     this.blindPeering = null;
@@ -113,10 +115,15 @@ export default class BlindPeeringManager extends EventEmitter {
     this.refreshBackoff = {
       attempt: 0,
       timer: null,
-      inflight: null
+      inflight: null,
+      nextDelayMs: null,
+      nextReason: null,
+      nextScheduledAt: null
     };
     this.rehydrationState = {
-      inflight: null
+      inflight: null,
+      lastResult: null,
+      lastCompletedAt: null
     };
   }
 
@@ -129,13 +136,22 @@ export default class BlindPeeringManager extends EventEmitter {
     }
 
     this.enabled = !!nextSettings.blindPeerEnabled;
-    const keys = Array.isArray(nextSettings.blindPeerKeys)
+    const handshakeKeys = Array.isArray(nextSettings.blindPeerKeys)
       ? nextSettings.blindPeerKeys
       : [];
-    this.trustedMirrors = new Set(keys.map(sanitizeKey).filter(Boolean));
+    const manualKeys = Array.isArray(nextSettings.blindPeerManualKeys)
+      ? nextSettings.blindPeerManualKeys
+      : [];
+    const sanitizedHandshake = handshakeKeys.map(sanitizeKey).filter(Boolean);
+    const sanitizedManual = manualKeys.map(sanitizeKey).filter(Boolean);
+    this.handshakeMirrors = new Set(sanitizedHandshake);
+    this.manualMirrors = new Set(sanitizedManual);
+    this.trustedMirrors = new Set([...this.handshakeMirrors, ...this.manualMirrors]);
 
     this.logger?.debug?.('[BlindPeering] Configuration updated', {
       enabled: this.enabled,
+      handshakeKeys: this.handshakeMirrors.size,
+      manualKeys: this.manualMirrors.size,
       keys: this.trustedMirrors.size
     });
 
@@ -223,6 +239,9 @@ export default class BlindPeeringManager extends EventEmitter {
     for (const key of peerKeys) {
       const sanitized = sanitizeKey(key);
       if (!sanitized) continue;
+      if (!this.handshakeMirrors.has(sanitized)) {
+        this.handshakeMirrors.add(sanitized);
+      }
       if (!this.trustedMirrors.has(sanitized)) {
         this.trustedMirrors.add(sanitized);
         updated = true;
@@ -526,6 +545,8 @@ export default class BlindPeeringManager extends EventEmitter {
       }
 
       this.logger?.info?.('[BlindPeering] Rehydration cycle completed', summary);
+      this.rehydrationState.lastResult = summary;
+      this.rehydrationState.lastCompletedAt = Date.now();
       return summary;
     })();
 
@@ -723,6 +744,9 @@ export default class BlindPeeringManager extends EventEmitter {
     if (this.refreshBackoff.timer) {
       clearTimeout(this.refreshBackoff.timer);
       this.refreshBackoff.timer = null;
+      this.refreshBackoff.nextDelayMs = null;
+      this.refreshBackoff.nextReason = null;
+      this.refreshBackoff.nextScheduledAt = null;
     }
     if (!this.started) {
       this.logger?.debug?.('[BlindPeering] refresh skipped (not started)', { reason });
@@ -742,6 +766,9 @@ export default class BlindPeeringManager extends EventEmitter {
       try {
         await this.blindPeering?.resume?.();
         this.refreshBackoff.attempt = 0;
+        this.refreshBackoff.nextDelayMs = null;
+        this.refreshBackoff.nextReason = null;
+        this.refreshBackoff.nextScheduledAt = null;
         this.emit('refresh-requested', { reason, targets: Array.from(this.mirrorTargets.values()) });
       } catch (error) {
         const attemptNext = attempt + 1;
@@ -764,8 +791,21 @@ export default class BlindPeeringManager extends EventEmitter {
     return {
       enabled: this.enabled,
       running: this.started,
+      handshakeMirrors: this.handshakeMirrors.size,
+      manualMirrors: this.manualMirrors.size,
       trustedMirrors: this.trustedMirrors.size,
-      targets: this.mirrorTargets.size
+      targets: this.mirrorTargets.size,
+      refreshBackoff: {
+        attempt: this.refreshBackoff.attempt,
+        nextDelayMs: this.refreshBackoff.nextDelayMs,
+        nextReason: this.refreshBackoff.nextReason,
+        nextScheduledAt: this.refreshBackoff.nextScheduledAt
+      },
+      rehydration: {
+        inflight: !!this.rehydrationState.inflight,
+        lastCompletedAt: this.rehydrationState.lastCompletedAt || null,
+        lastResult: this.rehydrationState.lastResult || null
+      }
     };
   }
 
@@ -933,6 +973,9 @@ export default class BlindPeeringManager extends EventEmitter {
     }
     if (this.refreshBackoff.timer) return;
     const delay = this.#calculateBackoffDelay(attempt);
+    this.refreshBackoff.nextDelayMs = delay;
+    this.refreshBackoff.nextReason = reason;
+    this.refreshBackoff.nextScheduledAt = Date.now() + delay;
     this.logger?.debug?.('[BlindPeering] Scheduling refresh retry', {
       reason,
       attempt,
@@ -940,6 +983,9 @@ export default class BlindPeeringManager extends EventEmitter {
     });
     this.refreshBackoff.timer = setTimeout(() => {
       this.refreshBackoff.timer = null;
+      this.refreshBackoff.nextDelayMs = null;
+      this.refreshBackoff.nextReason = null;
+      this.refreshBackoff.nextScheduledAt = null;
       this.refreshFromBlindPeers(reason).catch((error) => {
         this.logger?.warn?.('[BlindPeering] Scheduled refresh failed', {
           err: error?.message || error,

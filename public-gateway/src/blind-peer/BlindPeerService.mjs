@@ -32,6 +32,12 @@ function sanitizePeerKey(key) {
   return trimmed.length ? trimmed : null;
 }
 
+function sanitizeRelayKey(value) {
+  if (!value || typeof value !== 'string') return null;
+  const trimmed = value.trim();
+  return trimmed.length ? trimmed : null;
+}
+
 function decodeKey(key) {
   if (!key) return null;
   if (Buffer.isBuffer(key)) return key;
@@ -82,6 +88,13 @@ export default class BlindPeerService extends EventEmitter {
       lastEvictions: 0
     };
     this.coreMetadata = new Map();
+    this.dispatcherAssignments = new Map();
+    this.dispatcherAssignmentTimers = new Map();
+    this.metadataPersistPath = this.config.metadataPersistPath
+      ? resolve(this.config.metadataPersistPath)
+      : null;
+    this.metadataDirty = false;
+    this.metadataSaveTimer = null;
   }
 
   async initialize() {
@@ -96,6 +109,8 @@ export default class BlindPeerService extends EventEmitter {
 
     await this.#loadTrustedPeersFromDisk();
     await this.#ensureStorageDir();
+    this.#ensureMetadataPersistPath();
+    await this.#loadCoreMetadataFromDisk();
     this.initialized = true;
     this.logger?.info?.('[BlindPeer] Initialized', this.getStatus());
   }
@@ -143,6 +158,16 @@ export default class BlindPeerService extends EventEmitter {
     this.blindPeer = null;
     this.#updateMetrics();
     this.metrics.setActive?.(0);
+    for (const timer of this.dispatcherAssignmentTimers.values()) {
+      clearTimeout(timer);
+    }
+    this.dispatcherAssignmentTimers.clear();
+    this.dispatcherAssignments.clear();
+    if (this.metadataSaveTimer) {
+      clearTimeout(this.metadataSaveTimer);
+      this.metadataSaveTimer = null;
+    }
+    await this.#persistCoreMetadata(true);
     this.logger?.info?.('[BlindPeer] Service stopped');
   }
 
@@ -196,6 +221,51 @@ export default class BlindPeerService extends EventEmitter {
       }
     }
     return removed;
+  }
+
+  recordDispatcherAssignment({ jobId, peerKey, relayKey, filters = [], requester = null } = {}) {
+    if (!jobId) return null;
+    const sanitizedPeer = sanitizePeerKey(peerKey);
+    const sanitizedRelay = sanitizeRelayKey(relayKey);
+    const entry = {
+      jobId,
+      peerKey: sanitizedPeer,
+      relayKey: sanitizedRelay,
+      filters: Array.isArray(filters) ? filters : [],
+      requester: requester || null,
+      status: 'assigned',
+      assignedAt: Date.now(),
+      completedAt: null
+    };
+    if (!sanitizedPeer && sanitizedRelay) {
+      entry.requester = entry.requester || {};
+    }
+    if (sanitizedPeer) {
+      this.addTrustedPeer(sanitizedPeer);
+    }
+    if (this.dispatcherAssignmentTimers.has(jobId)) {
+      clearTimeout(this.dispatcherAssignmentTimers.get(jobId));
+      this.dispatcherAssignmentTimers.delete(jobId);
+    }
+    this.dispatcherAssignments.set(jobId, entry);
+    return entry;
+  }
+
+  clearDispatcherAssignment(jobId, { status = 'completed', details = null } = {}) {
+    if (!jobId) return null;
+    const entry = this.dispatcherAssignments.get(jobId);
+    if (!entry) return null;
+    entry.status = status;
+    entry.completedAt = Date.now();
+    entry.details = details;
+    this.dispatcherAssignments.set(jobId, entry);
+    this.#scheduleDispatcherAssignmentCleanup(jobId);
+    return entry;
+  }
+
+  getDispatcherAssignmentsSnapshot() {
+    return Array.from(this.dispatcherAssignments.values())
+      .sort((a, b) => (b.assignedAt || 0) - (a.assignedAt || 0));
   }
 
   async mirrorCore(coreOrKey, options = {}) {
@@ -294,6 +364,44 @@ export default class BlindPeerService extends EventEmitter {
     return this.#runHygieneCycle(reason);
   }
 
+  async deleteMirror(coreKey, { reason = 'manual' } = {}) {
+    if (!this.running || !this.blindPeer) {
+      throw new Error('Blind peer service inactive');
+    }
+    const keyInput = typeof coreKey === 'string' ? coreKey.trim() : coreKey;
+    if (!keyInput) {
+      throw new Error('coreKey is required');
+    }
+    const decoded = decodeKey(keyInput);
+    if (!decoded) {
+      throw new Error('invalid-core-key');
+    }
+    try {
+      await this.blindPeer.db.deleteCore(decoded);
+      this.#removeCoreMetadata(decoded);
+      try {
+        await this.blindPeer.flush();
+      } catch (flushError) {
+        this.logger?.debug?.('[BlindPeer] Flush after delete failed', {
+          err: flushError?.message || flushError
+        });
+      }
+      this.logger?.info?.('[BlindPeer] Mirror deleted via admin request', {
+        key: toKeyString(decoded),
+        reason
+      });
+      this.#updateMetrics();
+      return true;
+    } catch (error) {
+      this.logger?.warn?.('[BlindPeer] Failed to delete mirror via admin request', {
+        key: toKeyString(decoded) || keyInput,
+        reason,
+        err: error?.message || error
+      });
+      throw error;
+    }
+  }
+
   getPublicKeyHex() {
     return this.blindPeer ? toKeyString(this.blindPeer.publicKey) : null;
   }
@@ -354,6 +462,7 @@ export default class BlindPeerService extends EventEmitter {
         includeCores,
         coresPerOwner: includeCores ? coresPerOwner : 0
       }),
+      dispatcherAssignments: this.getDispatcherAssignmentsSnapshot(),
       config: {
         maxBytes: this.config.maxBytes,
         gcIntervalMs: this.config.gcIntervalMs,
@@ -377,6 +486,146 @@ export default class BlindPeerService extends EventEmitter {
       maxBytes: this.config.maxBytes,
       trustedPeerCount: this.trustedPeers.size
     };
+  }
+
+  #ensureMetadataPersistPath() {
+    if (this.metadataPersistPath) return this.metadataPersistPath;
+    if (!this.storageDir) return null;
+    this.metadataPersistPath = resolve(this.storageDir, 'blind-peer-metadata.json');
+    return this.metadataPersistPath;
+  }
+
+  async #loadCoreMetadataFromDisk() {
+    const path = this.#ensureMetadataPersistPath();
+    if (!path) return;
+    try {
+      const raw = await readFile(path, 'utf8');
+      const parsed = JSON.parse(raw);
+      if (!parsed || typeof parsed !== 'object' || !Array.isArray(parsed.entries)) return;
+      this.coreMetadata.clear();
+      for (const entry of parsed.entries) {
+        if (!entry || typeof entry !== 'object' || !entry.key) continue;
+        const owners = new Map();
+        if (Array.isArray(entry.owners)) {
+          for (const owner of entry.owners) {
+            if (!owner) continue;
+            const ownerId = owner.ownerId || owner.ownerPeerKey || owner.alias || `owner:${owners.size}`;
+            owners.set(ownerId, {
+              ownerPeerKey: sanitizePeerKey(owner.ownerPeerKey) || null,
+              type: owner.type || null,
+              identifier: typeof owner.identifier === 'string' ? owner.identifier : null,
+              priority: this.#normalizeMetadataPriority(owner.priority),
+              lastSeen: Number.isFinite(owner.lastSeen) ? Math.trunc(owner.lastSeen) : null
+            });
+          }
+        }
+        const identifiers = new Set();
+        if (Array.isArray(entry.identifiers)) {
+          for (const id of entry.identifiers) {
+            if (typeof id === 'string' && id.trim()) {
+              identifiers.add(id.trim());
+            }
+          }
+        }
+        const record = {
+          key: entry.key,
+          owners,
+          identifiers,
+          primaryIdentifier: typeof entry.primaryIdentifier === 'string' ? entry.primaryIdentifier : null,
+          firstSeen: Number.isFinite(entry.firstSeen) ? Math.trunc(entry.firstSeen) : Date.now(),
+          lastUpdated: Number.isFinite(entry.lastUpdated) ? Math.trunc(entry.lastUpdated) : Date.now(),
+          priority: this.#normalizeMetadataPriority(entry.priority),
+          announce: entry.announce === true,
+          lastActive: Number.isFinite(entry.lastActive) ? Math.trunc(entry.lastActive) : Date.now()
+        };
+        if (record.primaryIdentifier) {
+          record.identifiers.add(record.primaryIdentifier);
+        }
+        this.coreMetadata.set(record.key, record);
+      }
+      this.metadataDirty = false;
+      this.logger?.debug?.('[BlindPeer] Loaded metadata snapshot', {
+        entries: this.coreMetadata.size,
+        path
+      });
+    } catch (error) {
+      if (error?.code !== 'ENOENT') {
+        this.logger?.warn?.('[BlindPeer] Failed to load metadata snapshot', {
+          path,
+          err: error?.message || error
+        });
+      }
+    }
+  }
+
+  async #persistCoreMetadata(force = false) {
+    const path = this.#ensureMetadataPersistPath();
+    if (!path) return;
+    if (!force && !this.metadataDirty) return;
+    try {
+      await mkdir(dirname(path), { recursive: true });
+      const entries = [];
+      for (const entry of this.coreMetadata.values()) {
+        entries.push({
+          key: entry.key,
+          primaryIdentifier: entry.primaryIdentifier || null,
+          announce: entry.announce === true,
+          priority: this.#normalizeMetadataPriority(entry.priority),
+          firstSeen: entry.firstSeen || null,
+          lastUpdated: entry.lastUpdated || null,
+          lastActive: entry.lastActive || null,
+          identifiers: Array.from(entry.identifiers || []),
+          owners: Array.from(entry.owners.entries()).map(([ownerId, ownerInfo]) => ({
+            ownerId,
+            ownerPeerKey: ownerInfo.ownerPeerKey || null,
+            type: ownerInfo.type || null,
+            identifier: ownerInfo.identifier || null,
+            priority: this.#normalizeMetadataPriority(ownerInfo.priority),
+            lastSeen: ownerInfo.lastSeen || null
+          }))
+        });
+      }
+      const payload = JSON.stringify({ entries }, null, 2);
+      await writeFile(path, payload, 'utf8');
+      this.metadataDirty = false;
+    } catch (error) {
+      this.logger?.warn?.('[BlindPeer] Failed to persist metadata snapshot', {
+        path,
+        err: error?.message || error
+      });
+    }
+  }
+
+  #scheduleCoreMetadataPersist() {
+    if (this.metadataSaveTimer) return;
+    this.metadataSaveTimer = setTimeout(() => {
+      this.metadataSaveTimer = null;
+      this.#persistCoreMetadata().catch((error) => {
+        this.logger?.warn?.('[BlindPeer] Metadata snapshot task failed', {
+          err: error?.message || error
+        });
+      });
+    }, 5000);
+    this.metadataSaveTimer.unref?.();
+  }
+
+  #markCoreMetadataDirty() {
+    this.metadataDirty = true;
+    this.#scheduleCoreMetadataPersist();
+  }
+
+  #scheduleDispatcherAssignmentCleanup(jobId, delayMs = 120000) {
+    if (!jobId) return;
+    if (this.dispatcherAssignmentTimers.has(jobId)) {
+      clearTimeout(this.dispatcherAssignmentTimers.get(jobId));
+      this.dispatcherAssignmentTimers.delete(jobId);
+    }
+    const timer = setTimeout(() => {
+      this.dispatcherAssignmentTimers.delete(jobId);
+      this.dispatcherAssignments.delete(jobId);
+    }, delayMs);
+    timer.unref?.();
+    this.dispatcherAssignmentTimers.set(jobId, timer);
   }
 
   #startHygieneLoop() {
@@ -696,6 +945,7 @@ export default class BlindPeerService extends EventEmitter {
     entry.lastActive = Date.now();
 
     this.coreMetadata.set(entry.key, entry);
+    this.#markCoreMetadataDirty();
     return entry;
   }
 
@@ -722,6 +972,7 @@ export default class BlindPeerService extends EventEmitter {
       } else if (!existing.lastActive) {
         existing.lastActive = now;
       }
+      this.#markCoreMetadataDirty();
       return existing;
     }
 
@@ -740,6 +991,7 @@ export default class BlindPeerService extends EventEmitter {
       entry.identifiers.add(entry.primaryIdentifier);
     }
     this.coreMetadata.set(keyStr, entry);
+    this.#markCoreMetadataDirty();
     return entry;
   }
 
@@ -747,7 +999,11 @@ export default class BlindPeerService extends EventEmitter {
     const keyBuf = coreKey?.key ? coreKey.key : coreKey;
     const keyStr = toKeyString(decodeKey(keyBuf) || keyBuf);
     if (!keyStr) return false;
-    return this.coreMetadata.delete(keyStr);
+    const removed = this.coreMetadata.delete(keyStr);
+    if (removed) {
+      this.#markCoreMetadataDirty();
+    }
+    return removed;
   }
 
   #onBlindPeerAddCore(record, stream, context = {}) {

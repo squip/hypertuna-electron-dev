@@ -224,6 +224,10 @@ export class GatewayService extends EventEmitter {
     this.publicGatewayRegistrar = null;
     this.publicGatewayRelayState = new Map();
     this.blindPeerSummary = null;
+    this.blindPeerFallbackState = {
+      inflight: null,
+      lastAttempt: 0
+    };
     this.publicGatewayRelayTokens = new Map();
     this.publicGatewayRelayTokenTimers = new Map();
     this.gatewayTelemetryTimers = new Map();
@@ -1127,6 +1131,12 @@ export class GatewayService extends EventEmitter {
       await this.#applyBlindPeerInfo(registrationResult.blindPeer || { enabled: false }, { persist: true }).catch((error) => {
         this.log('warn', `[PublicGateway] Failed to persist blind peer announcement: ${error.message}`);
       });
+      if ((!this.blindPeerSummary?.enabled || !this.blindPeerSummary?.publicKey)
+        && (!Array.isArray(this.publicGatewaySettings?.blindPeerKeys) || !this.publicGatewaySettings.blindPeerKeys.length)) {
+        this.#maybeFetchBlindPeerInfo({ reason: 'registration-fallback' }).catch((error) => {
+          this.log('debug', `[PublicGateway] Blind peer fallback lookup failed after registration: ${error?.message || error}`);
+        });
+      }
 
       if (this.#isPublicGatewayRelayKey(relayKey)) {
         await this.#registerPublicGatewayVirtualRelay(metadataCopy);
@@ -1371,8 +1381,19 @@ export class GatewayService extends EventEmitter {
         publicKey: handshake.blindPeerPublicKey || null,
         encryptionKey: handshake.blindPeerEncryptionKey || null,
         maxBytes: handshake.blindPeerMaxBytes ?? null
-      }, { persist: false }).catch((error) => {
+      }, { persist: false }).then(() => {
+        if ((!this.blindPeerSummary?.enabled || !this.blindPeerSummary?.publicKey)
+          && (!Array.isArray(this.publicGatewaySettings?.blindPeerKeys) || !this.publicGatewaySettings.blindPeerKeys.length)) {
+          this.#maybeFetchBlindPeerInfo({ reason: 'handshake-disabled' }).catch((error) => {
+            this.log('debug', `[PublicGateway] Blind peer fallback lookup failed after handshake: ${error?.message || error}`);
+          });
+        }
+      }).catch((error) => {
         this.log('debug', `[PublicGateway] Failed to apply blind peer info from handshake: ${error.message}`);
+      });
+    } else {
+      this.#maybeFetchBlindPeerInfo({ reason: 'handshake-missing' }).catch((error) => {
+        this.log('debug', `[PublicGateway] Blind peer fallback lookup failed: ${error?.message || error}`);
       });
     }
 
@@ -1590,9 +1611,11 @@ export class GatewayService extends EventEmitter {
     const config = this.publicGatewaySettings || {};
     const enabled = !!(config.enabled && this.publicGatewayRegistrar?.isEnabled?.());
     const summary = this.blindPeerSummary;
-    const defaultKeys = Array.isArray(config.blindPeerKeys) ? [...config.blindPeerKeys] : [];
+    const defaultKeys = Array.isArray(config.blindPeerKeys) ? config.blindPeerKeys.filter(Boolean) : [];
+    const manualKeys = Array.isArray(config.blindPeerManualKeys) ? config.blindPeerManualKeys.filter(Boolean) : [];
     const summaryKeys = summary?.publicKey ? [summary.publicKey] : [];
     const blindPeerKeys = summaryKeys.length ? summaryKeys : defaultKeys;
+    const combinedBlindPeerKeys = Array.from(new Set([...manualKeys, ...blindPeerKeys]));
 
     return {
       enabled,
@@ -1616,6 +1639,8 @@ export class GatewayService extends EventEmitter {
       blindPeer: {
         enabled: summary?.enabled ?? !!config.blindPeerEnabled,
         keys: blindPeerKeys,
+        manualKeys,
+        combinedKeys: combinedBlindPeerKeys,
         encryptionKey: summary?.encryptionKey || config.blindPeerEncryptionKey || null,
         maxBytes: config.blindPeerMaxBytes ?? null,
         storageUsageBytes: summary?.storageUsageBytes ?? null,
@@ -3565,6 +3590,74 @@ export class GatewayService extends EventEmitter {
     }
 
     return true;
+  }
+
+  async #maybeFetchBlindPeerInfo({ reason = 'fallback', force = false } = {}) {
+    const settings = this.publicGatewaySettings || {};
+    const manualKeys = Array.isArray(settings.blindPeerManualKeys) ? settings.blindPeerManualKeys.filter(Boolean) : [];
+    const handshakeKeys = Array.isArray(settings.blindPeerKeys) ? settings.blindPeerKeys.filter(Boolean) : [];
+    if (!force && (handshakeKeys.length || manualKeys.length)) return false;
+    if (!force && this.blindPeerSummary?.enabled && this.blindPeerSummary?.publicKey) return false;
+
+    const baseUrl = settings.baseUrl || settings.preferredBaseUrl || null;
+    if (!baseUrl) return false;
+
+    if (!this.blindPeerFallbackState) {
+      this.blindPeerFallbackState = {
+        inflight: null,
+        lastAttempt: 0
+      };
+    }
+
+    if (this.blindPeerFallbackState.inflight) {
+      return this.blindPeerFallbackState.inflight;
+    }
+
+    const now = Date.now();
+    if (!force && this.blindPeerFallbackState.lastAttempt && (now - this.blindPeerFallbackState.lastAttempt) < 60000) {
+      return false;
+    }
+
+    const attempt = (async () => {
+      this.blindPeerFallbackState.lastAttempt = Date.now();
+      try {
+        const target = new URL('/api/blind-peer', baseUrl);
+        const response = await fetch(target, {
+          headers: {
+            accept: 'application/json'
+          }
+        });
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status} ${response.statusText}`);
+        }
+        const payload = await response.json();
+        const summary = payload?.summary || null;
+        const status = payload?.status || null;
+        const info = {
+          enabled: summary?.enabled ?? status?.enabled ?? false,
+          publicKey: summary?.publicKey || null,
+          encryptionKey: summary?.encryptionKey || null,
+          maxBytes: summary?.config?.maxBytes ?? status?.config?.maxBytes ?? null
+        };
+        const changed = await this.#applyBlindPeerInfo(info, { persist: true });
+        if (changed) {
+          this.log('info', `[PublicGateway] Blind peer metadata refreshed via REST fallback (${reason})`);
+        }
+        return changed;
+      } catch (error) {
+        this.log('debug', `[PublicGateway] Blind peer fallback fetch failed (${reason}): ${error?.message || error}`);
+        return false;
+      }
+    })();
+
+    this.blindPeerFallbackState.inflight = attempt;
+    try {
+      return await attempt;
+    } finally {
+      if (this.blindPeerFallbackState.inflight === attempt) {
+        this.blindPeerFallbackState.inflight = null;
+      }
+    }
   }
 
   getPeersWithPfpDrive() {

@@ -10,6 +10,7 @@ const DEFAULT_SETTINGS = Object.freeze({
   delegateReqToPeers: false,
   blindPeerEnabled: false,
   blindPeerKeys: [],
+  blindPeerManualKeys: [],
   blindPeerEncryptionKey: null,
   blindPeerReplicationTopic: null,
   blindPeerMaxBytes: null,
@@ -99,6 +100,16 @@ function normalizeSettings(raw = {}) {
       return trimmed.length ? trimmed : null;
     }).filter(Boolean)));
     normalized.blindPeerKeys = keys;
+  }
+
+  if (raw.blindPeerManualKeys != null) {
+    const list = Array.isArray(raw.blindPeerManualKeys) ? raw.blindPeerManualKeys : [raw.blindPeerManualKeys];
+    const keys = Array.from(new Set(list.map((value) => {
+      if (typeof value !== 'string') return null;
+      const trimmed = value.trim();
+      return trimmed.length ? trimmed : null;
+    }).filter(Boolean)));
+    normalized.blindPeerManualKeys = keys;
   }
 
   if (typeof raw.blindPeerEncryptionKey === 'string') {
@@ -345,6 +356,9 @@ function withDefaults(raw = {}) {
   merged.blindPeerEnabled = !!merged.blindPeerEnabled;
   merged.blindPeerKeys = Array.isArray(merged.blindPeerKeys)
     ? Array.from(new Set(merged.blindPeerKeys.map(sanitizeString).filter(Boolean)))
+    : [];
+  merged.blindPeerManualKeys = Array.isArray(merged.blindPeerManualKeys)
+    ? Array.from(new Set(merged.blindPeerManualKeys.map(sanitizeString).filter(Boolean)))
     : [];
   merged.blindPeerEncryptionKey = sanitizeString(merged.blindPeerEncryptionKey);
   merged.blindPeerReplicationTopic = sanitizeString(merged.blindPeerReplicationTopic);
