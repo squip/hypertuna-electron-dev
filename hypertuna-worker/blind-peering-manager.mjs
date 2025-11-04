@@ -1,3 +1,4 @@
+import { Buffer } from 'node:buffer';
 import { EventEmitter } from 'node:events';
 import { readFile, writeFile, mkdir } from 'node:fs/promises';
 import { dirname } from 'node:path';
@@ -15,6 +16,65 @@ function sanitizeKey(value) {
   } catch (_) {
     return null;
   }
+}
+
+function normalizeCoreKey(value) {
+  if (!value) return null;
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    if (!trimmed) return null;
+    try {
+      HypercoreId.decode(trimmed);
+      return trimmed;
+    } catch (_) {
+      if (/^[0-9a-fA-F]{64}$/.test(trimmed)) {
+        try {
+          return HypercoreId.encode(Buffer.from(trimmed, 'hex'));
+        } catch (_) {
+          return null;
+        }
+      }
+      return null;
+    }
+  }
+  if (Buffer.isBuffer(value)) {
+    try {
+      return HypercoreId.encode(value);
+    } catch (_) {
+      return null;
+    }
+  }
+  if (value instanceof Uint8Array) {
+    return normalizeCoreKey(Buffer.from(value));
+  }
+  if (value && typeof value === 'object') {
+    if (value.key) return normalizeCoreKey(value.key);
+    if (value.core) return normalizeCoreKey(value.core);
+  }
+  return null;
+}
+
+function decodeCoreKey(value) {
+  if (!value) return null;
+  const candidate = typeof value === 'string' ? value.trim() : value;
+  if (!candidate) return null;
+  if (typeof candidate === 'string') {
+    try {
+      return HypercoreId.decode(candidate);
+    } catch (_) {
+      if (/^[0-9a-fA-F]{64}$/.test(candidate)) {
+        return Buffer.from(candidate, 'hex');
+      }
+      return null;
+    }
+  }
+  if (Buffer.isBuffer(candidate)) {
+    return Buffer.from(candidate);
+  }
+  if (candidate instanceof Uint8Array) {
+    return Buffer.from(candidate);
+  }
+  return null;
 }
 
 export default class BlindPeeringManager extends EventEmitter {
@@ -53,6 +113,9 @@ export default class BlindPeeringManager extends EventEmitter {
     this.refreshBackoff = {
       attempt: 0,
       timer: null,
+      inflight: null
+    };
+    this.rehydrationState = {
       inflight: null
     };
   }
@@ -198,14 +261,25 @@ export default class BlindPeeringManager extends EventEmitter {
     const entry = {
       type: 'relay',
       identifier,
-      context: relayContext,
+      context: { ...relayContext },
       updatedAt: Date.now()
     };
+    if (!entry.context.relayKey) {
+      entry.context.relayKey = identifier;
+    }
+    if (!entry.context.identifier) {
+      entry.context.identifier = identifier;
+    }
+    const coreRefs = this.#collectRelayCoreRefs(relayContext);
+    if (coreRefs.length) {
+      entry.coreRefs = coreRefs;
+      entry.context.coreRefs = coreRefs;
+    }
     this.mirrorTargets.set(`relay:${identifier}`, entry);
     this.#recordMirrorMetadata(entry);
     this.logger?.debug?.('[BlindPeering] Relay mirror scheduled', {
       identifier,
-      writers: Array.isArray(relayContext.coreRefs) ? relayContext.coreRefs.length : 0
+      writers: coreRefs.length
     });
     this.emit('mirror-requested', entry);
   }
@@ -218,9 +292,20 @@ export default class BlindPeeringManager extends EventEmitter {
     const entry = {
       type: driveContext.type || 'drive',
       identifier,
-      context: driveContext,
+      context: { ...driveContext },
       updatedAt: Date.now()
     };
+    if (!entry.context.identifier) {
+      entry.context.identifier = identifier;
+    }
+    if (!entry.context.driveKey) {
+      entry.context.driveKey = identifier;
+    }
+    const coreRefs = this.#collectDriveCoreRefs(driveContext);
+    if (coreRefs.length) {
+      entry.coreRefs = coreRefs;
+      entry.context.coreRefs = coreRefs;
+    }
     this.mirrorTargets.set(`drive:${identifier}`, entry);
     this.#recordMirrorMetadata(entry);
     this.logger?.debug?.('[BlindPeering] Hyperdrive mirror scheduled', {
@@ -252,6 +337,385 @@ export default class BlindPeeringManager extends EventEmitter {
         identifier,
         error: error?.message || error
       });
+    }
+  }
+
+  async removeRelayMirror(relayContext = {}, { reason = 'manual' } = {}) {
+    const identifier = sanitizeKey(relayContext.relayKey || relayContext.identifier || relayContext.publicIdentifier);
+    if (!identifier) return false;
+    const entryKey = `relay:${identifier}`;
+    const entry = this.mirrorTargets.get(entryKey);
+    const context = entry?.context || relayContext || {};
+    const autobase = relayContext.autobase || context.autobase || null;
+    const collected = new Set();
+    const addKey = (candidate) => {
+      const normalized = normalizeCoreKey(candidate);
+      if (normalized) collected.add(normalized);
+    };
+    for (const key of this.#collectRelayCoreRefs({ ...context, autobase })) {
+      addKey(key);
+    }
+    if (Array.isArray(relayContext.coreRefs)) {
+      for (const key of relayContext.coreRefs) addKey(key);
+    }
+    if (Array.isArray(entry?.coreRefs)) {
+      for (const key of entry.coreRefs) addKey(key);
+    }
+
+    if (entry) {
+      this.mirrorTargets.delete(entryKey);
+    }
+
+    this.#removeMetadataEntry(entryKey);
+
+    let deleted = 0;
+    if (this.blindPeering && collected.size) {
+      const operations = [];
+      for (const key of collected) {
+        operations.push(
+          this.#deleteCoreByKey(key).then(() => {
+            deleted += 1;
+          }).catch((error) => {
+            this.logger?.warn?.('[BlindPeering] Failed to delete mirrored relay core', {
+              key,
+              reason,
+              err: error?.message || error
+            });
+          })
+        );
+      }
+      if (operations.length) {
+        await Promise.allSettled(operations);
+      }
+    }
+
+    this.logger?.debug?.('[BlindPeering] Relay mirror removed', {
+      identifier,
+      reason,
+      mirroredCores: collected.size,
+      deletedCores: deleted
+    });
+    this.emit('mirror-removed', {
+      type: 'relay',
+      identifier,
+      reason,
+      deleted
+    });
+    return true;
+  }
+
+  async removeHyperdriveMirror(driveContext = {}, { reason = 'manual' } = {}) {
+    const identifier = sanitizeKey(driveContext.identifier || driveContext.driveKey);
+    if (!identifier) return false;
+    const entryKey = `drive:${identifier}`;
+    const entry = this.mirrorTargets.get(entryKey);
+    const context = entry?.context || driveContext || {};
+    const collected = new Set();
+    const addKey = (candidate) => {
+      const normalized = normalizeCoreKey(candidate);
+      if (normalized) collected.add(normalized);
+    };
+    for (const key of this.#collectDriveCoreRefs(context)) {
+      addKey(key);
+    }
+    if (Array.isArray(driveContext.coreRefs)) {
+      for (const key of driveContext.coreRefs) addKey(key);
+    }
+    if (Array.isArray(entry?.coreRefs)) {
+      for (const key of entry.coreRefs) addKey(key);
+    }
+
+    if (entry) {
+      this.mirrorTargets.delete(entryKey);
+    }
+
+    this.#removeMetadataEntry(entryKey);
+
+    let deleted = 0;
+    if (this.blindPeering && collected.size) {
+      const operations = [];
+      for (const key of collected) {
+        operations.push(
+          this.#deleteCoreByKey(key).then(() => {
+            deleted += 1;
+          }).catch((error) => {
+            this.logger?.warn?.('[BlindPeering] Failed to delete mirrored drive core', {
+              key,
+              reason,
+              err: error?.message || error
+            });
+          })
+        );
+      }
+      if (operations.length) {
+        await Promise.allSettled(operations);
+      }
+    }
+
+    const eventType = entry?.type || driveContext.type || 'drive';
+    this.logger?.debug?.('[BlindPeering] Drive mirror removed', {
+      identifier,
+      reason,
+      type: eventType,
+      mirroredCores: collected.size,
+      deletedCores: deleted
+    });
+    this.emit('mirror-removed', {
+      type: eventType,
+      identifier,
+      reason,
+      deleted
+    });
+    return true;
+  }
+
+  async clearAllMirrors({ reason = 'cleanup' } = {}) {
+    const entries = Array.from(this.mirrorTargets.values());
+    for (const entry of entries) {
+      if (entry.type === 'relay') {
+        await this.removeRelayMirror(
+          { ...entry.context, relayKey: entry.identifier },
+          { reason }
+        );
+      } else {
+        await this.removeHyperdriveMirror(
+          { ...entry.context, identifier: entry.identifier },
+          { reason }
+        );
+      }
+    }
+  }
+
+  async rehydrateMirrors({ reason = 'manual', timeoutMs = 45000 } = {}) {
+    if (!this.started) {
+      return { status: 'skipped', reason: 'not-started' };
+    }
+
+    if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+      timeoutMs = 45000;
+    }
+
+    if (this.rehydrationState.inflight) {
+      return this.rehydrationState.inflight;
+    }
+
+    const promise = (async () => {
+      const targets = this.#collectAllMirrorCoreObjects();
+      const summary = {
+        status: 'ok',
+        reason,
+        total: targets.size,
+        synced: 0,
+        failed: 0
+      };
+
+      for (const [key, info] of targets) {
+        const label = info.label || key;
+        try {
+          await this.#waitForCoreSync(info.core, timeoutMs, label);
+          summary.synced += 1;
+        } catch (error) {
+          summary.failed += 1;
+          this.logger?.warn?.('[BlindPeering] Mirror rehydration failed', {
+            key,
+            label,
+            reason,
+            err: error?.message || error
+          });
+        }
+      }
+
+      this.logger?.info?.('[BlindPeering] Rehydration cycle completed', summary);
+      return summary;
+    })();
+
+    this.rehydrationState.inflight = promise;
+    try {
+      return await promise;
+    } finally {
+      if (this.rehydrationState.inflight === promise) {
+        this.rehydrationState.inflight = null;
+      }
+    }
+  }
+
+  #collectRelayCoreRefs(relayContext = {}) {
+    if (!relayContext) return [];
+    const refs = new Set();
+    if (Array.isArray(relayContext.coreRefs)) {
+      for (const key of relayContext.coreRefs) {
+        const normalized = normalizeCoreKey(key);
+        if (normalized) refs.add(normalized);
+      }
+    }
+    const autobase = relayContext.autobase || null;
+    if (autobase) {
+      const objects = this.#collectAutobaseCoreObjects(autobase);
+      for (const key of objects.keys()) {
+        refs.add(key);
+      }
+    }
+    return Array.from(refs);
+  }
+
+  #collectDriveCoreRefs(driveContext = {}) {
+    if (!driveContext) return [];
+    const refs = new Set();
+    if (Array.isArray(driveContext.coreRefs)) {
+      for (const key of driveContext.coreRefs) {
+        const normalized = normalizeCoreKey(key);
+        if (normalized) refs.add(normalized);
+      }
+    }
+    const drive = driveContext.drive || null;
+    if (drive) {
+      const objects = this.#collectDriveCoreObjects(drive, driveContext.type || 'drive');
+      for (const key of objects.keys()) {
+        refs.add(key);
+      }
+    }
+    return Array.from(refs);
+  }
+
+  #collectAutobaseCoreObjects(autobase) {
+    const map = new Map();
+    if (!autobase) return map;
+
+    const addWriterArray = (writers, labelPrefix) => {
+      if (!Array.isArray(writers)) return;
+      writers.forEach((writer, index) => {
+        this.#addCoreObject(map, writer?.core || writer, `${labelPrefix}-${index}`);
+      });
+    };
+
+    this.#addCoreObject(map, autobase.core, 'autobase-core');
+    this.#addCoreObject(map, autobase.local?.core || autobase.local, 'autobase-local');
+    addWriterArray(autobase.activeWriters, 'autobase-writer');
+    addWriterArray(autobase.writers, 'autobase-writer');
+
+    if (typeof autobase.views === 'function') {
+      let index = 0;
+      try {
+        for (const view of autobase.views()) {
+          this.#addCoreObject(map, view?.core || view, `autobase-view-${index++}`);
+        }
+      } catch (_) {
+        // ignore iterator errors
+      }
+    } else if (autobase.view) {
+      this.#addCoreObject(map, autobase.view?.core || autobase.view, 'autobase-view');
+    }
+
+    if (Array.isArray(autobase.viewCores)) {
+      autobase.viewCores.forEach((core, index) => {
+        this.#addCoreObject(map, core?.core || core, `autobase-view-${index}`);
+      });
+    }
+
+    return map;
+  }
+
+  #collectDriveCoreObjects(drive, type = 'drive') {
+    const map = new Map();
+    if (!drive) return map;
+    this.#addCoreObject(map, drive.core, `${type}-metadata`);
+    this.#addCoreObject(map, drive.content?.core || drive.content, `${type}-content`);
+    this.#addCoreObject(map, drive.blobs?.core || drive.blobs, `${type}-blobs`);
+    this.#addCoreObject(map, drive.metadata?.core || drive.metadata, `${type}-meta`);
+    return map;
+  }
+
+  #collectAllMirrorCoreObjects() {
+    const map = new Map();
+    for (const entry of this.mirrorTargets.values()) {
+      if (entry.type === 'relay') {
+        const autobase = entry.context?.autobase || null;
+        if (!autobase) continue;
+        const objects = this.#collectAutobaseCoreObjects(autobase);
+        for (const [key, info] of objects) {
+          if (!map.has(key)) {
+            map.set(key, info);
+          }
+        }
+      } else if (entry.type === 'drive' || entry.type === 'pfp-drive') {
+        const drive = entry.context?.drive || null;
+        if (!drive) continue;
+        const objects = this.#collectDriveCoreObjects(drive, entry.type);
+        for (const [key, info] of objects) {
+          if (!map.has(key)) {
+            map.set(key, info);
+          }
+        }
+      }
+    }
+    return map;
+  }
+
+  #addCoreObject(target, candidate, label) {
+    if (!candidate) return;
+    const core = candidate.core && typeof candidate.core.update === 'function'
+      ? candidate.core
+      : candidate;
+    if (!core || typeof core.update !== 'function' || !core.key) return;
+    const key = normalizeCoreKey(core.key);
+    if (!key || target.has(key)) return;
+    target.set(key, { core, label });
+  }
+
+  async #deleteCoreByKey(key) {
+    if (!this.blindPeering?.deleteCore) return false;
+    const decoded = decodeCoreKey(key);
+    if (!decoded) {
+      throw new Error(`Invalid core key provided: ${key}`);
+    }
+    await this.blindPeering.deleteCore(decoded);
+    return true;
+  }
+
+  #removeMetadataEntry(entryKey) {
+    if (!entryKey) return;
+    if (Object.prototype.hasOwnProperty.call(this.metadata.targets, entryKey)) {
+      delete this.metadata.targets[entryKey];
+      this.metadataDirty = true;
+      this.#scheduleMetadataPersist();
+    }
+  }
+
+  async #waitForCoreSync(core, timeoutMs, label) {
+    if (!core || typeof core.update !== 'function') return false;
+    try {
+      if (typeof core.ready === 'function') {
+        await this.#withTimeout(core.ready(), timeoutMs, label ? `${label}:ready` : null);
+      }
+    } catch (error) {
+      this.logger?.debug?.('[BlindPeering] Core ready wait failed', {
+        label,
+        err: error?.message || error
+      });
+    }
+    await this.#withTimeout(core.update({ wait: true }), timeoutMs, label ? `${label}:update` : null);
+    return true;
+  }
+
+  async #withTimeout(promise, timeoutMs, label) {
+    if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+      return promise;
+    }
+    let timer = null;
+    try {
+      return await Promise.race([
+        promise,
+        new Promise((_, reject) => {
+          timer = setTimeout(() => {
+            const message = label
+              ? `Operation timed out after ${timeoutMs}ms (${label})`
+              : `Operation timed out after ${timeoutMs}ms`;
+            reject(new Error(message));
+          }, timeoutMs);
+        })
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
     }
   }
 
@@ -418,28 +882,38 @@ export default class BlindPeeringManager extends EventEmitter {
     };
     if (entry.type === 'relay') {
       const context = entry.context || {};
+      const relayCoreRefs = Array.isArray(context.coreRefs)
+        ? Array.from(new Set(context.coreRefs.map(normalizeCoreKey).filter(Boolean)))
+        : [];
       return {
         ...base,
         relayKey: context.relayKey || entry.identifier,
         publicIdentifier: context.publicIdentifier || null,
-        lastWriterCount: Array.isArray(context.coreRefs) ? context.coreRefs.length : null,
+        lastWriterCount: relayCoreRefs.length || null,
         announce: !!context.announce,
+        coreRefs: relayCoreRefs,
         context: {
           relayKey: context.relayKey || entry.identifier,
-          publicIdentifier: context.publicIdentifier || null
+          publicIdentifier: context.publicIdentifier || null,
+          coreRefs: relayCoreRefs
         }
       };
     }
     if (entry.type === 'drive') {
       const context = entry.context || {};
+      const driveCoreRefs = Array.isArray(context.coreRefs)
+        ? Array.from(new Set(context.coreRefs.map(normalizeCoreKey).filter(Boolean)))
+        : [];
       return {
         ...base,
         driveKey: context.driveKey || entry.identifier,
         isPfp: !!context.isPfp,
         announce: true,
+        coreRefs: driveCoreRefs,
         context: {
           driveKey: context.driveKey || entry.identifier,
-          isPfp: !!context.isPfp
+          isPfp: !!context.isPfp,
+          coreRefs: driveCoreRefs
         }
       };
     }

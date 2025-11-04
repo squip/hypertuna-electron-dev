@@ -21,7 +21,7 @@ import {
   calculateMembers,
   calculateAuthorizedUsers
 } from './hypertuna-relay-profile-manager-bare.mjs'
-import { loadRelayKeyMappings, activeRelays, virtualRelayKeys } from './hypertuna-relay-manager-adapter.mjs'
+import { loadRelayKeyMappings, activeRelays, virtualRelayKeys, keyToPublic } from './hypertuna-relay-manager-adapter.mjs'
 import {
   queuePendingAuthUpdate,
   applyPendingAuthUpdates
@@ -65,10 +65,12 @@ const pearRuntime = globalThis?.Pear
 const __dirname = process.env.APP_DIR || pearRuntime?.config?.dir || process.cwd()
 const defaultStorageDir = process.env.STORAGE_DIR || pearRuntime?.config?.storage || join(process.cwd(), 'data')
 const BLIND_PEERING_METADATA_FILENAME = 'blind-peering-metadata.json'
+const BLIND_PEER_REHYDRATION_TIMEOUT_MS = 45000
 
 global.userConfig = global.userConfig || { storage: defaultStorageDir }
 
 const relayMirrorSubscriptions = new Map()
+let lastBlindPeerFingerprint = null
 
 function getGatewayWebsocketProtocol(config) {
   return config?.proxy_websocket_protocol === 'ws' ? 'ws' : 'wss'
@@ -322,12 +324,17 @@ function attachRelayMirrorHooks(relayKey, relayManager, manager) {
       publicIdentifier: relayManager?.publicIdentifier || null,
       autobase
     })
-    manager.refreshFromBlindPeers('relay-update').catch((error) => {
-      manager.logger?.warn?.('[BlindPeering] Relay update refresh failed', {
-        relayKey,
-        err: error?.message || error
+    manager.refreshFromBlindPeers('relay-update')
+      .then(() => manager.rehydrateMirrors({
+        reason: 'relay-update',
+        timeoutMs: BLIND_PEER_REHYDRATION_TIMEOUT_MS
+      }))
+      .catch((error) => {
+        manager.logger?.warn?.('[BlindPeering] Relay update sync failed', {
+          relayKey,
+          err: error?.message || error
+        })
       })
-    })
   }
   autobase.on('update', handler)
   relayMirrorSubscriptions.set(autobase, () => {
@@ -337,6 +344,20 @@ function attachRelayMirrorHooks(relayKey, relayManager, manager) {
       autobase.removeListener('update', handler)
     }
   })
+}
+
+function detachRelayMirrorHooks(relayManager) {
+  if (!relayManager) return
+  const autobase = relayManager.relay
+  if (!autobase) return
+  const unsubscribe = relayMirrorSubscriptions.get(autobase)
+  if (!unsubscribe) return
+  try {
+    unsubscribe()
+  } catch (error) {
+    console.warn('[Worker] Failed to detach relay mirror subscription:', error?.message || error)
+  }
+  relayMirrorSubscriptions.delete(autobase)
 }
 
 function cleanupRelayMirrorSubscriptions() {
@@ -411,6 +432,13 @@ async function startGatewayService(options = {}) {
         }
 
         const manager = await ensureBlindPeeringManager()
+        manager.configure(publicGatewaySettings)
+        manager.markTrustedMirrors(remoteKeys)
+
+        const keysFingerprint = remoteKeys.join(',')
+        const fingerprint = summary?.enabled
+          ? `${summary.publicKey || ''}:${summary.encryptionKey || ''}:${summary.trustedPeerCount ?? remoteKeys.length}:${keysFingerprint}`
+          : 'disabled'
 
         if (manager.enabled && !manager.started) {
           await manager.start({
@@ -420,8 +448,34 @@ async function startGatewayService(options = {}) {
           })
           await seedBlindPeeringMirrors(manager)
           await manager.refreshFromBlindPeers('status-sync')
+          await manager.rehydrateMirrors({
+            reason: 'status-sync',
+            timeoutMs: BLIND_PEER_REHYDRATION_TIMEOUT_MS
+          })
+          lastBlindPeerFingerprint = fingerprint
+        } else if (manager.enabled && manager.started) {
+          if (fingerprint !== lastBlindPeerFingerprint) {
+            lastBlindPeerFingerprint = fingerprint
+            try {
+              await manager.refreshFromBlindPeers('status-sync')
+            } catch (error) {
+              console.warn('[Worker] Blind peering refresh failed on status update:', error?.message || error)
+            }
+            manager.rehydrateMirrors({
+              reason: 'status-sync',
+              timeoutMs: BLIND_PEER_REHYDRATION_TIMEOUT_MS
+            }).catch((error) => {
+              console.warn('[Worker] Blind peering rehydration failed after status update:', error?.message || error)
+            })
+          }
         } else if (!manager.enabled && manager.started) {
+          try {
+            await manager.clearAllMirrors({ reason: 'status-disabled' })
+          } catch (error) {
+            console.warn('[Worker] Failed to clear blind peering mirrors before shutdown:', error?.message || error)
+          }
           await manager.stop()
+          lastBlindPeerFingerprint = fingerprint
         }
       } catch (error) {
         console.warn('[Worker] Failed to reconcile blind peering manager from status update:', error?.message || error)
@@ -1414,6 +1468,11 @@ async function handleMessageObject(message) {
               console.warn('[Worker] Failed to restart blind peering manager after config update:', err?.message || err)
             }
           } else if (!blindPeeringManager.enabled && blindPeeringManager.started) {
+            try {
+              await blindPeeringManager.clearAllMirrors({ reason: 'config-disabled' })
+            } catch (err) {
+              console.warn('[Worker] Failed to clear blind peering mirrors after config disable:', err?.message || err)
+            }
             await blindPeeringManager.stop()
           }
         }
@@ -1682,9 +1741,26 @@ async function handleMessageObject(message) {
 
     case 'disconnect-relay':
       console.log('[Worker] Disconnect relay requested:', message.data)
-      if (relayServer) {
+      if (relayServer && message?.data?.relayKey) {
+        const relayKey = message.data.relayKey
+        const relayManagerInstance = activeRelays.get(relayKey)
+        const publicIdentifier = message.data?.publicIdentifier || keyToPublic.get(relayKey) || null
         try {
-          const result = await relayServer.disconnectRelay(message.data.relayKey)
+          const result = await relayServer.disconnectRelay(relayKey)
+
+          detachRelayMirrorHooks(relayManagerInstance)
+          try {
+            const manager = await ensureBlindPeeringManager()
+            if (manager?.started) {
+              await manager.removeRelayMirror({
+                relayKey,
+                publicIdentifier,
+                autobase: relayManagerInstance?.relay || null
+              }, { reason: 'manual-disconnect' })
+            }
+          } catch (mirrorError) {
+            console.warn('[Worker] Blind peering mirror removal on disconnect failed:', mirrorError?.message || mirrorError)
+          }
 
           sendMessage({
             type: 'relay-disconnected',
@@ -1703,6 +1779,10 @@ async function handleMessageObject(message) {
             type: 'error',
             message: `Failed to disconnect relay: ${err.message}`
           })
+
+          if (relayManagerInstance && relayManagerInstance.relay) {
+            attachRelayMirrorHooks(relayKey, relayManagerInstance, blindPeeringManager)
+          }
         }
       }
       break
@@ -1944,10 +2024,16 @@ async function cleanup() {
 
   if (blindPeeringManager) {
     try {
+      await blindPeeringManager.clearAllMirrors({ reason: 'shutdown' })
+    } catch (err) {
+      console.warn('[Worker] Failed to clear blind peering mirrors during shutdown:', err?.message || err)
+    }
+    try {
       await blindPeeringManager.stop()
     } catch (err) {
       console.warn('[Worker] Failed to stop blind peering manager:', err?.message || err)
     }
+    lastBlindPeerFingerprint = null
   }
   
   if (workerPipe) {
@@ -2069,6 +2155,10 @@ async function main() {
       })
       await seedBlindPeeringMirrors(manager)
       await manager.refreshFromBlindPeers('startup')
+      await manager.rehydrateMirrors({
+        reason: 'startup',
+        timeoutMs: BLIND_PEER_REHYDRATION_TIMEOUT_MS
+      })
     } catch (error) {
       console.warn('[Worker] Blind peering manager failed to start:', error?.message || error)
     }
@@ -2181,9 +2271,14 @@ async function main() {
           seedBlindPeeringMirrors(blindPeeringManager).catch(err => {
             console.warn('[Worker] Blind peering mirror seeding failed:', err?.message || err)
           })
-          blindPeeringManager.refreshFromBlindPeers('periodic').catch(err => {
-            console.warn('[Worker] Blind peering periodic refresh failed:', err?.message || err)
-          })
+          blindPeeringManager.refreshFromBlindPeers('periodic')
+            .then(() => blindPeeringManager.rehydrateMirrors({
+              reason: 'periodic',
+              timeoutMs: BLIND_PEER_REHYDRATION_TIMEOUT_MS
+            }))
+            .catch(err => {
+              console.warn('[Worker] Blind peering periodic sync failed:', err?.message || err)
+            })
         }
       }
     }, 60000)
