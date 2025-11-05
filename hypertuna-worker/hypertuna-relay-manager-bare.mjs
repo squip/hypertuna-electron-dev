@@ -12,6 +12,7 @@ import { nobleSecp256k1 } from './crypto-libraries.js';
 import { NostrUtils } from './nostr-utils.js';
 import { setTimeout as delay } from 'node:timers/promises';
 import { join } from 'node:path';
+import { promises as fs } from 'node:fs';
 
 // File locking utility to handle concurrent access
 const fileLocks = new Map();
