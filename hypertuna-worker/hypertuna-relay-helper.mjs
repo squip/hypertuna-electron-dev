@@ -148,4 +148,20 @@ export default class Autobee extends Autobase {
     }
     return this.view.createReadStream(range, opts);
   }
+  
+  get core () {
+    return this.localWriter?.core || this.local || null;
+  }
+
+  get wakeupCapability () {
+    if (this._wakeupCapability) return this._wakeupCapability;
+    const core = this.localWriter?.core || this.local || null;
+    return core?.wakeupCapability || null;
+  }
+
+  set wakeupCapability(value) {
+    this._wakeupCapability = value;
+    if (this.localWriter?.core) this.localWriter.core.wakeupCapability = value;
+    if (this.local) this.local.wakeupCapability = value;
+  }
 }

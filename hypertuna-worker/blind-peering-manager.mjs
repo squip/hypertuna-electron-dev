@@ -261,18 +261,27 @@ export default class BlindPeeringManager extends EventEmitter {
   ensureRelayMirror(relayContext = {}) {
     if (!this.started) return;
     if (!this.blindPeering) return;
-    if (relayContext.autobase) {
-      try {
-        this.blindPeering.addAutobaseBackground(relayContext.autobase, relayContext.target || null, {
-          mirrors: Array.from(this.trustedMirrors),
-          pick: 2,
-          all: true
+
+    const autobase = relayContext.autobase || null;
+    let autobaseTarget = null;
+    if (autobase) {
+      autobaseTarget = this.#resolveAutobaseTarget(relayContext);
+      if (!autobaseTarget) {
+        this.logger?.warn?.('[BlindPeering] Skipping autobase mirroring (no wakeup target)', {
+          identifier: relayContext.relayKey || relayContext.publicIdentifier || null
         });
-      } catch (error) {
-        this.logger?.warn?.('[BlindPeering] Failed to mirror autobase', {
-          identifier: relayContext.relayKey || relayContext.publicIdentifier || null,
-          error: error?.message || error
-        });
+      } else {
+        try {
+          this.blindPeering.addAutobaseBackground(autobase, autobaseTarget, {
+            pick: 2,
+            all: true
+          });
+        } catch (error) {
+          this.logger?.warn?.('[BlindPeering] Failed to mirror autobase', {
+            identifier: relayContext.relayKey || relayContext.publicIdentifier || null,
+            error: error?.message || error
+          });
+        }
       }
     }
     const identifier = sanitizeKey(relayContext.relayKey || relayContext.publicIdentifier);
@@ -288,6 +297,13 @@ export default class BlindPeeringManager extends EventEmitter {
     }
     if (!entry.context.identifier) {
       entry.context.identifier = identifier;
+    }
+    if (autobaseTarget) {
+      try {
+        entry.context.autobaseTarget = HypercoreId.encode(autobaseTarget);
+      } catch (_) {
+        entry.context.autobaseTarget = autobaseTarget.toString('hex');
+      }
     }
     const coreRefs = this.#collectRelayCoreRefs(relayContext);
     if (coreRefs.length) {
@@ -340,14 +356,12 @@ export default class BlindPeeringManager extends EventEmitter {
       if (drive.core) {
         this.blindPeering.addCoreBackground(drive.core, drive.core.key, {
           announce: true,
-          mirrors: Array.from(this.trustedMirrors),
           priority: 1
         });
       }
       if (drive.blobs?.core) {
         this.blindPeering.addCoreBackground(drive.blobs.core, drive.blobs.core.key, {
           announce: false,
-          mirrors: Array.from(this.trustedMirrors),
           priority: 0
         });
       }
@@ -558,6 +572,46 @@ export default class BlindPeeringManager extends EventEmitter {
         this.rehydrationState.inflight = null;
       }
     }
+  }
+
+  #resolveAutobaseTarget(relayContext = {}) {
+    const tryDecode = (candidate) => {
+      if (!candidate) return null;
+      if (Buffer.isBuffer(candidate)) {
+        return candidate.length === 32 ? Buffer.from(candidate) : null;
+      }
+      if (typeof candidate === 'string') {
+        return decodeCoreKey(candidate);
+      }
+      if (candidate && typeof candidate === 'object') {
+        if (candidate.key) return tryDecode(candidate.key);
+        if (candidate.discoveryKey) return tryDecode(candidate.discoveryKey);
+      }
+      return null;
+    };
+
+    const pickFirst = (...candidates) => {
+      for (const candidate of candidates) {
+        const decoded = tryDecode(candidate);
+        if (decoded && decoded.length === 32) return decoded;
+      }
+      return null;
+    };
+
+    const autobase = relayContext.autobase || null;
+    const candidateTarget = pickFirst(
+      relayContext.target,
+      autobase?.wakeupCapability?.key,
+      autobase?.local?.key,
+      autobase?.local?.discoveryKey,
+      autobase?.discoveryKey,
+      autobase?.localWriter?.core?.key,
+      autobase?.key,
+      relayContext.relayKey,
+      relayContext.publicIdentifier
+    );
+
+    return candidateTarget;
   }
 
   #collectRelayCoreRefs(relayContext = {}) {

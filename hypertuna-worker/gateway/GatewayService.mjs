@@ -361,6 +361,9 @@ export class GatewayService extends EventEmitter {
       config.baseUrl = config.preferredBaseUrl || envBaseUrl || 'https://hypertuna.com';
     }
 
+    const blindPeerConfig = this.#normalizeBlindPeerConfig(rawConfig, this.publicGatewaySettings);
+    Object.assign(config, blindPeerConfig);
+
     config.enabled = !!config.enabled;
     return config;
   }
@@ -369,6 +372,58 @@ export class GatewayService extends EventEmitter {
     const num = Number(value);
     if (Number.isFinite(num) && num > 0) return Math.round(num);
     return fallback;
+  }
+
+  #normalizeBlindPeerConfig(rawConfig = {}, fallback = {}) {
+    const hasOwn = (obj, key) => Object.prototype.hasOwnProperty.call(obj || {}, key);
+    const selectBoolean = (key, defaultValue = false) => {
+      if (hasOwn(rawConfig, key)) return !!rawConfig[key];
+      if (hasOwn(fallback, key)) return !!fallback[key];
+      return defaultValue;
+    };
+    const selectKeys = (key) => {
+      const source = hasOwn(rawConfig, key) ? rawConfig[key] : fallback?.[key];
+      return this.#sanitizeKeyList(source);
+    };
+    const selectString = (key) => {
+      if (hasOwn(rawConfig, key)) return this.#sanitizeOptionalString(rawConfig[key]);
+      if (hasOwn(fallback, key)) return this.#sanitizeOptionalString(fallback[key]);
+      return null;
+    };
+    const selectNumber = (key) => {
+      const candidate = hasOwn(rawConfig, key)
+        ? Number(rawConfig[key])
+        : Number(fallback?.[key]);
+      return Number.isFinite(candidate) && candidate > 0 ? Math.trunc(candidate) : null;
+    };
+
+    return {
+      blindPeerEnabled: selectBoolean('blindPeerEnabled'),
+      blindPeerKeys: selectKeys('blindPeerKeys'),
+      blindPeerManualKeys: selectKeys('blindPeerManualKeys'),
+      blindPeerEncryptionKey: selectString('blindPeerEncryptionKey'),
+      blindPeerReplicationTopic: selectString('blindPeerReplicationTopic'),
+      blindPeerMaxBytes: selectNumber('blindPeerMaxBytes')
+    };
+  }
+
+  #sanitizeKeyList(value) {
+    if (value == null) return [];
+    const list = Array.isArray(value) ? value : [value];
+    const seen = new Set();
+    for (const entry of list) {
+      if (typeof entry !== 'string') continue;
+      const trimmed = entry.trim();
+      if (!trimmed) continue;
+      seen.add(trimmed);
+    }
+    return Array.from(seen);
+  }
+
+  #sanitizeOptionalString(value) {
+    if (typeof value !== 'string') return null;
+    const trimmed = value.trim();
+    return trimmed.length ? trimmed : null;
   }
 
   #configurePublicGateway() {
@@ -1128,12 +1183,20 @@ export class GatewayService extends EventEmitter {
         }
       }
 
-      await this.#applyBlindPeerInfo(registrationResult.blindPeer || { enabled: false }, { persist: true }).catch((error) => {
-        this.log('warn', `[PublicGateway] Failed to persist blind peer announcement: ${error.message}`);
-      });
+      const registrationBlindPeer = registrationResult?.blindPeer;
+      if (registrationBlindPeer && typeof registrationBlindPeer === 'object') {
+        await this.#applyBlindPeerInfo(registrationBlindPeer, { persist: true }).catch((error) => {
+          this.log('warn', `[PublicGateway] Failed to persist blind peer announcement: ${error.message}`);
+        });
+      } else {
+        this.log('debug', '[PublicGateway] Registration response missing blind peer summary; preserving existing configuration');
+      }
       if ((!this.blindPeerSummary?.enabled || !this.blindPeerSummary?.publicKey)
         && (!Array.isArray(this.publicGatewaySettings?.blindPeerKeys) || !this.publicGatewaySettings.blindPeerKeys.length)) {
-        this.#maybeFetchBlindPeerInfo({ reason: 'registration-fallback' }).catch((error) => {
+        const fallbackReason = registrationBlindPeer && typeof registrationBlindPeer === 'object'
+          ? 'registration-disabled'
+          : 'registration-missing';
+        this.#maybeFetchBlindPeerInfo({ reason: fallbackReason }).catch((error) => {
           this.log('debug', `[PublicGateway] Blind peer fallback lookup failed after registration: ${error?.message || error}`);
         });
       }
@@ -1721,7 +1784,11 @@ export class GatewayService extends EventEmitter {
 
   async updatePublicGatewayConfig(rawConfig = {}) {
     const previousSettings = this.publicGatewaySettings;
-    this.publicGatewaySettings = await this.#resolvePublicGatewayConfig(rawConfig);
+    const mergedConfig = {
+      ...(previousSettings || {}),
+      ...(rawConfig || {})
+    };
+    this.publicGatewaySettings = await this.#resolvePublicGatewayConfig(mergedConfig);
     this.#configurePublicGateway();
 
     const isEnabled = this.publicGatewaySettings?.enabled && this.publicGatewayRegistrar?.isEnabled?.();
@@ -3556,7 +3623,10 @@ export class GatewayService extends EventEmitter {
   }
 
   async #applyBlindPeerInfo(info = {}, { persist = false } = {}) {
-    const summary = info && typeof info === 'object' ? { ...info } : null;
+    if (!info || typeof info !== 'object') {
+      return false;
+    }
+    const summary = { ...info };
     this.blindPeerSummary = summary;
 
     const enabled = !!info.enabled;

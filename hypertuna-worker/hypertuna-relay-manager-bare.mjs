@@ -11,6 +11,7 @@ import Autobee from './hypertuna-relay-helper.mjs';
 import { nobleSecp256k1 } from './crypto-libraries.js';
 import { NostrUtils } from './nostr-utils.js';
 import { setTimeout as delay } from 'node:timers/promises';
+import { join } from 'node:path';
 
 // File locking utility to handle concurrent access
 const fileLocks = new Map();
@@ -69,6 +70,8 @@ async function verifyEventSignature(event) {
       return false;
   }
 }
+
+const WAKEUP_CAPABILITY_FILENAME = 'wakeup-capability.json';
 
 function serializeEvent(event) {
   return JSON.stringify([0, event.pubkey, event.created_at, event.kind, event.tags, event.content]);
@@ -149,6 +152,9 @@ export class RelayManager {
         this.relay.on('error', console.error);
 
         await this.relay.update();
+        await this.ensureWakeupCapability().catch((error) => {
+          console.warn('[RelayManager] Failed to prepare wakeup capability', error?.message || error);
+        });
 
         this.relay.view.core.on('append', async () => {
           if (this.relay.view.version === 1) return;
@@ -192,6 +198,98 @@ export class RelayManager {
         console.error(error.stack);
         throw error;
       }
+    }
+
+    async ensureWakeupCapability() {
+      if (!this.relay) return null;
+      try {
+        if (typeof this.relay.ready === 'function') {
+          await this.relay.ready();
+        }
+      } catch (error) {
+        console.warn('[RelayManager] Relay ready() failed while preparing wakeup capability', error?.message || error);
+      }
+
+      const localCore = this.relay.local || null;
+      if (localCore && typeof localCore.ready === 'function') {
+        try {
+          await localCore.ready();
+        } catch (error) {
+          console.warn('[RelayManager] Failed to ready local core for wakeup capability', error?.message || error);
+        }
+      }
+
+      let capability = await this.loadWakeupCapability();
+      if (capability?.key) {
+        this.relay.wakeupCapability = {
+          key: capability.key,
+          discoveryKey: capability.discoveryKey || null
+        };
+        return this.relay.wakeupCapability;
+      }
+
+      const primaryKey = localCore?.key || localCore?.core?.key || this.relay?.local?.key || this.relay?.key || null;
+      if (!primaryKey) {
+        console.warn('[RelayManager] Unable to determine wakeup capability key for relay');
+        return null;
+      }
+
+      const discoveryKey = localCore?.discoveryKey || this.relay.discoveryKey || null;
+      const normalizedKey = Buffer.isBuffer(primaryKey) ? primaryKey : Buffer.from(primaryKey);
+      capability = {
+        key: normalizedKey,
+        discoveryKey: discoveryKey ? (Buffer.isBuffer(discoveryKey) ? discoveryKey : Buffer.from(discoveryKey)) : null
+      };
+
+      try {
+        if (this.relay._wakeup?.queue) {
+          this.relay._wakeup.queue(capability.key, localCore?.length || 0);
+          await this.relay._wakeup.flush();
+        }
+      } catch (error) {
+        console.warn('[RelayManager] Failed to flush wakeup state', error?.message || error);
+      }
+
+      this.relay.wakeupCapability = { ...capability };
+
+      await this.persistWakeupCapability(capability).catch((error) => {
+        console.warn('[RelayManager] Failed to persist wakeup capability', error?.message || error);
+      });
+
+      return this.relay.wakeupCapability;
+    }
+
+    async loadWakeupCapability() {
+      const filePath = join(this.storageDir, WAKEUP_CAPABILITY_FILENAME);
+      try {
+        const raw = await fs.readFile(filePath, 'utf8');
+        const parsed = JSON.parse(raw);
+        if (!parsed || !parsed.key) return null;
+        const keyBuffer = Buffer.from(parsed.key, 'hex');
+        const discoveryBuffer = parsed.discoveryKey ? Buffer.from(parsed.discoveryKey, 'hex') : null;
+        return {
+          key: keyBuffer,
+          discoveryKey: discoveryBuffer
+        };
+      } catch (error) {
+        if (error.code !== 'ENOENT') {
+          console.warn('[RelayManager] Failed to load wakeup capability', error?.message || error);
+        }
+        return null;
+      }
+    }
+
+    async persistWakeupCapability(capability) {
+      if (!capability?.key) return;
+      const filePath = join(this.storageDir, WAKEUP_CAPABILITY_FILENAME);
+      const payload = {
+        key: b4a.isBuffer(capability.key) ? capability.key.toString('hex') : Buffer.from(capability.key).toString('hex'),
+        discoveryKey: capability.discoveryKey
+          ? (b4a.isBuffer(capability.discoveryKey) ? capability.discoveryKey.toString('hex') : Buffer.from(capability.discoveryKey).toString('hex'))
+          : null,
+        updatedAt: Date.now()
+      };
+      await fs.writeFile(filePath, JSON.stringify(payload, null, 2), 'utf8');
     }
 
     setupSwarmListeners() {
@@ -255,10 +353,15 @@ export class RelayManager {
 
     async addWriter(key) {
       console.log('Adding writer:', key);
-      return this.relay.append({
+      const result = await this.relay.append({
         type: 'addWriter',
         key
       });
+      await this.relay.update().catch(() => {});
+      await this.ensureWakeupCapability().catch((error) => {
+        console.warn('[RelayManager] Failed to refresh wakeup capability after addWriter', error?.message || error);
+      });
+      return result;
     }
 
     async removeWriter(key) {
