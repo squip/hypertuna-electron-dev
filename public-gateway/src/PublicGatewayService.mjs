@@ -130,6 +130,7 @@ class PublicGatewayService {
     this.delegationFallbackTimers = new Map();
     this.relayPeerIndex = new Map();
     this.peerMetadata = new Map();
+    this.peerRawPublicKeys = new Map();
     this.peerHyperbeeReplications = new Map();
     this.publicGatewayStatusUpdatedAt = null;
     this.blindPeerService = null;
@@ -304,6 +305,9 @@ class PublicGatewayService {
       }
     }
     this.dispatcherListeners = [];
+
+    this.peerRawPublicKeys.clear();
+    this.peerMetadata.clear();
 
     await this.connectionPool.destroy();
     await this.registrationStore?.disconnect?.();
@@ -2515,12 +2519,30 @@ class PublicGatewayService {
       });
     }
 
+    if (payload?.publicKey) {
+      this.#rememberPeerRawKey(peerKey, payload.publicKey);
+    }
+
     const peerEntry = this.peerMetadata.get(peerKey) || {};
-   peerEntry.registration = payload;
-   peerEntry.lastRegistrationAt = now;
-   this.peerMetadata.set(peerKey, peerEntry);
-   this.#markPeerReachable(peerKey, { timestamp: now });
-    this.blindPeerService?.addTrustedPeer(peerKey);
+    peerEntry.registration = payload;
+    peerEntry.lastRegistrationAt = now;
+    this.peerMetadata.set(peerKey, peerEntry);
+    this.#markPeerReachable(peerKey, { timestamp: now });
+
+    const rawPeerKey = this.#getPeerRawKey(peerKey);
+    const trustedInput = rawPeerKey || peerKey;
+    if (!trustedInput) {
+      this.logger?.warn?.('[PublicGateway] Unable to add trusted peer (no key resolved)', {
+        peer: peerKey,
+        payloadKeys: Object.keys(payload || {})
+      });
+    } else {
+      this.logger?.info?.('[PublicGateway] Registering trusted peer', {
+        peer: peerKey,
+        usedRawKey: Buffer.isBuffer(trustedInput)
+      });
+      this.blindPeerService?.addTrustedPeer(trustedInput);
+    }
 
     this.#emitPublicGatewayStatus();
 
@@ -2718,7 +2740,21 @@ class PublicGatewayService {
     await this.registrationStore.upsertRelay(relayKey, record);
     this.#syncSessionsWithRelay(relayKey, record);
     this.#markPeerReachable(peerKey, { relayKey, timestamp: now });
-    this.blindPeerService?.addTrustedPeer(peerKey);
+    const rawPeerKey = this.#getPeerRawKey(peerKey);
+    const trustedInput = rawPeerKey || peerKey;
+    if (!trustedInput) {
+      this.logger?.warn?.('[PublicGateway] Unable to trust relay peer (missing key)', {
+        peer: peerKey,
+        relayKey
+      });
+    } else {
+      this.logger?.info?.('[PublicGateway] Trusting relay peer for registration record', {
+        peer: peerKey,
+        relayKey,
+        usedRawKey: Buffer.isBuffer(trustedInput)
+      });
+      this.blindPeerService?.addTrustedPeer(trustedInput);
+    }
   }
 
   async #upsertInternalReplicaPeer(peerKey, { gatewayRelay = {}, replicaMetrics = null, replicaTelemetry = null, delegateReqToPeers = null } = {}) {
@@ -2867,8 +2903,57 @@ class PublicGatewayService {
     };
   }
 
-  #onProtocolCreated({ publicKey, protocol }) {
+  #normalizePeerRawKey(value) {
+    if (!value) return null;
+    if (Buffer.isBuffer(value)) {
+      return value.length === 32 ? Buffer.from(value) : null;
+    }
+    if (value instanceof Uint8Array) {
+      const buffer = Buffer.from(value);
+      return buffer.length === 32 ? buffer : null;
+    }
+    if (typeof value === 'string') {
+      const trimmed = value.trim();
+      if (!trimmed) return null;
+      try {
+        const buffer = Buffer.from(trimmed, 'hex');
+        return buffer.length === 32 ? buffer : null;
+      } catch (_) {
+        return null;
+      }
+    }
+    return null;
+  }
+
+  #rememberPeerRawKey(peerKey, rawValue) {
+    const normalized = this.#normalizePeerRawKey(rawValue) || this.#normalizePeerRawKey(peerKey);
+    if (!normalized) return;
+    this.peerRawPublicKeys.set(peerKey, normalized);
+    this.logger?.debug?.('[PublicGateway] Remembered peer raw key', {
+      peer: peerKey,
+      sourceType: rawValue ? (Buffer.isBuffer(rawValue) ? 'buffer' : rawValue instanceof Uint8Array ? 'uint8array' : typeof rawValue) : 'string',
+      byteLength: normalized.length
+    });
+  }
+
+  #getPeerRawKey(peerKey) {
+    const stored = this.peerRawPublicKeys.get(peerKey);
+    if (stored) return Buffer.from(stored);
+    const normalized = this.#normalizePeerRawKey(peerKey);
+    return normalized ? Buffer.from(normalized) : null;
+  }
+
+  #forgetPeerRawKey(peerKey) {
+    this.peerRawPublicKeys.delete(peerKey);
+  }
+
+  #onProtocolCreated({ publicKey, protocol, context = {} }) {
     if (!protocol || !publicKey) return;
+
+    const rawKeyCandidate = context?.peerInfo?.publicKey
+      || context?.connection?.stream?.remotePublicKey
+      || context?.connection?.remotePublicKey;
+    this.#rememberPeerRawKey(publicKey, rawKeyCandidate);
 
     protocol.handle('/gateway/register', async (request) => {
       try {
@@ -2889,7 +2974,7 @@ class PublicGatewayService {
     const cleanup = () => {
       this.peerMetadata.delete(publicKey);
       this.#detachHyperbeeReplication(publicKey);
-      this.blindPeerService?.removeTrustedPeer(publicKey);
+      // Trusted peers persist until explicit revocation logic runs.
     };
     protocol.once('close', cleanup);
     protocol.once('destroy', cleanup);

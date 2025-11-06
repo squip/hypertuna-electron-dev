@@ -26,18 +26,46 @@ function toKeyString(value) {
   }
 }
 
-function sanitizePeerKey(key) {
+function toPeerKeyBuffer(key) {
   if (!key) return null;
+  if (Buffer.isBuffer(key)) {
+    return key.length ? Buffer.from(key) : null;
+  }
+  if (key instanceof Uint8Array) {
+    return key.length ? Buffer.from(key) : null;
+  }
+  if (typeof key === 'string') {
+    const trimmed = key.trim();
+    if (!trimmed) return null;
+    try {
+      const decoded = HypercoreId.decode(trimmed);
+      return decoded.length ? Buffer.from(decoded) : null;
+    } catch (_) {
+      const isHex = /^[0-9a-f]+$/i.test(trimmed) && trimmed.length % 2 === 0;
+      if (!isHex) return null;
+      try {
+        const buffer = Buffer.from(trimmed, 'hex');
+        return buffer.length ? buffer : null;
+      } catch (_) {
+        return null;
+      }
+    }
+  }
+  return null;
+}
+
+function sanitizePeerKey(key) {
+  const buffer = toPeerKeyBuffer(key);
+  if (buffer) {
+    try {
+      return HypercoreId.encode(buffer);
+    } catch (_) {
+      return buffer.toString('hex');
+    }
+  }
   if (typeof key === 'string') {
     const trimmed = key.trim();
     return trimmed.length ? trimmed : null;
-  }
-  if (Buffer.isBuffer(key) || key instanceof Uint8Array) {
-    try {
-      return HypercoreId.encode(Buffer.from(key));
-    } catch (_) {
-      return Buffer.from(key).toString('hex');
-    }
   }
   return null;
 }
@@ -49,17 +77,8 @@ function sanitizeRelayKey(value) {
 }
 
 function decodeKey(key) {
-  if (!key) return null;
-  if (Buffer.isBuffer(key)) return key;
-  if (key instanceof Uint8Array) return Buffer.from(key);
-  if (typeof key === 'string') {
-    try {
-      return HypercoreId.decode(key);
-    } catch (_) {
-      return Buffer.from(key, 'hex');
-    }
-  }
-  return null;
+  const buffer = toPeerKeyBuffer(key);
+  return buffer ? Buffer.from(buffer) : null;
 }
 
 export default class BlindPeerService extends EventEmitter {
@@ -184,7 +203,14 @@ export default class BlindPeerService extends EventEmitter {
   addTrustedPeer(peerKey) {
     const sanitized = sanitizePeerKey(peerKey);
     if (!sanitized) return false;
-    if (this.trustedPeers.has(sanitized)) return false;
+    if (this.trustedPeers.has(sanitized)) {
+      this.logger?.debug?.('[BlindPeer] Trusted peer add skipped (already trusted)', { peerKey: sanitized });
+      return false;
+    }
+    this.logger?.info?.('[BlindPeer] Adding trusted peer', {
+      inputType: peerKey instanceof Uint8Array ? 'uint8array' : Buffer.isBuffer(peerKey) ? 'buffer' : typeof peerKey,
+      peerKey: sanitized
+    });
     this.trustedPeers.add(sanitized);
     const now = Date.now();
     this.trustedPeerMeta.set(sanitized, {
@@ -194,6 +220,7 @@ export default class BlindPeerService extends EventEmitter {
     if (this.blindPeer?.addTrustedPubKey) {
       try {
         this.blindPeer.addTrustedPubKey(sanitized);
+        this.logger?.debug?.('[BlindPeer] Delegated peer to blind-peer instance', { peerKey: sanitized });
       } catch (error) {
         this.logger?.warn?.('[BlindPeer] Failed to add trusted peer to running service', {
           peerKey: sanitized,
@@ -219,7 +246,7 @@ export default class BlindPeerService extends EventEmitter {
     if (!sanitized) return false;
     const removed = this.trustedPeers.delete(sanitized);
     if (removed) {
-      this.logger?.debug?.('[BlindPeer] Trusted peer removed', { peerKey: sanitized });
+      this.logger?.info?.('[BlindPeer] Removing trusted peer', { peerKey: sanitized });
       this.trustedPeerMeta.delete(sanitized);
       this.#updateTrustedPeers();
       if (this.trustedPeersPersistPath) {
