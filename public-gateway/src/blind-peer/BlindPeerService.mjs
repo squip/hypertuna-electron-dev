@@ -27,9 +27,19 @@ function toKeyString(value) {
 }
 
 function sanitizePeerKey(key) {
-  if (!key || typeof key !== 'string') return null;
-  const trimmed = key.trim();
-  return trimmed.length ? trimmed : null;
+  if (!key) return null;
+  if (typeof key === 'string') {
+    const trimmed = key.trim();
+    return trimmed.length ? trimmed : null;
+  }
+  if (Buffer.isBuffer(key) || key instanceof Uint8Array) {
+    try {
+      return HypercoreId.encode(Buffer.from(key));
+    } catch (_) {
+      return Buffer.from(key).toString('hex');
+    }
+  }
+  return null;
 }
 
 function sanitizeRelayKey(value) {
