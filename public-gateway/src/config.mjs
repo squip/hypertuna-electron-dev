@@ -75,6 +75,15 @@ const DEFAULT_CONFIG = {
     dedupeBatchSize: Number(process.env.GATEWAY_BLINDPEER_DEDUPE_BATCH) || 100,
     staleCoreTtlMs: Number(process.env.GATEWAY_BLINDPEER_STALE_TTL_MS) || (7 * 24 * 60 * 60 * 1000),
     trustedPeersPersistPath: process.env.GATEWAY_BLINDPEER_TRUSTED_PATH || null
+  },
+  escrow: {
+    enabled: process.env.GATEWAY_ESCROW_ENABLED === 'true',
+    baseUrl: process.env.GATEWAY_ESCROW_BASE_URL || '',
+    sharedSecret: process.env.GATEWAY_ESCROW_SHARED_SECRET
+      || process.env.GATEWAY_REGISTRATION_SECRET
+      || null,
+    clientId: process.env.GATEWAY_ESCROW_CLIENT_ID || 'public-gateway',
+    requestTimeoutMs: Number(process.env.GATEWAY_ESCROW_TIMEOUT_MS) || 5000
   }
 };
 
@@ -131,6 +140,10 @@ function loadConfig(overrides = {}) {
     blindPeer: {
       ...DEFAULT_CONFIG.blindPeer,
       ...(overrides.blindPeer || {})
+    },
+    escrow: {
+      ...DEFAULT_CONFIG.escrow,
+      ...(overrides.escrow || {})
     }
   };
 
@@ -144,6 +157,7 @@ function loadConfig(overrides = {}) {
 
   merged.relay = normalizeRelaySettings(merged.relay);
   merged.blindPeer = normalizeBlindPeerSettings(merged.blindPeer);
+  merged.escrow = normalizeEscrowSettings(merged.escrow, merged.publicBaseUrl, merged.registration?.sharedSecret);
 
   return merged;
 }
@@ -207,6 +221,23 @@ function normalizeBlindPeerSettings(settings = {}) {
     staleCoreTtlMs: toPositiveInt(settings.staleCoreTtlMs, 7 * 24 * 60 * 60 * 1000),
     trustedPeersPersistPath: sanitizePath(settings.trustedPeersPersistPath)
   };
+}
+
+function normalizeEscrowSettings(settings = {}, fallbackBaseUrl, defaultSecret) {
+  const sanitizeBase = (value) => {
+    if (!value || typeof value !== 'string') return null;
+    const trimmed = value.trim();
+    return trimmed.length ? trimmed.replace(/\/+$/, '') : null;
+  };
+
+  const result = { ...settings };
+  const normalizedBase = sanitizeBase(result.baseUrl) || sanitizeBase(fallbackBaseUrl ? `${fallbackBaseUrl}/api/escrow` : null);
+  result.baseUrl = normalizedBase || null;
+  result.sharedSecret = result.sharedSecret || defaultSecret || null;
+  const timeout = Number(result.requestTimeoutMs);
+  result.requestTimeoutMs = Number.isFinite(timeout) && timeout > 0 ? Math.trunc(timeout) : 5000;
+  result.enabled = Boolean(result.enabled && result.baseUrl && result.sharedSecret);
+  return result;
 }
 
 export {

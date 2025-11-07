@@ -35,7 +35,9 @@ import {
   blindPeerGcRunsCounter,
   blindPeerEvictionsCounter,
   blindPeerMirrorStateGauge,
-  blindPeerMirrorLagGauge
+  blindPeerMirrorLagGauge,
+  escrowUnlockCounter,
+  escrowLeaseGauge
 } from './metrics.mjs';
 import MemoryRegistrationStore from './stores/MemoryRegistrationStore.mjs';
 import MessageQueue from './utils/MessageQueue.mjs';
@@ -48,6 +50,7 @@ import PublicGatewayHyperbeeAdapter from '../../shared/public-gateway/PublicGate
 import { openHyperbeeReplicationChannel } from '../../shared/public-gateway/hyperbeeReplicationChannel.mjs';
 import BlindPeerService from './blind-peer/BlindPeerService.mjs';
 import BlindPeerReplicaManager from './blind-peer/BlindPeerReplicaManager.mjs';
+import AutobaseKeyEscrowCoordinator from './escrow/AutobaseKeyEscrowCoordinator.mjs';
 
 const DELEGATION_FALLBACK_MS = 1500;
 
@@ -178,6 +181,17 @@ class PublicGatewayService {
         }
       }
     };
+    this.escrowCoordinator = null;
+    this.escrowMetrics = {
+      recordUnlock: (result) => {
+        const label = typeof result === 'string' && result.trim().length ? result.trim() : 'unknown';
+        escrowUnlockCounter.labels(label).inc();
+      },
+      setLeaseState: (relayKey, active) => {
+        if (!relayKey) return;
+        escrowLeaseGauge.labels(relayKey).set(active ? 1 : 0);
+      }
+    };
 
     if (this.dispatcher) {
       const assignmentListener = (event) => this.#handleDispatcherAssignment(event);
@@ -221,6 +235,18 @@ class PublicGatewayService {
       });
       await this.blindPeerService.initialize();
       await this.#initializeBlindPeerReplicaManager();
+    }
+    if (this.config?.escrow?.enabled) {
+      const escrowLogger = this.logger?.child
+        ? this.logger.child({ module: 'EscrowCoordinator' })
+        : this.logger;
+      this.escrowCoordinator = new AutobaseKeyEscrowCoordinator({
+        config: this.config.escrow,
+        logger: escrowLogger,
+        metrics: this.escrowMetrics,
+        replicaManager: this.blindPeerReplicaManager
+      });
+      await this.escrowCoordinator.initialize();
     }
     this.logger.info('PublicGatewayService initialized');
   }
@@ -331,6 +357,8 @@ class PublicGatewayService {
 
     this.peerRawPublicKeys.clear();
     this.peerMetadata.clear();
+    await this.escrowCoordinator?.stop?.();
+    this.escrowCoordinator = null;
 
     await this.connectionPool.destroy();
     await this.registrationStore?.disconnect?.();
@@ -359,6 +387,8 @@ class PublicGatewayService {
     app.get('/api/blind-peer/replicas', (req, res) => this.#handleBlindPeerReplicas(req, res));
     app.post('/api/blind-peer/gc', (req, res) => this.#handleBlindPeerGc(req, res));
     app.delete('/api/blind-peer/mirrors/:key', (req, res) => this.#handleBlindPeerDelete(req, res));
+    app.post('/api/escrow/leases/query', (req, res) => this.#handleEscrowLeaseQuery(req, res));
+    app.post('/api/escrow/leases/:relayKey/request', (req, res) => this.#handleEscrowLeaseRequest(req, res));
 
     app.get('/health', (_req, res) => {
       res.json({ status: 'ok' });
@@ -2391,6 +2421,53 @@ class PublicGatewayService {
         err: error?.message || error
       });
       res.status(500).json({ error: 'blind-peer-delete-failed', message: error?.message || String(error) });
+    }
+  }
+
+  #handleEscrowLeaseQuery(req, res) {
+    if (!this.config?.escrow?.enabled || !this.escrowCoordinator) {
+      return res.status(503).json({ error: 'escrow-disabled' });
+    }
+    const { payload, signature } = req.body || {};
+    if (!this.#verifySignedPayload(payload, signature)) {
+      return res.status(401).json({ error: 'Invalid signature' });
+    }
+    try {
+      const leases = this.escrowCoordinator.getLeaseSummaries();
+      return res.json({ leases });
+    } catch (error) {
+      this.logger?.warn?.('[PublicGateway] Escrow lease query failed', {
+        error: error?.message || error
+      });
+      return res.status(500).json({ error: 'escrow-query-failed' });
+    }
+  }
+
+  async #handleEscrowLeaseRequest(req, res) {
+    if (!this.config?.escrow?.enabled || !this.escrowCoordinator) {
+      return res.status(503).json({ error: 'escrow-disabled' });
+    }
+    const { payload, signature } = req.body || {};
+    if (!this.#verifySignedPayload(payload, signature)) {
+      return res.status(401).json({ error: 'Invalid signature' });
+    }
+    const relayKey = req.params?.relayKey || payload?.relayKey;
+    if (!relayKey) {
+      return res.status(400).json({ error: 'relayKey-required' });
+    }
+    try {
+      const lease = await this.escrowCoordinator.requestLease({
+        relayKey,
+        requesterId: payload?.requesterId || 'manual-api',
+        evidence: payload?.evidence || {}
+      });
+      return res.json({ status: 'ok', lease });
+    } catch (error) {
+      this.logger?.warn?.('[PublicGateway] Escrow lease request failed', {
+        relayKey,
+        error: error?.message || error
+      });
+      return res.status(400).json({ error: error?.message || 'escrow-request-failed' });
     }
   }
 

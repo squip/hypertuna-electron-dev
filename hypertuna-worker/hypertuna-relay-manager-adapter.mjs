@@ -201,6 +201,19 @@ export function registerVirtualRelay(relayKey, manager, options = {}) {
     };
 }
 
+export function getRelayWriterSecret(relayKey) {
+    if (!relayKey) return null;
+    const manager = activeRelays.get(relayKey);
+    const coreKey = manager?.relay?.local?.key || manager?.relay?.localKey || null;
+    if (!coreKey) return null;
+    const buffer = Buffer.isBuffer(coreKey)
+        ? coreKey
+        : coreKey instanceof Uint8Array
+            ? Buffer.from(coreKey)
+            : Buffer.from(coreKey);
+    return buffer.toString('hex');
+}
+
 export async function unregisterVirtualRelay(relayKey, options = {}) {
     if (!relayKey) return;
 

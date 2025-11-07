@@ -6,6 +6,7 @@
     "protomux": "^3.10.1",
     "compact-encoding": "^2.16.1",
     "hypercore-crypto": "^3.6.1",
-    "hyperswarm": "^4.14.0"
+    "hyperswarm": "^4.14.0",
+    "tweetnacl": "^1.0.3"
   }
 }

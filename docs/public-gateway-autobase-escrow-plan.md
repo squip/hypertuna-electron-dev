@@ -75,23 +75,25 @@
 - The new `BlindPeerReplicaManager` consumes those events, stores per-identifier replica state (including owning peer, priority bounds, and lag), maintains bounded LRU caches of open cores, and can open the underlying hypercores on demand by reusing the blind-peer Corestore.
 - Public Gateway startup wires the manager in automatically and exposes the aggregated state through `/api/blind-peer/replicas`, which now reflects the manager’s snapshot rather than re-synthesizing metrics on every request.
 
-### Phase 3 – AutonbaseKeyEscrow Service (Automated Policy)
-1. **Service Definition**
-   - Implement a standalone service with:
-     - Public key + signed policy payload accessible to workers.
-     - Storage for escrow records (encrypted payload, metadata, TTL, unlock criteria).
-     - APIs: `POST /escrow` (worker deposit), `POST /unlock` (gateway request), `POST /revoke` (worker or operator).
-     - Automated unlock policy engine that evaluates objective signals (e.g., “no healthy peers for N ms”, “blind-peer replica synced within M ms”, “relay escrow-enabled flag”) and rejects requests that fail policy checks.
-2. **Worker Integration**
-   - Extend worker settings flow to fetch escrow policy, encrypt the gateway writer key, and register the escrow entry during relay registration.
-   - Support policy negotiation (e.g., time-bound, liveness thresholds).
-3. **Gateway Integration**
-   - Add a client module that:
-     - Requests unlock when no healthy workers remain and a write is required.
-     - Supplies evidence (registration state, blind-peer mirror status, policy version/timestamps).
-     - Receives the temporary key, loads it into the replica manager, and auto-expires it when TTL ends.
-4. **Audit Trail**
-   - Append every escrow action (deposit, unlock, revoke) to an append-only Hypercore for post-incident review.
+### Phase 3 – AutonbaseKeyEscrow Service (Automated Policy) ✅
+1. **Service Definition** – *Completed*
+   - Delivered the standalone AutobaseKeyEscrow service (`public-gateway/src/escrow`) with `/policy`, `/escrow`, `/escrow/unlock`, and `/escrow/revoke` endpoints, disk-backed escrow records, automated policy evaluation, and a Corestore-based audit feed for every deposit/unlock/revoke.
+2. **Worker Integration** – *Completed*
+   - Worker gateway settings now capture escrow configuration, the worker fetches policy snapshots, encrypts relay writer keys with the published escrow public key, and uploads deposits whenever relays register or writer keys rotate.
+3. **Gateway Integration** – *Completed*
+   - The public gateway boots an `AutobaseKeyEscrowCoordinator` that requests leases, decrypts writer packages in-memory, updates the `BlindPeerReplicaManager` lease state, exports Prometheus metrics, and exposes signed admin APIs for querying or manually requesting leases.
+4. **Audit Trail** – *Completed*
+   - All escrow actions append to the service’s audit Hypercore so operators can replay the history during incident response.
+
+#### Phase 3 Execution Tickets
+- **BP-P3-01 – AutobaseKeyEscrow Service & Policy Engine (Completed):** Implemented service bootstrapper, persistent store, Hypercore audit log, policy evaluation, and signed HTTP surface.
+- **BP-P3-02 – Worker Escrow Deposits (Completed):** Worker GatewayService consumes escrow policy, encrypts writer packages, automatically deposits per relay, caches deposit metadata, and includes escrow state within HTTP registrations.
+- **BP-P3-03 – Gateway Escrow Coordinator & APIs (Completed):** Added escrow coordinator, Prometheus metrics, replica-manager lease tracking, and signed `/api/escrow/leases/*` admin endpoints for manual inspection/lease triggering.
+
+### Phase 3 Technical Overview
+- **Escrow microservice:** `public-gateway/src/escrow/AutobaseKeyEscrowService.mjs` manages encrypted deposits, enforces automated unlock policies (peer liveness + mirror freshness), and writes an append-only Hypercore audit log. `public-gateway/src/escrow/index.mjs` boots the service for standalone deployments.
+- **Worker pipeline:** `hypertuna-worker` now persists escrow settings, fetches policy via `AutobaseKeyEscrowClient`, encrypts relay writer keys through the shared NaCl helper, and attaches escrow metadata to `/api/relays` registrations so the gateway knows which relays are escrow-enabled.
+- **Gateway coordinator:** `AutobaseKeyEscrowCoordinator` requests unlocks when instructed (currently via signed admin APIs), decrypts leases via ephemeral session keys, updates `BlindPeerReplicaManager` writer lease flags, and records metrics (`gateway_escrow_unlock_requests_total`, `gateway_escrow_leases_active`). Manual ops endpoints (`/api/escrow/leases/query` and `/api/escrow/leases/:relayKey/request`) reuse the shared secret signature scheme for trust parity with registration flows.
 
 ### Phase 4 – Request Routing Updates
 1. **WebSocket Relay Handler**

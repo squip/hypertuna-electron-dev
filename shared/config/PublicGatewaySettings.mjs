@@ -14,6 +14,9 @@ const DEFAULT_SETTINGS = Object.freeze({
   blindPeerEncryptionKey: null,
   blindPeerReplicationTopic: null,
   blindPeerMaxBytes: null,
+  escrowEnabled: false,
+  escrowBaseUrl: null,
+  resolvedEscrowPolicy: null,
   defaultTokenTtl: 3600,
   tokenRefreshWindowSeconds: 300,
   dispatcherMaxConcurrent: 3,
@@ -50,6 +53,13 @@ function isRenderer() {
 
 function isNodeProcess() {
   return typeof process !== 'undefined' && !!process.versions?.node && !isRenderer();
+}
+
+function sanitizeUrl(value) {
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  return trimmed.replace(/\/+$/, '');
 }
 
 function normalizeSettings(raw = {}) {
@@ -127,6 +137,18 @@ function normalizeSettings(raw = {}) {
     if (Number.isFinite(bytes) && bytes > 0) {
       normalized.blindPeerMaxBytes = Math.trunc(bytes);
     }
+  }
+
+  if (typeof raw.escrowEnabled === 'boolean') {
+    normalized.escrowEnabled = raw.escrowEnabled;
+  }
+
+  if (typeof raw.escrowBaseUrl === 'string') {
+    normalized.escrowBaseUrl = sanitizeUrl(raw.escrowBaseUrl);
+  }
+
+  if (raw.resolvedEscrowPolicy && typeof raw.resolvedEscrowPolicy === 'object') {
+    normalized.resolvedEscrowPolicy = { ...raw.resolvedEscrowPolicy };
   }
 
   if (raw.defaultTokenTtl != null) {

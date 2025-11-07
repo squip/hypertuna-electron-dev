@@ -100,6 +100,8 @@ export default class BlindPeerReplicaManager extends EventEmitter {
       healthy: replica.healthy ?? null,
       lagMs: replica.lagMs ?? null,
       writerLeaseActive: replica.writerLeaseActive ?? false,
+      writerLeaseExpiresAt: replica.writerLeaseExpiresAt ?? null,
+      writerLeaseId: replica.writerLeaseId || null,
       metadata: includeInternals ? replica.metadata || null : undefined
     }));
     list.sort((a, b) => {
@@ -112,6 +114,17 @@ export default class BlindPeerReplicaManager extends EventEmitter {
       return list.slice(0, Math.trunc(limit));
     }
     return list;
+  }
+
+  setWriterLeaseState(identifier, ownerPeerKey, lease = null) {
+    if (!identifier) return false;
+    const replica = this.#findReplica(identifier, ownerPeerKey) || this.#findReplica(identifier, null);
+    if (!replica) return false;
+    replica.writerLeaseActive = !!lease;
+    replica.writerLeaseExpiresAt = lease?.expiresAt || null;
+    replica.writerLeaseId = lease?.leaseId || null;
+    this.emit('replica-updated', replica);
+    return true;
   }
 
   async ensureReplicaCore(identifier, ownerPeerKey) {

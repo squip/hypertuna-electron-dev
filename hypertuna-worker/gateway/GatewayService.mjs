@@ -23,10 +23,16 @@ import PublicGatewayHyperbeeAdapter from '../../shared/public-gateway/PublicGate
 import PublicGatewayVirtualRelayManager from './PublicGatewayVirtualRelayManager.mjs';
 import {
   registerVirtualRelay,
-  unregisterVirtualRelay
+  unregisterVirtualRelay,
+  getRelayWriterSecret
 } from '../hypertuna-relay-manager-adapter.mjs';
 import { getRelayAuthStore } from '../relay-auth-store.mjs';
 import { updatePublicGatewaySettings } from '../../shared/config/PublicGatewaySettings.mjs';
+import AutobaseKeyEscrowClient from '../../shared/escrow/AutobaseKeyEscrowClient.mjs';
+import {
+  sealPayload as sealEscrowPayload,
+  hashSecret as hashEscrowSecret
+} from '../../shared/escrow/AutobaseKeyEscrowCrypto.mjs';
 
 const MAX_LOG_ENTRIES = 500;
 const DEFAULT_PORT = 8443;
@@ -230,6 +236,12 @@ export class GatewayService extends EventEmitter {
     };
     this.publicGatewayRelayTokens = new Map();
     this.publicGatewayRelayTokenTimers = new Map();
+    this.publicGatewayEscrowState = {
+      policy: null,
+      lastFetchedAt: 0
+    };
+    this.publicGatewayEscrowDeposits = new Map();
+    this.escrowClient = null;
     this.gatewayTelemetryTimers = new Map();
     this.gatewayProtocols = new Map();
     this.publicGatewayRelayClient = new PublicGatewayRelayClient({ logger: this.#createExternalLogger?.() || console });
@@ -324,6 +336,21 @@ export class GatewayService extends EventEmitter {
       dispatcherCircuitBreakerTimeoutMs: this.#parsePositiveNumber(rawConfig?.dispatcherCircuitBreakerTimeoutMs, 60000)
     };
 
+    const envEscrowEnabled = process.env.PUBLIC_GATEWAY_ESCROW_ENABLED;
+    if (typeof rawConfig?.escrowEnabled === 'boolean') {
+      config.escrowEnabled = rawConfig.escrowEnabled;
+    } else if (envEscrowEnabled === 'true') {
+      config.escrowEnabled = true;
+    } else if (envEscrowEnabled === 'false') {
+      config.escrowEnabled = false;
+    } else {
+      config.escrowEnabled = config.escrowEnabled ?? true;
+    }
+
+    const escrowBaseCandidate = rawConfig?.escrowBaseUrl || process.env.PUBLIC_GATEWAY_ESCROW_URL || '';
+    config.escrowBaseUrl = this.#sanitizeEscrowBaseUrl(escrowBaseCandidate) || null;
+    config.resolvedEscrowPolicy = rawConfig?.resolvedEscrowPolicy || null;
+
     if (envDelegate !== null) {
       config.delegateReqToPeers = envDelegate;
     } else if (typeof rawConfig?.delegateReqToPeers === 'boolean') {
@@ -359,6 +386,11 @@ export class GatewayService extends EventEmitter {
 
     if (!config.baseUrl && config.selectionMode !== 'default') {
       config.baseUrl = config.preferredBaseUrl || envBaseUrl || 'https://hypertuna.com';
+    }
+
+    if (!config.escrowBaseUrl && config.baseUrl) {
+      const normalizedBase = config.baseUrl.replace(/\/+$/, '');
+      config.escrowBaseUrl = this.#sanitizeEscrowBaseUrl(`${normalizedBase}/api/escrow`);
     }
 
     const blindPeerConfig = this.#normalizeBlindPeerConfig(rawConfig, this.publicGatewaySettings);
@@ -424,6 +456,156 @@ export class GatewayService extends EventEmitter {
     if (typeof value !== 'string') return null;
     const trimmed = value.trim();
     return trimmed.length ? trimmed : null;
+  }
+
+  #sanitizeEscrowBaseUrl(value, fallbackBase = null) {
+    const candidate = typeof value === 'string' && value.trim().length ? value.trim() : '';
+    const base = candidate || fallbackBase || '';
+    if (!base) return null;
+    return base.replace(/\/+$/, '');
+  }
+
+  #isEscrowEnabled() {
+    return Boolean(
+      this.publicGatewaySettings?.escrowEnabled
+      && this.publicGatewaySettings?.sharedSecret
+      && this.publicGatewaySettings?.escrowBaseUrl
+    );
+  }
+
+  async #ensureEscrowClient() {
+    if (!this.#isEscrowEnabled()) return null;
+    if (this.escrowClient?.isEnabled?.()) return this.escrowClient;
+    const clientId = this.publicGatewaySettings?.resolvedGatewayId
+      || this.publicGatewaySettings?.selectedGatewayId
+      || 'hypertuna-worker';
+    this.escrowClient = new AutobaseKeyEscrowClient({
+      baseUrl: this.publicGatewaySettings.escrowBaseUrl,
+      sharedSecret: this.publicGatewaySettings.sharedSecret,
+      clientId,
+      fetchImpl: globalThis.fetch?.bind(globalThis)
+    });
+    return this.escrowClient;
+  }
+
+  async #fetchEscrowPolicy({ force = false } = {}) {
+    if (!this.#isEscrowEnabled()) return null;
+    const client = await this.#ensureEscrowClient();
+    if (!client?.isEnabled?.()) return null;
+    const now = Date.now();
+    if (!force && this.publicGatewayEscrowState.policy && (now - this.publicGatewayEscrowState.lastFetchedAt) < 5 * 60 * 1000) {
+      return this.publicGatewayEscrowState.policy;
+    }
+    try {
+      const policy = await client.fetchPolicy();
+      this.publicGatewayEscrowState = {
+        policy,
+        lastFetchedAt: now
+      };
+      if (this.publicGatewaySettings) {
+        this.publicGatewaySettings.resolvedEscrowPolicy = policy;
+        try {
+          await updatePublicGatewaySettings(this.publicGatewaySettings);
+        } catch (persistError) {
+          this.log('debug', `[PublicGateway] Failed to persist escrow policy: ${persistError.message}`);
+        }
+      }
+      return policy;
+    } catch (error) {
+      this.log('debug', `[PublicGateway] Failed to fetch escrow policy: ${error.message}`);
+      return this.publicGatewayEscrowState.policy;
+    }
+  }
+
+  async #maybePrepareEscrowAttachment(relayKey, { metadata } = {}) {
+    if (!this.#isEscrowEnabled()) return null;
+    const client = await this.#ensureEscrowClient();
+    if (!client?.isEnabled?.()) return null;
+    const writerSecret = getRelayWriterSecret(relayKey);
+    if (!writerSecret) return null;
+
+    const secretHash = hashEscrowSecret(writerSecret);
+    const now = Date.now();
+    const cached = this.publicGatewayEscrowDeposits.get(relayKey);
+    if (cached && cached.writerHash === secretHash && cached.expiresAt && cached.expiresAt - now > 60_000) {
+      return {
+        enabled: true,
+        escrowId: cached.escrowId,
+        policyVersion: cached.policyVersion,
+        leaseTtlMs: cached.leaseTtlMs,
+        expiresAt: cached.expiresAt
+      };
+    }
+
+    const policy = await this.#fetchEscrowPolicy();
+    if (!policy?.publicKey) return null;
+
+    const ownerPeerKeyBuffer = this.connectionPool?.getPublicKey?.()
+      || (this.ownPeerPublicKey ? Buffer.from(this.ownPeerPublicKey, 'hex') : null);
+    const ownerPeerKey = ownerPeerKeyBuffer
+      ? Buffer.from(ownerPeerKeyBuffer).toString('hex')
+      : null;
+
+    const writerPackage = {
+      relayKey,
+      writerKey: writerSecret,
+      ownerPeerKey,
+      createdAt: now,
+      metadata: {
+        identifier: metadata?.identifier || relayKey,
+        name: metadata?.name || null
+      }
+    };
+
+    let sealedPackage;
+    try {
+      sealedPackage = sealEscrowPayload({
+        payload: writerPackage,
+        recipientPublicKey: policy.publicKey
+      });
+    } catch (error) {
+      this.log('warn', `[PublicGateway] Failed to seal escrow package for ${relayKey}: ${error.message}`);
+      return null;
+    }
+
+    const expiresAt = now + (policy.depositTtlMs || policy.policy?.maxDepositTtlMs || 24 * 60 * 60 * 1000);
+    const depositPayload = {
+      relayKey,
+      ownerPeerKey,
+      encryptedPackage: sealedPackage,
+      policyVersion: policy.policy?.version || policy.policyVersion || 'v1',
+      metadata: {
+        identifier: metadata?.identifier || relayKey,
+        name: metadata?.name || null,
+        writerHash: secretHash
+      },
+      unlockConditions: {
+        peerLivenessTimeoutMs: policy.policy?.peerLivenessTimeoutMs || null,
+        mirrorFreshnessMaxLagMs: policy.policy?.mirrorFreshnessMaxLagMs || null
+      },
+      expiresAt
+    };
+
+    try {
+      const response = await client.deposit(depositPayload);
+      const summary = {
+        ...response,
+        relayKey,
+        writerHash: secretHash,
+        lastUpdatedAt: now
+      };
+      this.publicGatewayEscrowDeposits.set(relayKey, summary);
+      return {
+        enabled: true,
+        escrowId: response.escrowId,
+        policyVersion: response.policyVersion,
+        leaseTtlMs: response.leaseTtlMs,
+        expiresAt: response.expiresAt
+      };
+    } catch (error) {
+      this.log('warn', `[PublicGateway] Escrow deposit request failed for ${relayKey}: ${error.message}`);
+      return null;
+    }
   }
 
   #configurePublicGateway() {
@@ -760,6 +942,7 @@ export class GatewayService extends EventEmitter {
     const previousResolved = {
       baseUrl: config.baseUrl,
       sharedSecret: config.sharedSecret,
+       escrowBaseUrl: config.escrowBaseUrl,
       resolvedGatewayId: config.resolvedGatewayId,
       resolvedSecretVersion: config.resolvedSecretVersion,
       resolvedSharedSecretHash: config.resolvedSharedSecretHash,
@@ -772,7 +955,8 @@ export class GatewayService extends EventEmitter {
       resolvedGatewayRelay: config.resolvedGatewayRelay,
       resolvedDefaultTokenTtl: config.resolvedDefaultTokenTtl,
       resolvedTokenRefreshWindowSeconds: config.resolvedTokenRefreshWindowSeconds,
-      resolvedDispatcher: config.resolvedDispatcher
+      resolvedDispatcher: config.resolvedDispatcher,
+      resolvedEscrowPolicy: config.resolvedEscrowPolicy || null
     };
     config.resolvedFromDiscovery = false;
     config.resolvedFallback = false;
@@ -788,6 +972,7 @@ export class GatewayService extends EventEmitter {
     config.resolvedDefaultTokenTtl = null;
     config.resolvedTokenRefreshWindowSeconds = null;
     config.resolvedDispatcher = null;
+    config.resolvedEscrowPolicy = null;
 
     const restorePreviousResolved = () => {
       if (config.selectionMode !== 'default') {
@@ -798,6 +983,9 @@ export class GatewayService extends EventEmitter {
       }
       if (previousResolved.sharedSecret != null) {
         config.sharedSecret = previousResolved.sharedSecret;
+      }
+      if (!config.escrowBaseUrl && previousResolved.escrowBaseUrl) {
+        config.escrowBaseUrl = previousResolved.escrowBaseUrl;
       }
       config.resolvedGatewayId = previousResolved.resolvedGatewayId || null;
       config.resolvedSecretVersion = previousResolved.resolvedSecretVersion || null;
@@ -812,6 +1000,7 @@ export class GatewayService extends EventEmitter {
       config.resolvedDefaultTokenTtl = previousResolved.resolvedDefaultTokenTtl || null;
       config.resolvedTokenRefreshWindowSeconds = previousResolved.resolvedTokenRefreshWindowSeconds || null;
       config.resolvedDispatcher = previousResolved.resolvedDispatcher || null;
+      config.resolvedEscrowPolicy = previousResolved.resolvedEscrowPolicy || null;
     };
 
     if (!config.enabled) {
@@ -930,7 +1119,14 @@ export class GatewayService extends EventEmitter {
     config.resolvedDefaultTokenTtl = resolvedEntry.defaultTokenTtl || null;
     config.resolvedTokenRefreshWindowSeconds = resolvedEntry.tokenRefreshWindowSeconds || null;
     config.resolvedDispatcher = resolvedEntry.dispatcherPolicy || null;
+    const normalizedBase = (config.baseUrl || '').replace(/\/+$/, '');
+    config.escrowBaseUrl = this.#sanitizeEscrowBaseUrl(
+      config.escrowBaseUrl,
+      normalizedBase ? `${normalizedBase}/api/escrow` : null
+    );
     config.disabledReason = null;
+    config.escrowEnabled = config.escrowEnabled !== false
+      && Boolean(config.escrowBaseUrl && config.sharedSecret);
 
     return config;
   }
@@ -1141,6 +1337,15 @@ export class GatewayService extends EventEmitter {
       peers,
       metadata: metadataCopy
     };
+
+    try {
+      const escrowAttachment = await this.#maybePrepareEscrowAttachment(relayKey, { metadata: metadataCopy });
+      if (escrowAttachment) {
+        payload.escrow = escrowAttachment;
+      }
+    } catch (error) {
+      this.log('debug', `[PublicGateway] Escrow attachment skipped for ${relayKey}: ${error.message}`);
+    }
 
     try {
       const registrationResult = await this.publicGatewayRegistrar.registerRelay(relayKey, payload);

@@ -93,6 +93,18 @@ const blindPeerMirrorLagGauge = new client.Gauge({
   labelNames: ['identifier', 'owner', 'type']
 });
 
+const escrowUnlockCounter = new client.Counter({
+  name: 'gateway_escrow_unlock_requests_total',
+  help: 'Count of escrow unlock requests issued by the gateway',
+  labelNames: ['result']
+});
+
+const escrowLeaseGauge = new client.Gauge({
+  name: 'gateway_escrow_leases_active',
+  help: 'Number of active escrow leases tracked by the gateway per relay',
+  labelNames: ['relay']
+});
+
 register.registerMetric(sessionGauge);
 register.registerMetric(peerGauge);
 register.registerMetric(requestCounter);
@@ -109,6 +121,8 @@ register.registerMetric(blindPeerGcRunsCounter);
 register.registerMetric(blindPeerEvictionsCounter);
 register.registerMetric(blindPeerMirrorStateGauge);
 register.registerMetric(blindPeerMirrorLagGauge);
+register.registerMetric(escrowUnlockCounter);
+register.registerMetric(escrowLeaseGauge);
 
 function metricsMiddleware(path = '/metrics') {
   return async (req, res, next) => {
@@ -140,5 +154,7 @@ export {
   blindPeerEvictionsCounter,
   blindPeerMirrorStateGauge,
   blindPeerMirrorLagGauge,
+  escrowUnlockCounter,
+  escrowLeaseGauge,
   metricsMiddleware
 };
