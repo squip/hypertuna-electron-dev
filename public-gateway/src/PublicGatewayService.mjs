@@ -33,7 +33,9 @@ import {
   blindPeerTrustedPeersGauge,
   blindPeerBytesGauge,
   blindPeerGcRunsCounter,
-  blindPeerEvictionsCounter
+  blindPeerEvictionsCounter,
+  blindPeerMirrorStateGauge,
+  blindPeerMirrorLagGauge
 } from './metrics.mjs';
 import MemoryRegistrationStore from './stores/MemoryRegistrationStore.mjs';
 import MessageQueue from './utils/MessageQueue.mjs';
@@ -45,6 +47,7 @@ import RelayTokenService from './relay/RelayTokenService.mjs';
 import PublicGatewayHyperbeeAdapter from '../../shared/public-gateway/PublicGatewayHyperbeeAdapter.mjs';
 import { openHyperbeeReplicationChannel } from '../../shared/public-gateway/hyperbeeReplicationChannel.mjs';
 import BlindPeerService from './blind-peer/BlindPeerService.mjs';
+import BlindPeerReplicaManager from './blind-peer/BlindPeerReplicaManager.mjs';
 
 const DELEGATION_FALLBACK_MS = 1500;
 
@@ -134,6 +137,7 @@ class PublicGatewayService {
     this.peerHyperbeeReplications = new Map();
     this.publicGatewayStatusUpdatedAt = null;
     this.blindPeerService = null;
+    this.blindPeerReplicaManager = null;
     this.dispatcherAssignments = new Map();
     this.dispatcherAssignmentTimers = new Map();
     this.dispatcherListeners = [];
@@ -156,6 +160,22 @@ class PublicGatewayService {
         const label = typeof reason === 'string' && reason.trim().length ? reason.trim() : 'unknown';
         const increment = Number.isFinite(count) && count > 0 ? count : 1;
         blindPeerEvictionsCounter.labels(label).inc(increment);
+      },
+      updateMirrorState: (records = []) => {
+        blindPeerMirrorStateGauge.reset();
+        blindPeerMirrorLagGauge.reset();
+        for (const record of records || []) {
+          const identifier = record?.identifier || 'unknown';
+          const owner = record?.ownerPeerKey || record?.ownerAlias || 'unknown';
+          const type = record?.type || 'unknown';
+          const healthy = record?.healthy === false ? 0 : 1;
+          blindPeerMirrorStateGauge.labels(identifier, owner, type).set(healthy);
+          if (Number.isFinite(record?.lagMs)) {
+            blindPeerMirrorLagGauge.labels(identifier, owner, type).set(record.lagMs);
+          } else {
+            blindPeerMirrorLagGauge.labels(identifier, owner, type).set(0);
+          }
+        }
       }
     };
 
@@ -200,6 +220,7 @@ class PublicGatewayService {
         metrics: this.blindPeerMetrics
       });
       await this.blindPeerService.initialize();
+      await this.#initializeBlindPeerReplicaManager();
     }
     this.logger.info('PublicGatewayService initialized');
   }
@@ -292,6 +313,8 @@ class PublicGatewayService {
     }
 
     await this.blindPeerService?.stop();
+    await this.blindPeerReplicaManager?.stop();
+    this.blindPeerReplicaManager = null;
 
     for (const timer of this.dispatcherAssignmentTimers.values()) {
       clearTimeout(timer);
@@ -333,6 +356,7 @@ class PublicGatewayService {
     }
 
     app.get('/api/blind-peer', (req, res) => this.#handleBlindPeerStatus(req, res));
+    app.get('/api/blind-peer/replicas', (req, res) => this.#handleBlindPeerReplicas(req, res));
     app.post('/api/blind-peer/gc', (req, res) => this.#handleBlindPeerGc(req, res));
     app.delete('/api/blind-peer/mirrors/:key', (req, res) => this.#handleBlindPeerDelete(req, res));
 
@@ -418,6 +442,32 @@ class PublicGatewayService {
 
     this.wss = new WebSocketServer({ server: this.server });
     this.wss.on('connection', (ws, req) => this.#handleWebSocket(ws, req));
+  }
+
+  async #initializeBlindPeerReplicaManager() {
+    if (!this.blindPeerService) return;
+    if (this.blindPeerReplicaManager) {
+      await this.blindPeerReplicaManager.stop();
+    }
+    const replicaConfig = this.config?.blindPeer?.replica || {};
+    const replicaLogger = this.logger?.child
+      ? this.logger.child({ module: 'BlindPeerReplicaManager' })
+      : this.logger;
+    this.blindPeerReplicaManager = new BlindPeerReplicaManager({
+      logger: replicaLogger,
+      maxReplicas: Number.isFinite(replicaConfig.maxCached) && replicaConfig.maxCached > 0
+        ? Math.trunc(replicaConfig.maxCached)
+        : 32
+    });
+    try {
+      await this.blindPeerReplicaManager.initialize({
+        blindPeerService: this.blindPeerService
+      });
+    } catch (error) {
+      this.logger?.warn?.('[PublicGateway] Failed to initialize BlindPeerReplicaManager', {
+        error: error?.message || error
+      });
+    }
   }
 
   #normalizeRelayConfig(raw = {}) {
@@ -2223,11 +2273,15 @@ class PublicGatewayService {
       const includeDetail = toBool(query.detail);
       const ownerLimit = parseLimit(query.owners, includeDetail ? 50 : 10);
       const coresPerOwner = parseLimit(query.coresPerOwner, 25);
+      const mirrorLimit = parseLimit(query.mirrors, includeDetail ? 100 : 25);
+      const includeMirrorCores = toBool(query.mirrorCores);
 
       const status = this.blindPeerService?.getStatus?.({
         ownerLimit,
         includeCores: includeDetail,
-        coresPerOwner
+        coresPerOwner,
+        mirrorLimit,
+        includeMirrorCores
       }) || { enabled: false };
       const summary = this.#getBlindPeerSummary(status);
 
@@ -2239,8 +2293,11 @@ class PublicGatewayService {
 
       if (includeDetail) {
         response.detail = {
-          ownership: status?.ownership || null
+          ownership: status?.ownership || null,
+          mirrors: status?.mirrors || null
         };
+      } else {
+        response.mirrors = status?.mirrors || null;
       }
 
       res.json(response);
@@ -2249,6 +2306,44 @@ class PublicGatewayService {
         err: error?.message || error
       });
       res.status(500).json({ error: 'blind-peer-status-unavailable' });
+    }
+  }
+
+  #handleBlindPeerReplicas(req, res) {
+    if (!this.blindPeerService) {
+      return res.status(503).json({ error: 'blind-peer-disabled' });
+    }
+    const query = req?.query || {};
+    const toBool = (value) => {
+      if (value === undefined || value === null) return false;
+      const str = String(value).trim().toLowerCase();
+      return str === '1' || str === 'true' || str === 'yes';
+    };
+    const parseLimit = (value, fallback) => {
+      const num = Number(value);
+      return Number.isFinite(num) && num > 0 ? Math.trunc(num) : fallback;
+    };
+    try {
+      const includeCores = toBool(query.cores);
+      const limit = parseLimit(query.limit, 100);
+      let replicas = null;
+      if (this.blindPeerReplicaManager) {
+        replicas = this.blindPeerReplicaManager.getReplicaSnapshot({
+          includeInternals: includeCores,
+          limit
+        });
+      } else {
+        replicas = this.blindPeerService?.getMirrorReadinessSnapshot?.({
+          includeCores,
+          limit
+        }) || [];
+      }
+      res.json({ replicas });
+    } catch (error) {
+      this.logger?.error?.('[PublicGateway] Failed to compose blind-peer replica response', {
+        err: error?.message || error
+      });
+      res.status(500).json({ error: 'blind-peer-replicas-unavailable' });
     }
   }
 

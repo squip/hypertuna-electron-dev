@@ -106,6 +106,7 @@ export default class BlindPeeringManager extends EventEmitter {
     this.metadataLoaded = false;
     this.metadataDirty = false;
     this.metadataSaveTimer = null;
+    this.ownerPeerKey = null;
 
     this.backoffConfig = {
       initialDelayMs: 1000,
@@ -172,6 +173,7 @@ export default class BlindPeeringManager extends EventEmitter {
       wakeup: runtime.wakeup || this.runtime.wakeup,
       swarmKeyPair: runtime.swarmKeyPair || this.runtime.swarmKeyPair || null
     };
+    this.ownerPeerKey = null;
 
     if (!this.runtime.corestore) {
       throw new Error('[BlindPeering] Corestore instance is required to start blind peering manager');
@@ -310,6 +312,14 @@ export default class BlindPeeringManager extends EventEmitter {
       entry.coreRefs = coreRefs;
       entry.context.coreRefs = coreRefs;
     }
+    entry.ownerPeerKey = this.#getOwnerPeerKey();
+    entry.announce = true;
+    entry.priority = Number.isFinite(relayContext.priority)
+      ? Math.trunc(relayContext.priority)
+      : 2;
+    entry.context.ownerPeerKey = entry.ownerPeerKey;
+    entry.context.announce = entry.announce;
+    entry.context.priority = entry.priority;
     this.mirrorTargets.set(`relay:${identifier}`, entry);
     this.#recordMirrorMetadata(entry);
     this.logger?.debug?.('[BlindPeering] Relay mirror scheduled', {
@@ -341,6 +351,15 @@ export default class BlindPeeringManager extends EventEmitter {
       entry.coreRefs = coreRefs;
       entry.context.coreRefs = coreRefs;
     }
+    entry.ownerPeerKey = this.#getOwnerPeerKey();
+    const defaultPriority = driveContext.type === 'pfp-drive' ? 0 : 1;
+    entry.priority = Number.isFinite(driveContext.priority)
+      ? Math.trunc(driveContext.priority)
+      : defaultPriority;
+    entry.announce = driveContext.announce ?? true;
+    entry.context.ownerPeerKey = entry.ownerPeerKey;
+    entry.context.priority = entry.priority;
+    entry.context.announce = entry.announce;
     this.mirrorTargets.set(`drive:${identifier}`, entry);
     this.#recordMirrorMetadata(entry);
     this.logger?.debug?.('[BlindPeering] Hyperdrive mirror scheduled', {
@@ -972,7 +991,10 @@ export default class BlindPeeringManager extends EventEmitter {
     const base = {
       type: entry.type,
       identifier: entry.identifier,
-      updatedAt: entry.updatedAt || Date.now()
+      updatedAt: entry.updatedAt || Date.now(),
+      ownerPeerKey: entry.ownerPeerKey || this.#getOwnerPeerKey() || null,
+      announce: entry.announce ?? null,
+      priority: Number.isFinite(entry.priority) ? Math.trunc(entry.priority) : null
     };
     if (entry.type === 'relay') {
       const context = entry.context || {};
@@ -984,12 +1006,14 @@ export default class BlindPeeringManager extends EventEmitter {
         relayKey: context.relayKey || entry.identifier,
         publicIdentifier: context.publicIdentifier || null,
         lastWriterCount: relayCoreRefs.length || null,
-        announce: !!context.announce,
         coreRefs: relayCoreRefs,
         context: {
           relayKey: context.relayKey || entry.identifier,
           publicIdentifier: context.publicIdentifier || null,
-          coreRefs: relayCoreRefs
+          coreRefs: relayCoreRefs,
+          announce: context.announce ?? base.announce,
+          priority: Number.isFinite(context.priority) ? Math.trunc(context.priority) : base.priority,
+          ownerPeerKey: base.ownerPeerKey
         }
       };
     }
@@ -1002,12 +1026,14 @@ export default class BlindPeeringManager extends EventEmitter {
         ...base,
         driveKey: context.driveKey || entry.identifier,
         isPfp: !!context.isPfp,
-        announce: true,
         coreRefs: driveCoreRefs,
         context: {
           driveKey: context.driveKey || entry.identifier,
           isPfp: !!context.isPfp,
-          coreRefs: driveCoreRefs
+          coreRefs: driveCoreRefs,
+          announce: context.announce ?? base.announce ?? true,
+          priority: Number.isFinite(context.priority) ? Math.trunc(context.priority) : base.priority,
+          ownerPeerKey: base.ownerPeerKey
         }
       };
     }
@@ -1055,5 +1081,21 @@ export default class BlindPeeringManager extends EventEmitter {
     const factor = 2 ** Math.max(0, attempt - 1);
     const delay = this.backoffConfig.initialDelayMs * factor;
     return Math.min(delay, this.backoffConfig.maxDelayMs);
+  }
+
+  #getOwnerPeerKey() {
+    if (this.ownerPeerKey) return this.ownerPeerKey;
+    const keyBuffer = this.runtime?.swarmKeyPair?.publicKey;
+    if (!keyBuffer) return null;
+    try {
+      this.ownerPeerKey = HypercoreId.encode(keyBuffer);
+    } catch (_) {
+      try {
+        this.ownerPeerKey = Buffer.from(keyBuffer).toString('hex');
+      } catch (_) {
+        this.ownerPeerKey = null;
+      }
+    }
+    return this.ownerPeerKey;
   }
 }

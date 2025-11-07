@@ -81,6 +81,18 @@ const blindPeerEvictionsCounter = new client.Counter({
   labelNames: ['reason']
 });
 
+const blindPeerMirrorStateGauge = new client.Gauge({
+  name: 'gateway_blind_peer_mirror_state',
+  help: 'Mirror readiness state (1 = healthy, 0 = stale)',
+  labelNames: ['identifier', 'owner', 'type']
+});
+
+const blindPeerMirrorLagGauge = new client.Gauge({
+  name: 'gateway_blind_peer_mirror_lag_ms',
+  help: 'Lag in milliseconds since the mirror last reported activity',
+  labelNames: ['identifier', 'owner', 'type']
+});
+
 register.registerMetric(sessionGauge);
 register.registerMetric(peerGauge);
 register.registerMetric(requestCounter);
@@ -95,6 +107,8 @@ register.registerMetric(blindPeerTrustedPeersGauge);
 register.registerMetric(blindPeerBytesGauge);
 register.registerMetric(blindPeerGcRunsCounter);
 register.registerMetric(blindPeerEvictionsCounter);
+register.registerMetric(blindPeerMirrorStateGauge);
+register.registerMetric(blindPeerMirrorLagGauge);
 
 function metricsMiddleware(path = '/metrics') {
   return async (req, res, next) => {
@@ -124,5 +138,7 @@ export {
   blindPeerBytesGauge,
   blindPeerGcRunsCounter,
   blindPeerEvictionsCounter,
+  blindPeerMirrorStateGauge,
+  blindPeerMirrorLagGauge,
   metricsMiddleware
 };

@@ -4,6 +4,7 @@ import { resolve, dirname } from 'node:path';
 import HypercoreId from 'hypercore-id-encoding';
 
 const DEFAULT_STORAGE_SUBDIR = 'blind-peer-data';
+const DEFAULT_MIRROR_STALE_THRESHOLD_MS = 10 * 60 * 1000;
 
 async function loadBlindPeerModule() {
   const mod = await import('blind-peer');
@@ -124,6 +125,11 @@ export default class BlindPeerService extends EventEmitter {
       : null;
     this.metadataDirty = false;
     this.metadataSaveTimer = null;
+    const readinessCandidate = this.config?.mirror?.staleThresholdMs ?? this.config?.mirrorStaleThresholdMs;
+    const readinessValue = Number(readinessCandidate);
+    this.mirrorStaleThresholdMs = Number.isFinite(readinessValue) && readinessValue > 0
+      ? Math.trunc(readinessValue)
+      : DEFAULT_MIRROR_STALE_THRESHOLD_MS;
   }
 
   async initialize() {
@@ -447,6 +453,10 @@ export default class BlindPeerService extends EventEmitter {
     return this.blindPeer ? toKeyString(this.blindPeer.encryptionPublicKey) : null;
   }
 
+  getCorestore() {
+    return this.blindPeer?.store || null;
+  }
+
   isTrustedPeer(peerKey) {
     const sanitized = sanitizePeerKey(peerKey);
     if (!sanitized) return false;
@@ -481,6 +491,10 @@ export default class BlindPeerService extends EventEmitter {
       ? Math.trunc(options.coresPerOwner)
       : 0;
     const includeCores = options.includeCores === true && coresPerOwner !== 0;
+    const mirrorLimit = Number.isFinite(options.mirrorLimit) && options.mirrorLimit > 0
+      ? Math.trunc(options.mirrorLimit)
+      : 50;
+    const includeMirrorCores = options.includeMirrorCores === true;
     return {
       enabled: !!this.config.enabled,
       running: this.running,
@@ -498,6 +512,10 @@ export default class BlindPeerService extends EventEmitter {
         ownerLimit,
         includeCores,
         coresPerOwner: includeCores ? coresPerOwner : 0
+      }),
+      mirrors: this.getMirrorReadinessSnapshot({
+        includeCores: includeMirrorCores,
+        limit: mirrorLimit
       }),
       dispatcherAssignments: this.getDispatcherAssignmentsSnapshot(),
       config: {
@@ -569,6 +587,7 @@ export default class BlindPeerService extends EventEmitter {
           owners,
           identifiers,
           primaryIdentifier: typeof entry.primaryIdentifier === 'string' ? entry.primaryIdentifier : null,
+          type: typeof entry.type === 'string' ? entry.type : null,
           firstSeen: Number.isFinite(entry.firstSeen) ? Math.trunc(entry.firstSeen) : Date.now(),
           lastUpdated: Number.isFinite(entry.lastUpdated) ? Math.trunc(entry.lastUpdated) : Date.now(),
           priority: this.#normalizeMetadataPriority(entry.priority),
@@ -606,6 +625,7 @@ export default class BlindPeerService extends EventEmitter {
         entries.push({
           key: entry.key,
           primaryIdentifier: entry.primaryIdentifier || null,
+          type: entry.type || null,
           announce: entry.announce === true,
           priority: this.#normalizeMetadataPriority(entry.priority),
           firstSeen: entry.firstSeen || null,
@@ -959,7 +979,8 @@ export default class BlindPeerService extends EventEmitter {
       priority: this.#normalizeMetadataPriority(metadata.priority),
       lastSeen: metadata.lastSeenAt && Number.isFinite(metadata.lastSeenAt)
         ? Math.trunc(metadata.lastSeenAt)
-        : Date.now()
+        : Date.now(),
+      announce: metadata.announce === true
     };
     entry.owners.set(ownerId, ownerInfo);
 
@@ -1001,6 +1022,9 @@ export default class BlindPeerService extends EventEmitter {
       if (metadata.announce === true) {
         existing.announce = true;
       }
+      if (typeof metadata.type === 'string' && metadata.type.trim()) {
+        existing.type = metadata.type.trim();
+      }
       if (Number.isFinite(metadata.lastActive)) {
         const activeVal = Math.trunc(metadata.lastActive);
         if (!existing.lastActive || activeVal > existing.lastActive) {
@@ -1018,6 +1042,7 @@ export default class BlindPeerService extends EventEmitter {
       owners: new Map(),
       identifiers: new Set(),
       primaryIdentifier: typeof metadata.identifier === 'string' ? metadata.identifier.trim() || null : null,
+      type: typeof metadata.type === 'string' ? metadata.type.trim() : null,
       firstSeen: now,
       lastUpdated: now,
       priority: this.#normalizeMetadataPriority(metadata.priority),
@@ -1048,7 +1073,7 @@ export default class BlindPeerService extends EventEmitter {
     const ownerPeerKey = stream?.remotePublicKey ? toKeyString(stream.remotePublicKey) : null;
     const identifier = record?.referrer ? toKeyString(record.referrer) : null;
 
-    this.#recordCoreMetadata(record.key, {
+    const metadataEntry = this.#recordCoreMetadata(record.key, {
       ownerPeerKey,
       priority: record?.priority,
       identifier,
@@ -1067,11 +1092,24 @@ export default class BlindPeerService extends EventEmitter {
         sourceEvent: context?.event || null
       });
     }
+
+    this.emit('mirror-added', {
+      coreKey: toKeyString(record.key),
+      ownerPeerKey,
+      identifier,
+      type: metadataEntry?.type || context?.type || null,
+      priority: record?.priority ?? metadataEntry?.priority ?? null,
+      announce: record?.announce === true || metadataEntry?.announce === true,
+      lastSeenAt: Date.now(),
+      healthy: true,
+      metadataSummary: this.#summarizeMetadata(metadataEntry)
+    });
   }
 
   #onBlindPeerDeleteCore(info = {}, { stream } = {}) {
     if (!info?.key) return;
     const keyStr = toKeyString(info.key);
+    const metadataEntry = this.coreMetadata.get(keyStr) || null;
     this.#removeCoreMetadata(info.key);
     if (this.logger?.debug) {
       this.logger.debug('[BlindPeer] Mirror removed', {
@@ -1080,6 +1118,13 @@ export default class BlindPeerService extends EventEmitter {
         existing: info?.existing ?? null
       });
     }
+
+    this.emit('mirror-removed', {
+      coreKey: keyStr,
+      ownerPeerKey: stream?.remotePublicKey ? toKeyString(stream.remotePublicKey) : null,
+      identifier: metadataEntry?.primaryIdentifier || null,
+      metadataSummary: this.#summarizeMetadata(metadataEntry)
+    });
   }
 
   #collectOwnershipMap() {
@@ -1250,6 +1295,117 @@ export default class BlindPeerService extends EventEmitter {
     return result;
   }
 
+  getMirrorReadinessSnapshot({ includeCores = false, limit = 50, staleThresholdMs } = {}) {
+    const now = Date.now();
+    const thresholdValue = Number.isFinite(staleThresholdMs) && staleThresholdMs > 0
+      ? Math.trunc(staleThresholdMs)
+      : this.mirrorStaleThresholdMs;
+    const readiness = new Map();
+
+    for (const entry of this.coreMetadata.values()) {
+      const identifier = this.#selectMetadataIdentifier(entry) || entry.key;
+      const entryLastActive = entry.lastActive || entry.lastUpdated || entry.firstSeen || now;
+      for (const [ownerId, ownerInfo] of entry.owners.entries()) {
+        const ownerKey = ownerInfo.ownerPeerKey || ownerId;
+        const mapKey = `${identifier}:${ownerKey}`;
+        let record = readiness.get(mapKey);
+        if (!record) {
+          record = {
+            identifier,
+            ownerPeerKey: ownerInfo.ownerPeerKey || null,
+            ownerAlias: ownerInfo.ownerPeerKey ? null : ownerId,
+            type: ownerInfo.type || entry.type || null,
+            totalCores: 0,
+            announcedCount: 0,
+            priorityMax: null,
+            priorityMin: null,
+            lastActive: 0,
+            lastUpdated: 0,
+            cores: [],
+          };
+          readiness.set(mapKey, record);
+        }
+
+        const effectivePriority = this.#normalizeMetadataPriority(
+          ownerInfo.priority ?? entry.priority
+        );
+        record.coreKeys = record.coreKeys || new Set();
+        record.announcedKeys = record.announcedKeys || new Set();
+        if (entry.key) {
+          record.coreKeys.add(entry.key);
+          if (entry.announce === true || ownerInfo.announce === true) {
+            record.announcedKeys.add(entry.key);
+          }
+        }
+        record.totalCores = record.coreKeys.size;
+        record.announcedCount = record.announcedKeys.size;
+        record.lastActive = Math.max(record.lastActive || 0, entryLastActive || 0);
+        record.lastUpdated = Math.max(record.lastUpdated || 0, entry.lastUpdated || 0);
+        if (Number.isFinite(effectivePriority)) {
+          record.priorityMax = record.priorityMax === null
+            ? effectivePriority
+            : Math.max(record.priorityMax, effectivePriority);
+          record.priorityMin = record.priorityMin === null
+            ? effectivePriority
+            : Math.min(record.priorityMin, effectivePriority);
+        }
+        if (includeCores) {
+          record.cores.push({
+            key: entry.key,
+            priority: effectivePriority,
+            announced: entry.announce === true,
+            lastActive: entry.lastActive || null,
+            lastUpdated: entry.lastUpdated || null,
+            firstSeen: entry.firstSeen || null
+          });
+        }
+      }
+    }
+
+    const snapshot = [];
+    for (const record of readiness.values()) {
+      const referenceTs = record.lastActive || record.lastUpdated || null;
+      const lagMs = referenceTs ? Math.max(0, now - referenceTs) : null;
+      const healthy = lagMs === null ? false : lagMs <= thresholdValue;
+      const firstCoreKey = record.coreKeys instanceof Set
+        ? (record.coreKeys.values().next().value || null)
+        : null;
+      const payload = {
+        identifier: record.identifier,
+        ownerPeerKey: record.ownerPeerKey,
+        ownerAlias: record.ownerAlias,
+        type: record.type,
+        totalCores: record.coreKeys instanceof Set ? record.coreKeys.size : record.totalCores,
+        announcedCount: record.announcedCount,
+        priorityMax: record.priorityMax,
+        priorityMin: record.priorityMin,
+        lastActive: referenceTs,
+        lastUpdated: record.lastUpdated || null,
+        lagMs,
+        healthy
+      };
+      if (firstCoreKey) {
+        payload.coreKey = firstCoreKey;
+      }
+      if (includeCores) {
+        payload.cores = record.cores
+          .slice()
+          .sort((a, b) => (b.lastActive || 0) - (a.lastActive || 0));
+      }
+      snapshot.push(payload);
+    }
+
+    snapshot.sort((a, b) => {
+      if (b.totalCores !== a.totalCores) return b.totalCores - a.totalCores;
+      return (b.lastActive || 0) - (a.lastActive || 0);
+    });
+
+    if (Number.isFinite(limit) && limit > 0 && snapshot.length > limit) {
+      return snapshot.slice(0, Math.trunc(limit));
+    }
+    return snapshot;
+  }
+
   #getHygieneSummary() {
     return {
       intervalMs: this.config.gcIntervalMs,
@@ -1261,6 +1417,18 @@ export default class BlindPeerService extends EventEmitter {
       lastBytesFreed: this.hygieneStats.lastBytesFreed,
       lastResult: this.hygieneStats.lastResult,
       lastError: this.hygieneStats.lastError
+    };
+  }
+
+  #summarizeMetadata(entry) {
+    if (!entry || typeof entry !== 'object') return null;
+    return {
+      primaryIdentifier: entry.primaryIdentifier || null,
+      announce: entry.announce === true,
+      priority: this.#normalizeMetadataPriority(entry.priority),
+      lastActive: entry.lastActive || null,
+      type: entry.type || null,
+      ownerCount: entry.owners instanceof Map ? entry.owners.size : null
     };
   }
 
@@ -1320,6 +1488,11 @@ export default class BlindPeerService extends EventEmitter {
     const bytes = this.blindPeer?.digest?.bytesAllocated ?? 0;
     this.metrics.setBytesAllocated?.(bytes);
     this.#updateTrustedPeers();
+    const snapshot = this.getMirrorReadinessSnapshot({
+      includeCores: false,
+      limit: Number.POSITIVE_INFINITY
+    });
+    this.metrics.updateMirrorState?.(snapshot);
   }
 
   #updateTrustedPeers() {
