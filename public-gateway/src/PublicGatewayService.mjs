@@ -7,9 +7,18 @@ import WebSocket, { WebSocketServer } from 'ws';
 import helmet from 'helmet';
 import rateLimit from 'express-rate-limit';
 
+function sanitizeSegment(value = '') {
+  if (!value || typeof value !== 'string') return '';
+  return value.trim()
+    .replace(/^[./\\]+/, '')
+    .replace(/\.\./g, '')
+    .replace(/[^a-zA-Z0-9._:-]/g, '_');
+}
+
 import {
   EnhancedHyperswarmPool,
   forwardMessageToPeerHyperswarm,
+  forwardRequestToPeer,
   getEventsFromPeerHyperswarm,
   requestFileFromPeer
 } from '../../shared/public-gateway/HyperswarmClient.mjs';
@@ -26,6 +35,10 @@ import {
   relayEventCounter,
   relayReqCounter,
   relayErrorCounter,
+  relayFallbackReadCounter,
+  relayFallbackWriteCounter,
+  relayReplicaSessionsGauge,
+  relayFallbackDurationHistogram,
   relayTokenIssueCounter,
   relayTokenRefreshCounter,
   relayTokenRevocationCounter,
@@ -36,8 +49,16 @@ import {
   blindPeerEvictionsCounter,
   blindPeerMirrorStateGauge,
   blindPeerMirrorLagGauge,
+  pendingWritesGauge,
+  pendingWritePushCounter,
+  pendingWritePushWaitHistogram,
   escrowUnlockCounter,
-  escrowLeaseGauge
+  escrowLeaseGauge,
+  escrowLeaseRotationCounter,
+  escrowPolicyRejectionCounter,
+  escrowLeaseLagHistogram,
+  escrowLeaseExpiryGauge,
+  gatewayReplicaFallbackCounter
 } from './metrics.mjs';
 import MemoryRegistrationStore from './stores/MemoryRegistrationStore.mjs';
 import MessageQueue from './utils/MessageQueue.mjs';
@@ -51,6 +72,8 @@ import { openHyperbeeReplicationChannel } from '../../shared/public-gateway/hype
 import BlindPeerService from './blind-peer/BlindPeerService.mjs';
 import BlindPeerReplicaManager from './blind-peer/BlindPeerReplicaManager.mjs';
 import AutobaseKeyEscrowCoordinator from './escrow/AutobaseKeyEscrowCoordinator.mjs';
+import GatewayHyperdriveManager from './hyperdrive/GatewayHyperdriveManager.mjs';
+import GatewayPendingWritePushService from './services/GatewayPendingWritePushService.mjs';
 
 const DELEGATION_FALLBACK_MS = 1500;
 
@@ -128,6 +151,10 @@ class PublicGatewayService {
       onHealth: this.#onPoolConnectionHealth.bind(this),
       handshakeBuilder: this.#buildHandshakePayload.bind(this)
     });
+    this.leaseHealth = new Map();
+    this.leaseMonitorHandlers = null;
+    this.leaseWarningThresholdMs = Number(this.config?.escrow?.warningThresholdMs) || 120000;
+    this.leaseHealthInterval = null;
 
     this.sessions = new Map();
     this.healthInterval = null;
@@ -141,6 +168,7 @@ class PublicGatewayService {
     this.publicGatewayStatusUpdatedAt = null;
     this.blindPeerService = null;
     this.blindPeerReplicaManager = null;
+    this.hyperdriveManager = null;
     this.dispatcherAssignments = new Map();
     this.dispatcherAssignmentTimers = new Map();
     this.dispatcherListeners = [];
@@ -181,6 +209,11 @@ class PublicGatewayService {
         }
       }
     };
+    this.gatewayLeaseLagStats = {
+      count: 0,
+      totalMs: 0,
+      lastMs: null
+    };
     this.escrowCoordinator = null;
     this.escrowMetrics = {
       recordUnlock: (result) => {
@@ -190,8 +223,37 @@ class PublicGatewayService {
       setLeaseState: (relayKey, active) => {
         if (!relayKey) return;
         escrowLeaseGauge.labels(relayKey).set(active ? 1 : 0);
+      },
+      recordPolicyRejection: (reasons) => {
+        const list = Array.isArray(reasons) && reasons.length ? reasons : ['unknown'];
+        for (const reason of list) {
+          const label = typeof reason === 'string' && reason.trim().length ? reason.trim() : 'unknown';
+          escrowPolicyRejectionCounter.labels(label).inc();
+        }
       }
     };
+    this.pendingWriteMetrics = {
+      setRelayState: (relayKey, active) => {
+        if (!relayKey) return;
+        pendingWritesGauge.labels(relayKey).set(active ? 1 : 0);
+      },
+      recordPushResult: (result) => {
+        const label = typeof result === 'string' && result.trim().length ? result.trim() : 'unknown';
+        pendingWritePushCounter.labels(label).inc();
+      },
+      observeAckDelay: (relayKey, seconds) => {
+        if (!relayKey || !Number.isFinite(seconds) || seconds < 0) return;
+        pendingWritePushWaitHistogram.labels(relayKey).observe(seconds);
+      }
+    };
+    this.pendingWritePushService = new GatewayPendingWritePushService({
+      connectionPool: this.connectionPool,
+      registrationStore: this.registrationStore,
+      peerResolver: this.getRelayPeerContext.bind(this),
+      leaseProvider: (relayKey) => this.#getLeaseSummary(relayKey),
+      metrics: this.pendingWriteMetrics,
+      logger: this.logger
+    });
 
     if (this.dispatcher) {
       const assignmentListener = (event) => this.#handleDispatcherAssignment(event);
@@ -235,6 +297,15 @@ class PublicGatewayService {
       });
       await this.blindPeerService.initialize();
       await this.#initializeBlindPeerReplicaManager();
+      const hyperdriveLogger = this.logger?.child
+        ? this.logger.child({ module: 'GatewayHyperdriveManager' })
+        : this.logger;
+      this.hyperdriveManager = new GatewayHyperdriveManager({
+        storageDir: this.config?.hyperdrive?.storageDir,
+        blindPeerService: this.blindPeerService,
+        logger: hyperdriveLogger
+      });
+      await this.hyperdriveManager.initialize();
     }
     if (this.config?.escrow?.enabled) {
       const escrowLogger = this.logger?.child
@@ -247,6 +318,7 @@ class PublicGatewayService {
         replicaManager: this.blindPeerReplicaManager
       });
       await this.escrowCoordinator.initialize();
+      this.#initializeLeaseMonitor();
     }
     this.logger.info('PublicGatewayService initialized');
   }
@@ -341,6 +413,9 @@ class PublicGatewayService {
     await this.blindPeerService?.stop();
     await this.blindPeerReplicaManager?.stop();
     this.blindPeerReplicaManager = null;
+    await this.hyperdriveManager?.stop();
+    this.hyperdriveManager = null;
+    await this.pendingWritePushService?.stop?.();
 
     for (const timer of this.dispatcherAssignmentTimers.values()) {
       clearTimeout(timer);
@@ -358,6 +433,16 @@ class PublicGatewayService {
     this.peerRawPublicKeys.clear();
     this.peerMetadata.clear();
     await this.escrowCoordinator?.stop?.();
+    if (this.leaseMonitorHandlers && this.escrowCoordinator) {
+      const { issued, released } = this.leaseMonitorHandlers;
+      if (issued) this.escrowCoordinator.off('lease-issued', issued);
+      if (released) this.escrowCoordinator.off('lease-released', released);
+    }
+    this.leaseMonitorHandlers = null;
+    if (this.leaseHealthInterval) {
+      clearInterval(this.leaseHealthInterval);
+      this.leaseHealthInterval = null;
+    }
     this.escrowCoordinator = null;
 
     await this.connectionPool.destroy();
@@ -388,7 +473,10 @@ class PublicGatewayService {
     app.post('/api/blind-peer/gc', (req, res) => this.#handleBlindPeerGc(req, res));
     app.delete('/api/blind-peer/mirrors/:key', (req, res) => this.#handleBlindPeerDelete(req, res));
     app.post('/api/escrow/leases/query', (req, res) => this.#handleEscrowLeaseQuery(req, res));
+    app.get('/api/escrow/leases/query', (req, res) => this.#handleEscrowLeaseQuery(req, res));
+    app.get('/api/escrow/leases', (req, res) => this.#handleEscrowLeaseQuery(req, res));
     app.post('/api/escrow/leases/:relayKey/request', (req, res) => this.#handleEscrowLeaseRequest(req, res));
+    app.post('/api/relays/:relayKey/escrow/revoke', (req, res) => this.#handleEscrowLeaseRevoke(req, res));
 
     app.get('/health', (_req, res) => {
       res.json({ status: 'ok' });
@@ -400,8 +488,9 @@ class PublicGatewayService {
 
     app.get('/drive/:identifier/:file', async (req, res) => {
       const { identifier, file } = req.params;
+      let target = null;
       try {
-        const target = await this.#resolveRelayTarget(identifier);
+        target = await this.#resolveRelayTarget(identifier);
         if (!target) {
           this.logger.warn?.('Drive request for unknown relay identifier', { identifier, file });
           return res.status(404).json({ error: 'Relay not registered with gateway' });
@@ -445,6 +534,22 @@ class PublicGatewayService {
         res.status(statusCode);
         bodyStream.pipe(res);
       } catch (error) {
+        const fallbackIdentifier = target?.driveIdentifier || identifier;
+        const fallback = await this.#readGatewayDriveFile(fallbackIdentifier, file);
+        if (fallback) {
+          this.logger.info?.('[PublicGateway] Served drive file from gateway hyperdrive', {
+            identifier: fallbackIdentifier,
+            file
+          });
+          Object.entries(fallback.headers || {}).forEach(([key, value]) => {
+            if (value !== undefined) {
+              res.setHeader(key, value);
+            }
+          });
+          res.status(fallback.statusCode || 200);
+          res.send(fallback.buffer);
+          return;
+        }
         const statusCode = Number.isInteger(error?.statusCode) ? error.statusCode : 500;
         this.logger.error?.({
           identifier,
@@ -459,8 +564,68 @@ class PublicGatewayService {
         }
       }
     });
+    app.put('/drive/:identifier/:file', express.raw({ type: '*/*', limit: '64mb' }), async (req, res) => {
+      const { identifier, file } = req.params;
+      const target = await this.#resolveRelayTarget(identifier);
+      if (!target) {
+        return res.status(404).json({ error: 'Relay not registered with gateway' });
+      }
+      if (!this.hyperdriveManager) {
+        return res.status(503).json({ error: 'gateway-drive-unavailable' });
+      }
+      const payload = Buffer.isBuffer(req.body) ? req.body : Buffer.from(req.body || '');
+      if (!payload.length) {
+        return res.status(400).json({ error: 'Empty payload' });
+      }
+      const token = req.query?.token || req.headers['x-relay-token'];
+      if (!token) {
+        return res.status(401).json({ error: 'token-required' });
+      }
+      const tokenValidation = await this.#validateToken(token, target.relayKey);
+      if (!tokenValidation) {
+        return res.status(403).json({ error: 'invalid-token' });
+      }
+      try {
+        const driveWrite = await this.#storeGatewayDriveUpload(target.relayKey, target.driveIdentifier, file, payload, {
+          contentType: req.headers['content-type'] || null
+        });
+        await this.#markGatewayPendingWrites(target.relayKey, {
+          type: 'drive-upload',
+          driveIdentifier: driveWrite?.identifier || target.driveIdentifier,
+          driveVersion: driveWrite?.version ?? null
+        });
+        res.status(202).json({
+          status: 'stored',
+          mode: 'gateway-drive',
+          relayKey: target.relayKey,
+          driveVersion: driveWrite?.version ?? null
+        });
+      } catch (error) {
+        this.logger.error?.('[PublicGateway] Drive upload failed', {
+          identifier,
+          file,
+          error: error?.message || error
+        });
+        if (error?.statusCode === 425 || error?.message === 'gateway-escrow-lease-missing') {
+          res.status(425).json({ error: 'gateway-escrow-lease-missing' });
+        } else {
+          res.status(500).json({ error: error?.message || 'drive-upload-failed' });
+        }
+      }
+    });
+    app.get('/pfp/:file', (req, res) => this.#handlePfpRequest(req, res));
+    app.get('/pfp/:owner/:file', (req, res) => this.#handlePfpRequest(req, res));
+
+    app.post('/post/join/:identifier', async (req, res) => {
+      await this.#handleJoinRequest(req, res);
+    });
+
+    app.post('/callback/finalize-auth/:identifier', async (req, res) => {
+      await this.#handleFinalizeAuth(req, res);
+    });
 
     app.post('/api/relays', (req, res) => this.#handleRelayRegistration(req, res));
+    app.post('/api/relays/:relayKey/resync-complete', (req, res) => this.#handleRelayResyncComplete(req, res));
     app.delete('/api/relays/:relayKey', (req, res) => this.#handleRelayDeletion(req, res));
 
     app.post('/api/relay-tokens/issue', (req, res) => this.#handleTokenIssue(req, res));
@@ -493,6 +658,9 @@ class PublicGatewayService {
       await this.blindPeerReplicaManager.initialize({
         blindPeerService: this.blindPeerService
       });
+      if (this.relayWebsocketController) {
+        this.relayWebsocketController.setReplicaManager(this.blindPeerReplicaManager);
+      }
     } catch (error) {
       this.logger?.warn?.('[PublicGateway] Failed to initialize BlindPeerReplicaManager', {
         error: error?.message || error
@@ -622,12 +790,21 @@ class PublicGatewayService {
       relayHost: host,
       hyperbeeAdapter: this.hyperbeeAdapter,
       dispatcher: this.dispatcher,
+      replicaManager: this.blindPeerReplicaManager,
       logger: this.logger,
       featureFlags: this.featureFlags,
       metrics: {
         eventCounter: relayEventCounter,
         reqCounter: relayReqCounter,
-        errorCounter: relayErrorCounter
+        errorCounter: relayErrorCounter,
+        fallbackReadCounter: relayFallbackReadCounter,
+        fallbackWriteCounter: relayFallbackWriteCounter,
+        replicaSessionGauge: relayReplicaSessionsGauge,
+        fallbackDurationHistogram: relayFallbackDurationHistogram,
+        replicaFallbackCounter: gatewayReplicaFallbackCounter
+      },
+      onReplicaWrite: (targetRelayKey, context = {}) => {
+        this.#markGatewayPendingWrites(targetRelayKey || this.internalRelayKey, context);
       },
       legacyForward: (session, message, preferredPeer, context = {}) => this.#forwardLegacyMessage(session, message, preferredPeer, context)
     });
@@ -831,6 +1008,7 @@ class PublicGatewayService {
       || registration?.gatewayReplica?.delegateReqToPeers === true;
 
     const availablePeers = this.#getUsablePeersFromRegistration(registration);
+    const hasReplica = this.#hasReplicaForRelay(registration);
     this.logger.info?.('Initializing websocket session - relay registration fetched', {
       relayKey,
       peerCount: availablePeers.length,
@@ -838,12 +1016,12 @@ class PublicGatewayService {
     });
 
     const selection = this.#selectPeer({ ...registration, peers: availablePeers });
-    const supportsLocal = this.#supportsLocalRelay(registration);
+    const supportsLocalRelay = this.#supportsLocalRelay(registration);
 
     let peerKey = null;
     let peers = availablePeers;
     let peerIndex = 0;
-    const localOnly = !selection && supportsLocal;
+    const localOnly = !selection && (supportsLocalRelay || hasReplica);
 
     if (selection) {
       peerKey = selection.peerKey;
@@ -877,7 +1055,8 @@ class PublicGatewayService {
         throw err;
       }
     } else if (localOnly) {
-      this.logger.info?.('WebSocket session using local Hyperbee host', { relayKey });
+      const mode = supportsLocalRelay ? 'local-relay-host' : hasReplica ? 'blind-peer-replica' : 'local';
+      this.logger.info?.('WebSocket session using local handling', { relayKey, mode });
     }
 
     const connectionKey = this.#generateConnectionKey();
@@ -894,6 +1073,13 @@ class PublicGatewayService {
       peers,
       peerIndex,
       localOnly,
+      useHyperbeeHost: supportsLocalRelay,
+      replicaEligible: hasReplica,
+      replicaMode: false,
+      ownerPeerKey: registration?.ownerPeerKey
+        || registration?.metadata?.ownerPeerKey
+        || registration?.metadata?.owner?.peerKey
+        || null,
       delegateReqToPeers,
       messageQueue: new MessageQueue(),
       openedAt: Date.now(),
@@ -1492,6 +1678,215 @@ class PublicGatewayService {
     return metadata.isGatewayReplica === true;
   }
 
+  async #markGatewayPendingWrites(relayKey, context = {}) {
+    if (!relayKey || !this.registrationStore?.getRelay) return;
+    try {
+      const registration = await this.registrationStore.getRelay(relayKey);
+      if (!registration) return;
+      const metadata = { ...(registration.metadata || {}) };
+      const normalizedReason = this.#normalizePendingReason(context.reason || context.type);
+      const pendingType = this.#normalizePendingType(context.type);
+      const driveIdentifier = typeof context.driveIdentifier === 'string' && context.driveIdentifier.trim().length
+        ? context.driveIdentifier.trim()
+        : null;
+      const driveVersion = Number.isFinite(context.driveVersion)
+        ? context.driveVersion
+        : null;
+
+      metadata.gatewayPendingWrites = true;
+      metadata.gatewayPendingReason = normalizedReason;
+      metadata.gatewayPendingUpdatedAt = Date.now();
+      metadata.gatewayPendingSince = metadata.gatewayPendingSince || metadata.gatewayPendingUpdatedAt;
+
+      const mergedTypes = this.#mergePendingTypes(metadata.gatewayPendingTypes, pendingType);
+      if (mergedTypes?.length) {
+        metadata.gatewayPendingTypes = mergedTypes;
+      } else {
+        delete metadata.gatewayPendingTypes;
+      }
+
+      if (driveIdentifier) {
+        metadata.gatewayPendingDriveIdentifier = driveIdentifier;
+      }
+      if (driveVersion !== null) {
+        metadata.gatewayDriveVersion = driveVersion;
+      } else if (!Number.isFinite(metadata.gatewayDriveVersion)) {
+        metadata.gatewayDriveVersion = metadata.gatewayPendingUpdatedAt;
+      }
+      const leaseSummary = this.#getLeaseSummary(relayKey);
+      if (leaseSummary) {
+        metadata.gatewayLeaseVersion = leaseSummary.leaseVersion ?? null;
+        metadata.gatewayLeaseActive = leaseSummary.leaseActive === true;
+      } else {
+        delete metadata.gatewayLeaseVersion;
+        delete metadata.gatewayLeaseActive;
+      }
+
+      registration.metadata = metadata;
+      this.#updateLeaseReplicaState(relayKey, { peersOnline: 0 });
+      await this.registrationStore.upsertRelay(relayKey, registration);
+      this.pendingWriteMetrics?.setRelayState(relayKey, true);
+      this.pendingWritePushService?.notifyPending(relayKey, metadata);
+    } catch (error) {
+      this.logger?.debug?.('[PublicGateway] Failed to mark gateway pending writes', {
+        relayKey,
+        error: error?.message || error
+      });
+    }
+  }
+
+  async getRelayPeerContext(relayKey) {
+    if (!relayKey || !this.registrationStore?.getRelay) {
+      return { registration: null, peers: [] };
+    }
+    try {
+      const registration = await this.registrationStore.getRelay(relayKey);
+      if (!registration) {
+        return { registration: null, peers: [] };
+      }
+      const peers = this.#getUsablePeersFromRegistration(registration);
+      return { registration, peers };
+    } catch (error) {
+      this.logger?.debug?.('[PublicGateway] Failed to resolve relay peer context', {
+        relayKey,
+        error: error?.message || error
+      });
+      return { registration: null, peers: [] };
+    }
+  }
+
+  #mergePendingTypes(existing = [], nextType = null) {
+    const base = Array.isArray(existing) ? existing.filter(Boolean) : [];
+    const set = new Set(base);
+    if (nextType) {
+      set.add(nextType);
+    }
+    if (!set.size) {
+      return [];
+    }
+    return Array.from(set).sort();
+  }
+
+  #normalizePendingType(raw) {
+    if (!raw && raw !== 0) return null;
+    const normalized = String(raw).trim().toLowerCase();
+    if (!normalized) return null;
+    return normalized.replace(/[^a-z0-9._-]/g, '-');
+  }
+
+  #normalizePendingReason(raw) {
+    const normalized = this.#normalizePendingType(raw);
+    if (!normalized) return 'replica-write';
+    if (normalized.startsWith('http-')) return 'http-artifact';
+    if (normalized.includes('drive')) return 'drive';
+    if (normalized.includes('autobase') || normalized === 'event') return 'autobase';
+    return normalized;
+  }
+
+  #clearGatewayPendingMetadata(metadata = {}) {
+    delete metadata.gatewayPendingWrites;
+    delete metadata.gatewayPendingReason;
+    delete metadata.gatewayPendingTypes;
+    delete metadata.gatewayPendingSince;
+    delete metadata.gatewayPendingUpdatedAt;
+    delete metadata.gatewayPendingDriveIdentifier;
+    delete metadata.gatewayLeaseVersion;
+    delete metadata.gatewayLeaseActive;
+    return metadata;
+  }
+
+  #buildForwardHeaders(sourceHeaders = {}, overrides = {}) {
+    const hopByHop = new Set(['content-length', 'host', 'connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization', 'te', 'trailers', 'transfer-encoding', 'upgrade']);
+    const headers = {};
+    for (const [key, value] of Object.entries(sourceHeaders || {})) {
+      if (!key) continue;
+      const lower = key.toLowerCase();
+      if (hopByHop.has(lower)) continue;
+      headers[lower] = value;
+    }
+    return { ...headers, ...overrides };
+  }
+
+  async #persistGatewaySubmission(target, category, req) {
+    if (!this.hyperdriveManager) {
+      throw new Error('gateway-drive-unavailable');
+    }
+    await this.#assertWritableLease(target.relayKey);
+    const safeCategory = sanitizeSegment(category || 'artifact') || 'artifact';
+    const fileName = `${safeCategory}/${Date.now()}-${Math.random().toString(36).slice(2)}.json`;
+    const artifact = {
+      category: safeCategory,
+      relayKey: target.relayKey,
+      driveIdentifier: target.driveIdentifier,
+      receivedAt: new Date().toISOString(),
+      headers: this.#redactHeaders(req.headers),
+      query: req.query || {},
+      body: req.body || null
+    };
+    const buffer = Buffer.from(JSON.stringify(artifact, null, 2));
+    const result = await this.hyperdriveManager.writeRelayFile(target.driveIdentifier, fileName, buffer, {
+      metadata: { category: safeCategory }
+    });
+    await this.#markGatewayPendingWrites(target.relayKey, {
+      type: `http-${safeCategory}`,
+      driveIdentifier: result?.identifier || target.driveIdentifier,
+      driveVersion: result?.version ?? null
+    });
+    this.logger?.info?.('[PublicGateway] Persisted offline HTTP submission', {
+      relayKey: target.relayKey,
+      category: safeCategory,
+      path: result?.path || fileName
+    });
+    return result?.path || fileName;
+  }
+
+  #redactHeaders(headers = {}) {
+    const sensitive = new Set(['authorization', 'cookie', 'set-cookie', 'x-relay-token', 'x-signature']);
+    const sanitized = {};
+    for (const [key, value] of Object.entries(headers || {})) {
+      if (!key) continue;
+      const lower = key.toLowerCase();
+      if (sensitive.has(lower)) continue;
+      sanitized[lower] = value;
+    }
+    return sanitized;
+  }
+
+  #relayHttpResponse(res, response) {
+    Object.entries(response.headers || {}).forEach(([key, value]) => {
+      if (value !== undefined) {
+        res.setHeader(key, value);
+      }
+    });
+    res.status(response.statusCode || 200);
+    if (Buffer.isBuffer(response.body) || typeof response.body === 'string') {
+      res.send(response.body);
+    } else if (response.body && typeof response.body.pipe === 'function') {
+      response.body.pipe(res);
+    } else {
+      res.end();
+    }
+  }
+
+  #hasReplicaForRelay(registration) {
+    if (!this.blindPeerReplicaManager || !registration) return false;
+    const identifier = registration.relayKey
+      || registration.identifier
+      || registration.metadata?.identifier
+      || registration.metadata?.publicIdentifier
+      || null;
+    if (!identifier) return false;
+    try {
+      return this.blindPeerReplicaManager.hasReplica(identifier);
+    } catch (error) {
+      this.logger?.debug?.('[PublicGateway] Replica availability check failed', {
+        identifier,
+        error: error?.message || error
+      });
+      return false;
+    }
+  }
+
   #selectPeer(registration) {
     const peers = this.#getUsablePeersFromRegistration(registration);
     if (!peers.length) return null;
@@ -1669,6 +2064,77 @@ class PublicGatewayService {
     }
 
     return null;
+  }
+
+  async #readGatewayDriveFile(identifier, file) {
+    if (!this.hyperdriveManager) return null;
+    try {
+      const buffer = await this.hyperdriveManager.readRelayFile(identifier, file);
+      if (!buffer) return null;
+      return {
+        buffer,
+        headers: { 'content-type': 'application/octet-stream' },
+        statusCode: 200
+      };
+    } catch (error) {
+      this.logger?.debug?.('[PublicGateway] Gateway drive read failed', {
+        identifier,
+        file,
+        error: error?.message || error
+      });
+      return null;
+    }
+  }
+
+  async #storeGatewayDriveUpload(relayKey, identifier, file, buffer, { contentType = null } = {}) {
+    if (!this.hyperdriveManager) {
+      throw new Error('gateway-drive-unavailable');
+    }
+    await this.#assertWritableLease(relayKey);
+    const result = await this.hyperdriveManager.writeRelayFile(identifier, file, buffer, {
+      metadata: {
+        contentType: contentType || undefined
+      }
+    });
+    this.logger?.info?.('[PublicGateway] Stored drive upload in gateway hyperdrive', {
+      relayKey,
+      identifier,
+      file,
+      bytes: buffer?.length || 0,
+      path: result?.path || null
+    });
+    return {
+      identifier: result?.identifier || identifier,
+      version: result?.version ?? null,
+      key: result?.key || null,
+      path: result?.path || file,
+      bytesWritten: result?.bytesWritten ?? buffer?.length ?? 0,
+      discoveryKey: result?.discoveryKey || null,
+      coreLength: result?.coreLength ?? null,
+      coreContiguousLength: result?.coreContiguousLength ?? null,
+      blobLength: result?.blobLength ?? null,
+      blobContiguousLength: result?.blobContiguousLength ?? null
+    };
+  }
+
+  async #readGatewayPfpFile(owner, file) {
+    if (!this.hyperdriveManager) return null;
+    try {
+      const buffer = await this.hyperdriveManager.readPfpFile(owner, file);
+      if (!buffer) return null;
+      return {
+        buffer,
+        headers: { 'content-type': 'application/octet-stream' },
+        statusCode: 200
+      };
+    } catch (error) {
+      this.logger?.debug?.('[PublicGateway] Gateway PFP read failed', {
+        owner,
+        file,
+        error: error?.message || error
+      });
+      return null;
+    }
   }
 
   #extractDriveIdentifier(registration, fallbackKey) {
@@ -2368,6 +2834,7 @@ class PublicGatewayService {
           limit
         }) || [];
       }
+      replicas = this.#decorateReplicaLeaseState(replicas);
       res.json({ replicas });
     } catch (error) {
       this.logger?.error?.('[PublicGateway] Failed to compose blind-peer replica response', {
@@ -2428,13 +2895,17 @@ class PublicGatewayService {
     if (!this.config?.escrow?.enabled || !this.escrowCoordinator) {
       return res.status(503).json({ error: 'escrow-disabled' });
     }
-    const { payload, signature } = req.body || {};
+    const { payload, signature } = this.#extractSignedPayload(req);
     if (!this.#verifySignedPayload(payload, signature)) {
       return res.status(401).json({ error: 'Invalid signature' });
     }
     try {
       const leases = this.escrowCoordinator.getLeaseSummaries();
-      return res.json({ leases });
+      return res.json({
+        leases,
+        leaseHealth: this.#serializeLeaseHealth(),
+        leaseLag: this.#getGatewayLeaseLagStats()
+      });
     } catch (error) {
       this.logger?.warn?.('[PublicGateway] Escrow lease query failed', {
         error: error?.message || error
@@ -2447,7 +2918,7 @@ class PublicGatewayService {
     if (!this.config?.escrow?.enabled || !this.escrowCoordinator) {
       return res.status(503).json({ error: 'escrow-disabled' });
     }
-    const { payload, signature } = req.body || {};
+    const { payload, signature } = this.#extractSignedPayload(req);
     if (!this.#verifySignedPayload(payload, signature)) {
       return res.status(401).json({ error: 'Invalid signature' });
     }
@@ -2471,6 +2942,35 @@ class PublicGatewayService {
     }
   }
 
+  async #handleEscrowLeaseRevoke(req, res) {
+    if (!this.config?.escrow?.enabled || !this.escrowCoordinator) {
+      return res.status(503).json({ error: 'escrow-disabled' });
+    }
+    const { payload, signature } = this.#extractSignedPayload(req);
+    if (!this.#verifySignedPayload(payload, signature)) {
+      return res.status(401).json({ error: 'Invalid signature' });
+    }
+    const relayKey = req.params?.relayKey || payload?.relayKey;
+    if (!relayKey) {
+      return res.status(400).json({ error: 'relayKey-required' });
+    }
+    const reason = payload?.reason || 'manual-api';
+    try {
+      const released = this.escrowCoordinator.releaseLease(relayKey, reason);
+      if (released) {
+        this.logger?.info?.('[PublicGateway] Lease revoked via API', { relayKey, reason });
+      }
+      res.json({ status: released ? 'released' : 'no-op' });
+    } catch (error) {
+      this.logger?.warn?.('[PublicGateway] Escrow lease revoke failed', {
+        relayKey,
+        reason,
+        error: error?.message || error
+      });
+      res.status(500).json({ error: error?.message || 'escrow-revoke-failed' });
+    }
+  }
+
   #verifySignedPayload(payload, signature) {
     if (!this.sharedSecret) return false;
     if (!payload || typeof payload !== 'object' || !signature) return false;
@@ -2480,6 +2980,31 @@ class PublicGatewayService {
       this.logger?.warn?.('Signed payload verification failed', { error: error?.message || error });
       return false;
     }
+  }
+
+  #extractSignedPayload(req) {
+    if (!req) return { payload: null, signature: null };
+    if (req.method === 'GET') {
+      const payloadParam = req.query?.payload;
+      const signature = req.query?.signature;
+      if (!payloadParam || !signature || typeof payloadParam !== 'string') {
+        return { payload: null, signature: null };
+      }
+      try {
+        const parsed = JSON.parse(payloadParam);
+        return { payload: parsed, signature };
+      } catch (error) {
+        this.logger?.warn?.('[PublicGateway] Failed to parse escrow payload from query', {
+          error: error?.message || error
+        });
+        return { payload: null, signature: null };
+      }
+    }
+    const body = req.body || {};
+    return {
+      payload: body.payload,
+      signature: body.signature
+    };
   }
 
   async #handleTokenIssue(req, res) {
@@ -2982,6 +3507,190 @@ class PublicGatewayService {
     } catch (error) {
       this.logger.error?.('Failed to persist relay registration', { relayKey: registration.relayKey, error: error.message });
       return res.status(500).json({ error: 'Failed to persist registration' });
+    }
+  }
+
+  async #handleRelayResyncComplete(req, res) {
+    if (!this.sharedSecret) {
+      return res.status(503).json({ error: 'Registration disabled' });
+    }
+    const relayKey = req.params?.relayKey;
+    if (!relayKey) {
+      return res.status(400).json({ error: 'relayKey param is required' });
+    }
+    const signature = req.headers['x-signature'];
+    if (!signature) {
+      return res.status(401).json({ error: 'Missing signature' });
+    }
+    const valid = verifySignature({ relayKey, action: 'resync-complete' }, signature, this.sharedSecret);
+    if (!valid) {
+      return res.status(401).json({ error: 'Invalid signature' });
+    }
+
+    try {
+      const registration = await this.registrationStore.getRelay(relayKey);
+      if (!registration) {
+        return res.status(404).json({ error: 'Relay not registered with gateway' });
+      }
+      const metadata = this.#clearGatewayPendingMetadata({ ...(registration.metadata || {}) });
+      registration.metadata = metadata;
+      await this.registrationStore.upsertRelay(relayKey, registration);
+      this.#updateLeaseReplicaState(relayKey, { peersOnline: 1 });
+      this.pendingWriteMetrics?.setRelayState(relayKey, false);
+      this.pendingWritePushService?.notifyCleared(relayKey);
+      this.escrowCoordinator?.releaseLease(relayKey, 'worker-resync');
+      res.json({ status: 'ok' });
+    } catch (error) {
+      this.logger.error?.('Failed to mark resync completion', {
+        relayKey,
+        error: error?.message || error
+      });
+      res.status(500).json({ error: 'Failed to update relay state' });
+    }
+  }
+
+  async #handlePfpRequest(req, res) {
+    const owner = req.params.owner || null;
+    const file = req.params.file;
+    const relayHint = req.query?.relay || req.query?.identifier || null;
+
+    if (relayHint) {
+      try {
+        const target = await this.#resolveRelayTarget(relayHint);
+        if (target) {
+          const response = await this.#withRelayPeerKey(target.relayKey, async (peerKey) => {
+            const peer = { publicKey: peerKey };
+            return forwardRequestToPeer(peer, {
+              method: 'GET',
+              path: req.originalUrl || req.url,
+              headers: { accept: req.headers.accept || 'application/octet-stream' }
+            }, this.connectionPool);
+          });
+          if (response) {
+            this.#relayHttpResponse(res, response);
+            return;
+          }
+        }
+      } catch (error) {
+        this.logger?.debug?.('[PublicGateway] Peer PFP fetch failed, falling back', {
+          owner,
+          file,
+          error: error?.message || error
+        });
+      }
+    }
+
+    const fallback = await this.#readGatewayPfpFile(owner, file);
+    if (fallback) {
+      Object.entries(fallback.headers || {}).forEach(([key, value]) => {
+        if (value !== undefined) {
+          res.setHeader(key, value);
+        }
+      });
+      res.status(fallback.statusCode || 200);
+      res.send(fallback.buffer);
+      return;
+    }
+    res.status(404).json({ error: 'Avatar not found' });
+  }
+
+  async #handleJoinRequest(req, res) {
+    const { identifier } = req.params;
+    const target = await this.#resolveRelayTarget(identifier);
+    if (!target) {
+      return res.status(404).json({ error: 'Relay not registered with gateway' });
+    }
+
+    const payloadBody = req.body && typeof req.body === 'object'
+      ? Buffer.from(JSON.stringify(req.body))
+      : Buffer.from(req.body || '{}');
+    const forwardHeaders = this.#buildForwardHeaders(req.headers, { 'content-type': 'application/json' });
+
+    try {
+      const response = await this.#withRelayPeerKey(target.relayKey, async (peerKey) => {
+        const peer = { publicKey: peerKey };
+        return forwardRequestToPeer(peer, {
+          method: 'POST',
+          path: req.originalUrl || req.url,
+          headers: forwardHeaders,
+          body: payloadBody
+        }, this.connectionPool);
+      });
+      if (response) {
+        this.#relayHttpResponse(res, response);
+        return;
+      }
+    } catch (error) {
+      this.logger?.warn?.('[PublicGateway] Join request fallback to gateway drive', {
+        identifier,
+        relayKey: target.relayKey,
+        error: error?.message || error
+      });
+    }
+
+    try {
+      const artifactPath = await this.#persistGatewaySubmission(target, 'join', req);
+      res.status(202).json({ status: 'queued', mode: 'gateway-drive', artifactPath });
+    } catch (error) {
+      this.logger?.error?.('[PublicGateway] Failed to persist join request', {
+        identifier,
+        error: error?.message || error
+      });
+      if (error?.statusCode === 425 || error?.message === 'gateway-escrow-lease-missing') {
+        res.status(425).json({ error: 'gateway-escrow-lease-missing' });
+      } else {
+        res.status(503).json({ error: 'gateway-drive-unavailable' });
+      }
+    }
+  }
+
+  async #handleFinalizeAuth(req, res) {
+    const { identifier } = req.params;
+    const target = await this.#resolveRelayTarget(identifier);
+    if (!target) {
+      return res.status(404).json({ error: 'Relay not registered with gateway' });
+    }
+
+    const payloadBody = req.body && typeof req.body === 'object'
+      ? Buffer.from(JSON.stringify(req.body))
+      : Buffer.from(req.body || '{}');
+    const forwardHeaders = this.#buildForwardHeaders(req.headers, { 'content-type': 'application/json' });
+
+    try {
+      const response = await this.#withRelayPeerKey(target.relayKey, async (peerKey) => {
+        const peer = { publicKey: peerKey };
+        return forwardRequestToPeer(peer, {
+          method: 'POST',
+          path: req.originalUrl || req.url,
+          headers: forwardHeaders,
+          body: payloadBody
+        }, this.connectionPool);
+      });
+      if (response) {
+        this.#relayHttpResponse(res, response);
+        return;
+      }
+    } catch (error) {
+      this.logger?.warn?.('[PublicGateway] Finalize-auth fallback to gateway drive', {
+        identifier,
+        relayKey: target.relayKey,
+        error: error?.message || error
+      });
+    }
+
+    try {
+      const artifactPath = await this.#persistGatewaySubmission(target, 'callback', req);
+      res.status(202).json({ status: 'queued', mode: 'gateway-drive', artifactPath });
+    } catch (error) {
+      this.logger?.error?.('[PublicGateway] Failed to persist callback request', {
+        identifier,
+        error: error?.message || error
+      });
+      if (error?.statusCode === 425 || error?.message === 'gateway-escrow-lease-missing') {
+        res.status(425).json({ error: 'gateway-escrow-lease-missing' });
+      } else {
+        res.status(503).json({ error: 'gateway-drive-unavailable' });
+      }
     }
   }
 
@@ -3535,6 +4244,252 @@ class PublicGatewayService {
         this.#cancelDelegationFallback(session);
       }
     }
+  }
+
+  getPeersWithPfpDrive() {
+    return this.activePeers
+      .filter(peer => !!peer.pfpDriveKey)
+      .map(peer => ({
+        publicKey: peer.publicKey,
+        pfpDriveKey: peer.pfpDriveKey,
+        nostrPubkeyHex: peer.nostr_pubkey_hex || null
+      }));
+  }
+
+  #initializeLeaseMonitor() {
+    if (!this.escrowCoordinator) return;
+    if (this.leaseMonitorHandlers) {
+      const { issued, released } = this.leaseMonitorHandlers;
+      if (issued) this.escrowCoordinator.off('lease-issued', issued);
+      if (released) this.escrowCoordinator.off('lease-released', released);
+    }
+    const issued = (lease) => this.#handleLeaseIssued(lease);
+    const released = (payload) => this.#handleLeaseReleased(payload);
+    this.escrowCoordinator.on('lease-issued', issued);
+    this.escrowCoordinator.on('lease-released', released);
+    this.leaseMonitorHandlers = { issued, released };
+    if (this.leaseHealthInterval) {
+      clearInterval(this.leaseHealthInterval);
+    }
+    this.leaseHealthInterval = setInterval(() => this.#checkLeaseWarnings(), 15000).unref();
+  }
+
+  #getOrCreateLeaseEntry(relayKey) {
+    if (!relayKey) return null;
+    let entry = this.leaseHealth.get(relayKey);
+    if (!entry) {
+      entry = {
+        relayKey,
+        status: 'idle',
+        peersOnline: 0,
+        replicaLagMs: null,
+        lastUpdatedAt: Date.now(),
+        issuedAt: null,
+        expiresAt: null,
+        leaseId: null,
+        escrowId: null,
+        warned: false,
+        warning: null,
+        releasedReason: null,
+        releasedAt: null,
+        leaseVersion: 0,
+        leaseActive: false
+      };
+      this.leaseHealth.set(relayKey, entry);
+      this.#updateLeaseExpiryMetric(entry);
+    }
+    return entry;
+  }
+
+  #handleLeaseIssued(lease) {
+    if (!lease?.relayKey) return;
+    const entry = this.#getOrCreateLeaseEntry(lease.relayKey);
+    entry.status = 'active';
+    entry.leaseId = lease.leaseId || null;
+    entry.escrowId = lease.escrowId || null;
+    entry.issuedAt = lease.issuedAt || Date.now();
+    entry.expiresAt = lease.expiresAt || null;
+    entry.warning = null;
+    entry.warned = false;
+    entry.releasedReason = null;
+    entry.releasedAt = null;
+    entry.leaseVersion = (entry.leaseVersion || 0) + 1;
+    entry.leaseActive = true;
+    entry.lastUpdatedAt = Date.now();
+    this.leaseHealth.set(lease.relayKey, entry);
+    this.#updateLeaseExpiryMetric(entry);
+    this.logger?.info?.('[PublicGateway] Escrow lease issued', {
+      relayKey: lease.relayKey,
+      leaseId: lease.leaseId,
+      expiresAt: lease.expiresAt || null
+    });
+    escrowLeaseRotationCounter.labels('lease-issued', 'success').inc();
+  }
+
+  #handleLeaseReleased(payload = {}) {
+    const relayKey = payload?.relayKey;
+    if (!relayKey) return;
+    const entry = this.#getOrCreateLeaseEntry(relayKey);
+    entry.status = 'released';
+    entry.releasedReason = payload?.reason || 'manual';
+    entry.releasedAt = Date.now();
+    entry.leaseActive = false;
+    entry.lastUpdatedAt = Date.now();
+    this.leaseHealth.set(relayKey, entry);
+    this.#updateLeaseExpiryMetric(entry);
+    if (entry.issuedAt && entry.releasedAt) {
+      const lagMs = entry.releasedAt - entry.issuedAt;
+      if (Number.isFinite(lagMs) && lagMs >= 0) {
+        this.#recordGatewayLeaseLag(relayKey, lagMs, entry.releasedReason || 'released');
+      }
+    }
+    const reasonLabel = typeof entry.releasedReason === 'string' && entry.releasedReason.trim().length
+      ? entry.releasedReason.trim()
+      : 'unknown';
+    escrowLeaseRotationCounter.labels(reasonLabel, 'released').inc();
+  }
+
+  #updateLeaseReplicaState(relayKey, { peersOnline = 0, replicaLagMs = null } = {}) {
+    const entry = this.#getOrCreateLeaseEntry(relayKey);
+    if (!entry) return;
+    entry.peersOnline = peersOnline;
+    if (Number.isFinite(replicaLagMs)) {
+      entry.replicaLagMs = replicaLagMs;
+    }
+    entry.lastUpdatedAt = Date.now();
+    this.leaseHealth.set(relayKey, entry);
+    this.#updateLeaseExpiryMetric(entry);
+    if (peersOnline > 0 && entry.status === 'active') {
+      this.escrowCoordinator?.releaseLease(relayKey, 'peer-healthy');
+    }
+  }
+
+  #checkLeaseWarnings() {
+    if (!this.leaseHealth?.size) return;
+    const now = Date.now();
+    for (const entry of this.leaseHealth.values()) {
+      if (entry.status !== 'active' || !entry.expiresAt) continue;
+      const remaining = entry.expiresAt - now;
+      if (remaining <= 0 && entry.status !== 'expired') {
+        entry.status = 'expired';
+        entry.warning = 'expired';
+        this.logger?.warn?.('[PublicGateway] Escrow lease expired while held by gateway', {
+          relayKey: entry.relayKey,
+          leaseId: entry.leaseId
+        });
+      } else if (remaining > 0 && remaining < this.leaseWarningThresholdMs && !entry.warned) {
+        entry.warned = true;
+        entry.warning = 'expiring';
+        this.logger?.warn?.('[PublicGateway] Escrow lease nearing expiry', {
+          relayKey: entry.relayKey,
+          leaseId: entry.leaseId,
+          msRemaining: remaining
+        });
+      }
+    }
+  }
+
+  #serializeLeaseHealth() {
+    return Array.from(this.leaseHealth.values())
+      .sort((a, b) => (b.lastUpdatedAt || 0) - (a.lastUpdatedAt || 0))
+      .map((entry) => ({
+        relayKey: entry.relayKey,
+        status: entry.status,
+        leaseId: entry.leaseId,
+        escrowId: entry.escrowId,
+        issuedAt: entry.issuedAt,
+        expiresAt: entry.expiresAt,
+        peersOnline: entry.peersOnline,
+        replicaLagMs: entry.replicaLagMs,
+        warning: entry.warning || null,
+        releasedReason: entry.releasedReason || null,
+        releasedAt: entry.releasedAt || null,
+        leaseVersion: entry.leaseVersion ?? null,
+        leaseActive: entry.leaseActive ?? false,
+        lastUpdatedAt: entry.lastUpdatedAt
+      }));
+  }
+
+  #recordGatewayLeaseLag(relayKey, lagMs, reason = 'released') {
+    if (!Number.isFinite(lagMs) || lagMs < 0) return;
+    const relayLabel = relayKey || 'unknown';
+    const reasonLabel = typeof reason === 'string' && reason.trim().length ? reason.trim() : 'unknown';
+    escrowLeaseLagHistogram.labels(relayLabel, reasonLabel).observe(lagMs / 1000);
+    this.gatewayLeaseLagStats.lastMs = lagMs;
+    this.gatewayLeaseLagStats.count = (this.gatewayLeaseLagStats.count || 0) + 1;
+    this.gatewayLeaseLagStats.totalMs = (this.gatewayLeaseLagStats.totalMs || 0) + lagMs;
+  }
+
+  #getGatewayLeaseLagStats() {
+    const stats = this.gatewayLeaseLagStats || null;
+    if (!stats) return null;
+    const { count = 0, totalMs = 0, lastMs = null } = stats;
+    return {
+      count,
+      lastMs,
+      avgMs: count ? Math.round(totalMs / count) : null
+    };
+  }
+
+  #getLeaseSummary(relayKey) {
+    if (!relayKey) return null;
+    const entry = this.leaseHealth.get(relayKey);
+    if (!entry) return null;
+    return {
+      relayKey: entry.relayKey,
+      leaseId: entry.leaseId || null,
+      escrowId: entry.escrowId || null,
+      leaseVersion: entry.leaseVersion ?? null,
+      issuedAt: entry.issuedAt || null,
+      expiresAt: entry.expiresAt || null,
+      releasedAt: entry.releasedAt || null,
+      releasedReason: entry.releasedReason || null,
+      leaseActive: entry.leaseActive ?? false,
+      status: entry.status,
+      peersOnline: entry.peersOnline ?? 0,
+      replicaLagMs: entry.replicaLagMs ?? null
+    };
+  }
+
+  #updateLeaseExpiryMetric(entry) {
+    if (!entry || !entry.relayKey) return;
+    const now = Date.now();
+    let seconds = 0;
+    if (entry.expiresAt && entry.status === 'active') {
+      seconds = Math.max(0, Math.round((entry.expiresAt - now) / 1000));
+    }
+    escrowLeaseExpiryGauge.labels(entry.relayKey).set(seconds);
+  }
+
+  #getLeaseVersion(relayKey) {
+    return this.#getLeaseSummary(relayKey)?.leaseVersion ?? null;
+  }
+
+  #decorateReplicaLeaseState(replicas = []) {
+    if (!Array.isArray(replicas) || !replicas.length) return replicas;
+    return replicas.map((replica) => {
+      const relayKey = typeof replica?.identifier === 'string' ? replica.identifier : null;
+      if (!relayKey) return replica;
+      const lease = this.#getLeaseSummary(relayKey);
+      if (!lease) return replica;
+      return {
+        ...replica,
+        gatewayLeaseActive: lease.leaseActive,
+        gatewayLeaseVersion: lease.leaseVersion,
+        gatewayLeaseExpiresAt: lease.expiresAt,
+        gatewayLeaseId: lease.leaseId
+      };
+    });
+  }
+
+  async #assertWritableLease(relayKey) {
+    if (!this.config?.escrow?.enabled) return true;
+    const lease = this.escrowCoordinator?.getLease?.(relayKey);
+    if (lease) return true;
+    this.logger?.warn?.('[PublicGateway] Blocking gateway write without escrow lease', { relayKey });
+    const error = new Error('gateway-escrow-lease-missing');
+    error.statusCode = 425;
+    throw error;
   }
 
   async #attachHyperbeeReplication(publicKey, protocol, handshake = {}) {

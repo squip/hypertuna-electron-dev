@@ -1,0 +1,100 @@
+{
+  "title": "Hypertuna Public Gateway",
+  "uid": "hypertuna-gateway",
+  "version": 1,
+  "schemaVersion": 38,
+  "editable": true,
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
+  "refresh": "30s",
+  "panels": [
+    {
+      "type": "timeseries",
+      "title": "Blind Peer Mirror Lag (ms)",
+      "gridPos": { "x": 0, "y": 0, "w": 12, "h": 8 },
+      "targets": [
+        {
+          "expr": "gateway_blind_peer_mirror_lag_ms",
+          "legendFormat": "{{identifier}}/{{owner}} ({{type}})",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Replica Fallback Sessions",
+      "gridPos": { "x": 12, "y": 0, "w": 12, "h": 8 },
+      "targets": [
+        {
+          "expr": "gateway_replica_fallback_total",
+          "legendFormat": "{{relay}} ({{mode}})",
+          "refId": "A"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "rate",
+          "options": {
+            "expr": "rate(__series__[$__rate_interval])"
+          }
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Pending Writes Gauge",
+      "gridPos": { "x": 0, "y": 8, "w": 12, "h": 8 },
+      "targets": [
+        {
+          "expr": "gateway_pending_writes",
+          "legendFormat": "{{relay}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Active Escrow Leases",
+      "gridPos": { "x": 12, "y": 8, "w": 6, "h": 4 },
+      "targets": [
+        { "expr": "sum(gateway_escrow_leases_active)", "refId": "A" }
+      ],
+      "options": { "reduceOptions": { "calcs": ["last"] } }
+    },
+    {
+      "type": "stat",
+      "title": "Blind Peer Enabled",
+      "gridPos": { "x": 18, "y": 8, "w": 6, "h": 4 },
+      "targets": [
+        { "expr": "gateway_blind_peer_active", "refId": "A" }
+      ],
+      "options": { "reduceOptions": { "calcs": ["last"] } }
+    },
+    {
+      "type": "timeseries",
+      "title": "Escrow Lease Lag (seconds)",
+      "gridPos": { "x": 0, "y": 16, "w": 12, "h": 8 },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(gateway_escrow_lease_lag_seconds_bucket[$__rate_interval])) by (le, relay))",
+          "legendFormat": "p95 {{relay}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Escrow Policy Rejections",
+      "gridPos": { "x": 12, "y": 16, "w": 12, "h": 8 },
+      "targets": [
+        {
+          "expr": "rate(gateway_escrow_policy_rejections_total[$__rate_interval])",
+          "legendFormat": "{{reason}}",
+          "refId": "A"
+        }
+      ]
+    }
+  ]
+}

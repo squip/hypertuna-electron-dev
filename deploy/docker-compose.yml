@@ -37,8 +37,15 @@ services:
       GATEWAY_REGISTRATION_REDIS: redis://redis:6379
       GATEWAY_REGISTRATION_REDIS_PREFIX: "public-gateway:${GATEWAY_HOST}:"
       GATEWAY_DEFAULT_TOKEN_TTL: 3600
+      POSTGRES_USER: ${ESCROW_POSTGRES_USER:-gateway}
+      POSTGRES_PASSWORD: ${ESCROW_POSTGRES_PASSWORD:-gateway}
+      POSTGRES_DB: ${ESCROW_POSTGRES_DB:-gateway_escrow}
+      POSTGRES_DATA_DIR: /data/postgres
+      ESCROW_DATABASE_URL: postgres://${ESCROW_POSTGRES_USER:-gateway}:${ESCROW_POSTGRES_PASSWORD:-gateway}@127.0.0.1:5432/${ESCROW_POSTGRES_DB:-gateway_escrow}
     depends_on:
       - redis
+    volumes:
+      - public-gateway-data:/data
     labels:
       - traefik.enable=true
       - traefik.http.routers.gateway.rule=Host(`${GATEWAY_HOST}`)
@@ -51,3 +58,4 @@ services:
 volumes:
   traefik-lets:
   redis-data:
+  public-gateway-data:

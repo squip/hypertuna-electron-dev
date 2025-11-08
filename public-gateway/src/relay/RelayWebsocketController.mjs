@@ -5,6 +5,8 @@ export default class RelayWebsocketController {
     relayHost,
     hyperbeeAdapter = null,
     dispatcher = null,
+    replicaManager = null,
+    onReplicaWrite = null,
     logger = console,
     featureFlags = {},
     metrics = {},
@@ -18,15 +20,24 @@ export default class RelayWebsocketController {
     this.relayHost = relayHost;
     this.hyperbeeAdapter = hyperbeeAdapter;
     this.dispatcher = dispatcher;
+    this.replicaManager = replicaManager;
+    this.onReplicaWrite = typeof onReplicaWrite === 'function' ? onReplicaWrite : null;
     this.logger = logger;
     this.featureFlags = featureFlags;
     this.metrics = {
       eventCounter: metrics.eventCounter,
       reqCounter: metrics.reqCounter,
-      errorCounter: metrics.errorCounter
+      errorCounter: metrics.errorCounter,
+      fallbackReadCounter: metrics.fallbackReadCounter,
+      fallbackWriteCounter: metrics.fallbackWriteCounter,
+      fallbackDurationHistogram: metrics.fallbackDurationHistogram,
+      replicaSessionGauge: metrics.replicaSessionGauge,
+      replicaFallbackCounter: metrics.replicaFallbackCounter
     };
     this.legacyForward = legacyForward;
     this.subscriptions = new Map();
+    this.replicaSessionState = new Map(); // connectionKey -> { relayKey, startedAt }
+    this.replicaSessionCounts = new Map(); // relayKey -> count
   }
 
   getSubscriptionSnapshot(sessionKey) {
@@ -91,6 +102,11 @@ export default class RelayWebsocketController {
       }
     }
     this.subscriptions.delete(sessionKey);
+    this.#clearReplicaState(sessionKey, 'session-close');
+  }
+
+  setReplicaManager(replicaManager) {
+    this.replicaManager = replicaManager;
   }
 
   async #handleEventFrame(session, frame) {
@@ -101,6 +117,11 @@ export default class RelayWebsocketController {
     }
 
     const event = frame[1];
+    const servedByReplica = await this.#maybeHandleReplicaEvent(session, event);
+    if (servedByReplica) {
+      return;
+    }
+
     try {
       const result = await this.relayHost.applyEvent(event);
       const success = result?.status === 'accepted';
@@ -162,6 +183,23 @@ export default class RelayWebsocketController {
       }, 'DelegationDebug: REQ served locally');
       if (Number.isFinite(localResult.latestTimestamp)) {
         this.#updateSubscriptionCursor(session.connectionKey, subscriptionId, localResult.latestTimestamp);
+      }
+      return;
+    }
+
+    const replicaResult = await this.#serveReqFromReplica(session, subscriptionId, filters, lastReturnedAt);
+    if (replicaResult?.handled) {
+      this.logger.info?.({
+        tag: 'DelegationDebug',
+        stage: 'req-served-replica',
+        relayKey: session.relayKey,
+        connectionKey: session.connectionKey,
+        subscriptionId,
+        delivered: replicaResult.delivered || 0,
+        latestTimestamp: replicaResult.latestTimestamp ?? null
+      }, 'DelegationDebug: REQ served via replica');
+      if (Number.isFinite(replicaResult.latestTimestamp)) {
+        this.#updateSubscriptionCursor(session.connectionKey, subscriptionId, replicaResult.latestTimestamp);
       }
       return;
     }
@@ -344,8 +382,50 @@ export default class RelayWebsocketController {
     subs.set(subscriptionId, state);
   }
 
+  async #maybeHandleReplicaEvent(session, event) {
+    if (!this.#shouldUseReplica(session)) {
+      return false;
+    }
+    if (!session?.replicaEligible) return false;
+    const replicaSession = await this.#ensureReplicaSession(session);
+    if (!replicaSession) return false;
+    this.#enableReplicaMode(session, 'event-frame');
+
+    if (!replicaSession.hasWritableLease()) {
+      this.#sendNotice(session, 'Relay is read-only while workers are offline');
+      this.#incrementEvent('rejected');
+      this.#incrementFallbackWrite(session.relayKey, 'readonly');
+      this.#sendOk(session, event?.id || null, false, 'read-only');
+      return true;
+    }
+
+    try {
+      const result = await replicaSession.appendEvent(event);
+      const success = result?.status === 'accepted';
+      this.#incrementEvent(success ? 'accepted' : 'rejected');
+      this.#incrementFallbackWrite(session.relayKey, success ? 'accepted' : 'rejected');
+      this.#sendOk(session, event.id || null, success, success ? 'stored' : result?.reason || 'rejected');
+      if (success) {
+        this.onReplicaWrite?.(session.relayKey, { type: 'event' });
+      }
+    } catch (error) {
+      this.#incrementEvent('error');
+      this.#incrementFallbackWrite(session.relayKey, 'error');
+      this.logger.error?.('[RelayWebsocketController] Replica append failed', {
+        relayKey: session.relayKey,
+        error: error?.message || error
+      });
+      this.#sendOk(session, event?.id || null, false, error?.message || 'append-error');
+    }
+
+    return true;
+  }
+
   async #serveReqFromHyperbee(session, subscriptionId, filters, lastReturnedAt) {
     if (!this.hyperbeeAdapter?.hasReplica?.()) {
+      return null;
+    }
+    if (session?.useHyperbeeHost === false) {
       return null;
     }
 
@@ -402,5 +482,159 @@ export default class RelayWebsocketController {
       this.#incrementError('hyperbee-query');
       return null;
     }
+  }
+
+  async #serveReqFromReplica(session, subscriptionId, filters, lastReturnedAt) {
+    if (!this.#shouldUseReplica(session)) return null;
+    if (!session?.replicaEligible) return null;
+    const replicaSession = await this.#ensureReplicaSession(session);
+    if (!replicaSession) return null;
+    this.#enableReplicaMode(session, 'req-frame');
+
+    try {
+      const queryResult = await replicaSession.query(filters || []);
+      if (!queryResult?.stats?.served) {
+        return null;
+      }
+
+      const events = Array.isArray(queryResult.events) ? queryResult.events : [];
+      const filteredEvents = events.filter((event) => {
+        const createdAt = Number(event?.created_at ?? 0);
+        if (!Number.isFinite(lastReturnedAt)) return true;
+        return createdAt > lastReturnedAt;
+      });
+
+      const latestTimestamp = filteredEvents.reduce((acc, event) => {
+        const createdAt = Number(event?.created_at ?? 0);
+        if (!Number.isFinite(createdAt)) return acc;
+        return Math.max(acc, createdAt);
+      }, Number.isFinite(lastReturnedAt) ? lastReturnedAt : -Infinity);
+
+      for (const event of filteredEvents) {
+        if (session.ws?.readyState === WebSocket.OPEN) {
+          session.ws.send(JSON.stringify(['EVENT', subscriptionId, event]));
+        }
+      }
+
+      if (session.ws?.readyState === WebSocket.OPEN) {
+        session.ws.send(JSON.stringify(['EOSE', subscriptionId]));
+      }
+
+      this.#incrementReq('served-replica');
+      this.#incrementFallbackRead(session.relayKey, 'replica');
+
+      return {
+        handled: true,
+        latestTimestamp: Number.isFinite(latestTimestamp) ? latestTimestamp : lastReturnedAt ?? null,
+        delivered: filteredEvents.length
+      };
+    } catch (error) {
+      this.logger.warn?.('[RelayWebsocketController] Replica query failed, falling back to peers', {
+        error: error?.message || error,
+        relayKey: session.relayKey,
+        subscriptionId
+      });
+      this.#incrementError('replica-query');
+      return null;
+    }
+  }
+
+  async #ensureReplicaSession(session) {
+    if (session?.replicaSession) return session.replicaSession;
+    if (!this.replicaManager || !session?.relayKey || session.replicaEligible === false) {
+      return null;
+    }
+    try {
+      const replicaSession = await this.replicaManager.acquireAutobaseSession(
+        session.relayKey,
+        session.ownerPeerKey || null
+      );
+      if (replicaSession) {
+        session.replicaSession = replicaSession;
+        return replicaSession;
+      }
+    } catch (error) {
+      this.logger?.debug?.('[RelayWebsocketController] Failed to acquire replica session', {
+        relayKey: session?.relayKey,
+        error: error?.message || error
+      });
+    }
+    return null;
+  }
+
+  #incrementFallbackRead(relayKey, reason) {
+    try {
+      this.metrics.fallbackReadCounter?.inc({ relay: relayKey || 'unknown', reason: reason || 'unknown' });
+      this.metrics.replicaFallbackCounter?.inc({ relay: relayKey || 'unknown', mode: 'read' });
+    } catch (_) {}
+  }
+
+  #incrementFallbackWrite(relayKey, result) {
+    try {
+      this.metrics.fallbackWriteCounter?.inc({ relay: relayKey || 'unknown', result: result || 'unknown' });
+      this.metrics.replicaFallbackCounter?.inc({ relay: relayKey || 'unknown', mode: 'write' });
+    } catch (_) {}
+  }
+
+  #shouldUseReplica(session) {
+    if (!session?.replicaEligible) return false;
+    if (session.replicaMode === true) return true;
+    if (session.localOnly === true) return true;
+    if (!Array.isArray(session.peers) || session.peers.length === 0) return true;
+    return false;
+  }
+
+  #enableReplicaMode(session, reason = 'unknown') {
+    if (!session?.connectionKey) return;
+    const connectionKey = session.connectionKey;
+    if (this.replicaSessionState.has(connectionKey)) return;
+    const relayKey = session.relayKey || 'unknown';
+    this.replicaSessionState.set(connectionKey, {
+      relayKey,
+      startedAt: Date.now(),
+      reason
+    });
+    try {
+      this.metrics.replicaFallbackCounter?.inc({ relay: relayKey || 'unknown', mode: 'session' });
+    } catch (_) {}
+    session.replicaMode = true;
+    this.#adjustReplicaGauge(relayKey, 1);
+    this.logger.info?.('[RelayWebsocketController] Replica fallback enabled', {
+      relayKey,
+      reason,
+      connectionKey
+    });
+  }
+
+  #clearReplicaState(sessionOrKey, reason = 'unknown') {
+    const connectionKey = typeof sessionOrKey === 'string'
+      ? sessionOrKey
+      : sessionOrKey?.connectionKey;
+    if (!connectionKey) return;
+    const state = this.replicaSessionState.get(connectionKey);
+    if (!state) return;
+    this.replicaSessionState.delete(connectionKey);
+    const relayKey = state.relayKey || 'unknown';
+    const durationSeconds = state.startedAt ? (Date.now() - state.startedAt) / 1000 : null;
+    if (Number.isFinite(durationSeconds)) {
+      this.metrics.fallbackDurationHistogram?.observe({ relay: relayKey }, durationSeconds);
+    }
+    this.#adjustReplicaGauge(relayKey, -1);
+    if (typeof sessionOrKey === 'object' && sessionOrKey) {
+      sessionOrKey.replicaMode = false;
+    }
+    this.logger.info?.('[RelayWebsocketController] Replica fallback disabled', {
+      relayKey,
+      reason,
+      connectionKey
+    });
+  }
+
+  #adjustReplicaGauge(relayKey, delta) {
+    const key = relayKey || 'unknown';
+    const current = this.replicaSessionCounts.get(key) || 0;
+    const next = Math.max(0, current + delta);
+    this.replicaSessionCounts.set(key, next);
+    this.metrics.replicaSessionGauge?.set({ relay: key }, next);
   }
 }

@@ -1,6 +1,8 @@
 import { EventEmitter } from 'node:events';
 import HypercoreId from 'hypercore-id-encoding';
 
+import AutobaseReplicaSession from '../replica/AutobaseReplicaSession.mjs';
+
 function toKeyString(value) {
   if (!value) return null;
   if (typeof value === 'string') return value;
@@ -40,6 +42,7 @@ export default class BlindPeerReplicaManager extends EventEmitter {
     this.replicas = new Map();
     this.sequence = 0;
     this.listeners = new Map();
+    this.sessions = new Map();
   }
 
   async initialize({ blindPeerService } = {}) {
@@ -78,6 +81,10 @@ export default class BlindPeerReplicaManager extends EventEmitter {
       this.blindPeerService?.off?.(event, handler);
     }
     this.listeners.clear();
+    await Promise.allSettled(Array.from(this.sessions.values()).map(async (session) => {
+      await session?.close?.();
+    }));
+    this.sessions.clear();
     await Promise.allSettled(Array.from(this.replicas.values()).map(async (replica) => {
       await this.#closeReplica(replica);
     }));
@@ -123,7 +130,26 @@ export default class BlindPeerReplicaManager extends EventEmitter {
     replica.writerLeaseActive = !!lease;
     replica.writerLeaseExpiresAt = lease?.expiresAt || null;
     replica.writerLeaseId = lease?.leaseId || null;
+    replica.currentLease = lease ? this.#cloneLease(lease) : null;
     this.emit('replica-updated', replica);
+    const session = this.#getSession(identifier, ownerPeerKey || replica.ownerPeerKey);
+    if (session) {
+      if (lease) {
+        Promise.resolve(session.setWriterLease(this.#cloneLease(lease))).catch((error) => {
+          this.logger?.warn?.('[BlindPeerReplicaManager] Failed to apply writer lease to session', {
+            identifier,
+            error: error?.message || error
+          });
+        });
+      } else {
+        Promise.resolve(session.clearWriterLease()).catch((error) => {
+          this.logger?.warn?.('[BlindPeerReplicaManager] Failed to clear writer lease from session', {
+            identifier,
+            error: error?.message || error
+          });
+        });
+      }
+    }
     return true;
   }
 
@@ -131,6 +157,51 @@ export default class BlindPeerReplicaManager extends EventEmitter {
     const replica = this.#findReplica(identifier, ownerPeerKey);
     if (!replica) return null;
     return await this.#ensureCore(replica);
+  }
+
+  hasReplica(identifier, ownerPeerKey = null) {
+    return !!this.#findReplica(identifier, ownerPeerKey);
+  }
+
+  async acquireAutobaseSession(identifier, ownerPeerKey = null) {
+    if (!identifier) return null;
+    const replica = this.#findReplica(identifier, ownerPeerKey) || this.#findReplica(identifier, null);
+    if (!replica || !replica.coreKey) return null;
+    const cacheKey = this.#sessionKey(identifier, replica.ownerPeerKey);
+    let session = this.sessions.get(cacheKey);
+    if (session) {
+      return session;
+    }
+    const corestore = await this.#prepareCorestore();
+    if (!corestore) {
+      this.logger?.warn?.('[BlindPeerReplicaManager] Unable to prepare corestore for replica session', {
+        identifier
+      });
+      return null;
+    }
+    const ensured = await this.#ensureCore(replica);
+    if (!ensured) {
+      return null;
+    }
+    session = new AutobaseReplicaSession({
+      identifier,
+      ownerPeerKey: replica.ownerPeerKey,
+      coreKey: replica.coreKey,
+      corestore,
+      logger: this.logger
+    });
+    if (replica.currentLease) {
+      try {
+        await session.setWriterLease(this.#cloneLease(replica.currentLease));
+      } catch (error) {
+        this.logger?.warn?.('[BlindPeerReplicaManager] Failed to hydrate replica session lease', {
+          identifier,
+          error: error?.message || error
+        });
+      }
+    }
+    this.sessions.set(cacheKey, session);
+    return session;
   }
 
   async #prepareCorestore() {
@@ -221,6 +292,7 @@ export default class BlindPeerReplicaManager extends EventEmitter {
     replica.announcedCount = replica.announcedKeys?.size || 0;
     const replicaKey = this.#replicaKey(replica.identifier, replica.ownerPeerKey);
     if (replica.totalCores === 0) {
+      this.#deleteSession(replica.identifier, replica.ownerPeerKey);
       this.replicas.delete(replicaKey);
       this.#closeReplica(replica).catch((error) => {
         this.logger?.debug?.('[BlindPeerReplicaManager] Failed to close replica core', {
@@ -353,6 +425,49 @@ export default class BlindPeerReplicaManager extends EventEmitter {
 
   #replicaKey(identifier, ownerPeerKey) {
     return `${identifier || 'unknown'}::${ownerPeerKey || 'anonymous'}`;
+  }
+
+  #sessionKey(identifier, ownerPeerKey) {
+    return `session:${identifier || 'unknown'}::${ownerPeerKey || 'anonymous'}`;
+  }
+
+  #getSession(identifier, ownerPeerKey) {
+    const key = this.#sessionKey(identifier, ownerPeerKey);
+    return this.sessions.get(key) || null;
+  }
+
+  async #deleteSession(identifier, ownerPeerKey) {
+    const key = this.#sessionKey(identifier, ownerPeerKey);
+    const session = this.sessions.get(key);
+    if (!session) return;
+    this.sessions.delete(key);
+    try {
+      await session.close();
+    } catch (error) {
+      this.logger?.debug?.('[BlindPeerReplicaManager] Failed to close replica session', {
+        identifier,
+        error: error?.message || error
+      });
+    }
+  }
+
+  #cloneLease(lease = null) {
+    if (!lease || typeof lease !== 'object') return null;
+    const copy = { ...lease };
+    if (lease.writerPackage && typeof lease.writerPackage === 'object') {
+      copy.writerPackage = { ...lease.writerPackage };
+      if (lease.writerPackage.writerKey) {
+        const keyValue = lease.writerPackage.writerKey;
+        if (Buffer.isBuffer(keyValue)) {
+          copy.writerPackage.writerKey = Buffer.from(keyValue);
+        } else if (keyValue instanceof Uint8Array) {
+          copy.writerPackage.writerKey = Buffer.from(keyValue);
+        } else {
+          copy.writerPackage.writerKey = keyValue;
+        }
+      }
+    }
+    return copy;
   }
 
   #normalize(existing, current, preferMin = false) {

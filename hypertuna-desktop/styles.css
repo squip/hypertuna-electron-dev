@@ -2699,6 +2699,76 @@ members-list,.member-list {
     gap: var(--space-md);
 }
 
+.gateway-pending-section {
+    margin-top: var(--space-md);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: var(--radius-lg);
+    padding: var(--space-md);
+    background: rgba(255, 255, 255, 0.02);
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-sm);
+}
+
+.pending-section-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-sm);
+}
+
+.gateway-pending-summary {
+    font-size: 0.8rem;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+}
+
+.pending-write-list {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-sm);
+}
+
+.pending-write-list.empty {
+    padding: var(--space-sm) 0;
+}
+
+.pending-write-item {
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: var(--radius-md);
+    padding: var(--space-sm) var(--space-md);
+    background: rgba(255, 255, 255, 0.01);
+    display: flex;
+    flex-direction: column;
+    gap: 0.4rem;
+}
+
+.pending-write-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-sm);
+}
+
+.pending-write-title {
+    font-weight: 600;
+    font-size: 0.95rem;
+}
+
+.pending-write-status {
+    font-size: 0.75rem;
+    text-transform: uppercase;
+    color: var(--text-muted);
+}
+
+.pending-write-details {
+    display: flex;
+    flex-direction: column;
+    gap: 0.2rem;
+    font-size: 0.85rem;
+    color: var(--text-muted);
+}
+
 .public-gateway-status-card {
     border: 1px solid rgba(255, 255, 255, 0.08);
     border-radius: var(--radius-md);

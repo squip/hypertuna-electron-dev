@@ -3,6 +3,7 @@ import WebSocket from 'ws';
 import url from 'node:url';
 import crypto from 'node:crypto';
 import { EventEmitter } from 'node:events';
+import { readFile } from 'node:fs/promises';
 
 import LocalGatewayServer from './LocalGatewayServer.mjs';
 import {
@@ -31,7 +32,8 @@ import { updatePublicGatewaySettings } from '../../shared/config/PublicGatewaySe
 import AutobaseKeyEscrowClient from '../../shared/escrow/AutobaseKeyEscrowClient.mjs';
 import {
   sealPayload as sealEscrowPayload,
-  hashSecret as hashEscrowSecret
+  hashSecret as hashEscrowSecret,
+  withZeroizedBuffer
 } from '../../shared/escrow/AutobaseKeyEscrowCrypto.mjs';
 
 const MAX_LOG_ENTRIES = 500;
@@ -244,6 +246,13 @@ export class GatewayService extends EventEmitter {
     this.escrowClient = null;
     this.gatewayTelemetryTimers = new Map();
     this.gatewayProtocols = new Map();
+    this.gatewayPendingWriteState = new Map();
+    this.pendingWriteCoordinator = null;
+    this.pendingWriteCoordinatorListener = null;
+    this.pendingWriteCoordinatorLeaseLagListener = null;
+    this.gatewayEscrowRotations = new Map();
+    this.gatewayRotationSequence = 0;
+    this.publicGatewayRotationsInitialized = false;
     this.publicGatewayRelayClient = new PublicGatewayRelayClient({ logger: this.#createExternalLogger?.() || console });
     this.hyperbeeAdapter = new PublicGatewayHyperbeeAdapter({
       relayClient: this.publicGatewayRelayClient,
@@ -277,6 +286,67 @@ export class GatewayService extends EventEmitter {
       : () => options.currentPubkey || null;
 
     this.#configurePublicGateway();
+
+    this.workerLeaseLagStats = {
+      count: 0,
+      totalMs: 0,
+      lastMs: null
+    };
+  }
+
+  setPendingWriteCoordinator(coordinator) {
+    if (this.pendingWriteCoordinator && this.pendingWriteCoordinatorListener) {
+      const current = this.pendingWriteCoordinator;
+      const listener = this.pendingWriteCoordinatorListener;
+      if (typeof current.off === 'function') {
+        current.off('state-changed', listener);
+      } else if (typeof current.removeListener === 'function') {
+        current.removeListener('state-changed', listener);
+      }
+    }
+    if (this.pendingWriteCoordinator && this.pendingWriteCoordinatorLeaseLagListener) {
+      const current = this.pendingWriteCoordinator;
+      const listener = this.pendingWriteCoordinatorLeaseLagListener;
+      if (typeof current.off === 'function') {
+        current.off('lease-lag', listener);
+      } else if (typeof current.removeListener === 'function') {
+        current.removeListener('lease-lag', listener);
+      }
+    }
+    this.pendingWriteCoordinator = coordinator || null;
+    this.pendingWriteCoordinatorListener = null;
+    this.pendingWriteCoordinatorLeaseLagListener = null;
+    if (this.pendingWriteCoordinator && typeof this.pendingWriteCoordinator.on === 'function') {
+      const listener = () => {
+        this.emit('status', this.getStatus());
+        this.emit('public-gateway-status', this.getPublicGatewayState());
+      };
+      this.pendingWriteCoordinator.on('state-changed', listener);
+      this.pendingWriteCoordinatorListener = listener;
+      const leaseLagListener = (payload) => {
+        this.recordWorkerLeaseLag(payload);
+      };
+      this.pendingWriteCoordinator.on('lease-lag', leaseLagListener);
+      this.pendingWriteCoordinatorLeaseLagListener = leaseLagListener;
+    }
+  }
+
+  recordWorkerLeaseLag(payload = {}) {
+    if (!payload || !Number.isFinite(payload.lagMs)) return;
+    const relayKey = payload.relayKey || 'unknown';
+    const lagMs = payload.lagMs;
+    this.workerLeaseLagStats.lastMs = lagMs;
+    this.workerLeaseLagStats.count = (this.workerLeaseLagStats.count || 0) + 1;
+    this.workerLeaseLagStats.totalMs = (this.workerLeaseLagStats.totalMs || 0) + lagMs;
+    if (this.publicGatewayRelayState.has(relayKey)) {
+      const current = this.publicGatewayRelayState.get(relayKey);
+      this.publicGatewayRelayState.set(relayKey, {
+        ...current,
+        workerLeaseLagMs: lagMs
+      });
+    }
+    this.publicGatewayStatusUpdatedAt = Date.now();
+    this.emit('public-gateway-status', this.getPublicGatewayState());
   }
 
   #normalizePublicGatewayConfig(rawConfig = {}) {
@@ -303,6 +373,16 @@ export class GatewayService extends EventEmitter {
     const selectionMode = ['default', 'discovered', 'manual'].includes(selectionRaw)
       ? selectionRaw
       : '';
+
+    const resolvePathInput = (...inputs) => {
+      for (const value of inputs) {
+        if (typeof value === 'string') {
+          const trimmed = value.trim();
+          if (trimmed) return trimmed;
+        }
+      }
+      return null;
+    };
 
     const config = {
       enabled: rawConfig?.enabled ?? envEnabled,
@@ -335,6 +415,30 @@ export class GatewayService extends EventEmitter {
       dispatcherCircuitBreakerThreshold: this.#parsePositiveNumber(rawConfig?.dispatcherCircuitBreakerThreshold, 5),
       dispatcherCircuitBreakerTimeoutMs: this.#parsePositiveNumber(rawConfig?.dispatcherCircuitBreakerTimeoutMs, 60000)
     };
+    config.escrowTlsCaPath = resolvePathInput(
+      rawConfig?.escrowTlsCaPath,
+      process.env.PUBLIC_GATEWAY_ESCROW_TLS_CA,
+      process.env.ESCROW_TLS_CA
+    );
+    config.escrowTlsClientCertPath = resolvePathInput(
+      rawConfig?.escrowTlsClientCertPath,
+      process.env.PUBLIC_GATEWAY_ESCROW_TLS_CLIENT_CERT,
+      process.env.ESCROW_TLS_CLIENT_CERT
+    );
+    config.escrowTlsClientKeyPath = resolvePathInput(
+      rawConfig?.escrowTlsClientKeyPath,
+      process.env.PUBLIC_GATEWAY_ESCROW_TLS_CLIENT_KEY,
+      process.env.ESCROW_TLS_CLIENT_KEY
+    );
+    if (typeof rawConfig?.escrowTlsRejectUnauthorized === 'boolean') {
+      config.escrowTlsRejectUnauthorized = rawConfig.escrowTlsRejectUnauthorized;
+    } else if (process.env.PUBLIC_GATEWAY_ESCROW_TLS_REJECT_UNAUTHORIZED) {
+      config.escrowTlsRejectUnauthorized = process.env.PUBLIC_GATEWAY_ESCROW_TLS_REJECT_UNAUTHORIZED !== 'false';
+    } else if (process.env.ESCROW_TLS_REJECT_UNAUTHORIZED) {
+      config.escrowTlsRejectUnauthorized = process.env.ESCROW_TLS_REJECT_UNAUTHORIZED !== 'false';
+    } else {
+      config.escrowTlsRejectUnauthorized = true;
+    }
 
     const envEscrowEnabled = process.env.PUBLIC_GATEWAY_ESCROW_ENABLED;
     if (typeof rawConfig?.escrowEnabled === 'boolean') {
@@ -465,6 +569,39 @@ export class GatewayService extends EventEmitter {
     return base.replace(/\/+$/, '');
   }
 
+  async #loadEscrowTlsMaterials() {
+    const caPath = this.publicGatewaySettings?.escrowTlsCaPath;
+    const certPath = this.publicGatewaySettings?.escrowTlsClientCertPath;
+    const keyPath = this.publicGatewaySettings?.escrowTlsClientKeyPath;
+    if (!caPath && !certPath && !keyPath) {
+      if (this.publicGatewaySettings?.escrowTlsRejectUnauthorized === false) {
+        return { rejectUnauthorized: false };
+      }
+      return null;
+    }
+    const [ca, cert, key] = await Promise.all([
+      this.#readEscrowTlsFile(caPath),
+      this.#readEscrowTlsFile(certPath),
+      this.#readEscrowTlsFile(keyPath)
+    ]);
+    return {
+      ca: ca || undefined,
+      cert: cert || undefined,
+      key: key || undefined,
+      rejectUnauthorized: this.publicGatewaySettings?.escrowTlsRejectUnauthorized !== false
+    };
+  }
+
+  async #readEscrowTlsFile(path) {
+    if (!path) return null;
+    try {
+      return await readFile(path);
+    } catch (error) {
+      this.log('warn', `[PublicGateway] Failed to read escrow TLS file at ${path}: ${error.message}`);
+      throw error;
+    }
+  }
+
   #isEscrowEnabled() {
     return Boolean(
       this.publicGatewaySettings?.escrowEnabled
@@ -479,11 +616,13 @@ export class GatewayService extends EventEmitter {
     const clientId = this.publicGatewaySettings?.resolvedGatewayId
       || this.publicGatewaySettings?.selectedGatewayId
       || 'hypertuna-worker';
+    const tls = await this.#loadEscrowTlsMaterials();
     this.escrowClient = new AutobaseKeyEscrowClient({
       baseUrl: this.publicGatewaySettings.escrowBaseUrl,
       sharedSecret: this.publicGatewaySettings.sharedSecret,
       clientId,
-      fetchImpl: globalThis.fetch?.bind(globalThis)
+      fetchImpl: globalThis.fetch?.bind(globalThis),
+      tls
     });
     return this.escrowClient;
   }
@@ -517,17 +656,25 @@ export class GatewayService extends EventEmitter {
     }
   }
 
-  async #maybePrepareEscrowAttachment(relayKey, { metadata } = {}) {
+  async #maybePrepareEscrowAttachment(relayKey, { metadata, force = false } = {}) {
     if (!this.#isEscrowEnabled()) return null;
     const client = await this.#ensureEscrowClient();
     if (!client?.isEnabled?.()) return null;
-    const writerSecret = getRelayWriterSecret(relayKey);
-    if (!writerSecret) return null;
-
-    const secretHash = hashEscrowSecret(writerSecret);
+    const secretResult = withZeroizedBuffer(
+      () => getRelayWriterSecret(relayKey),
+      (secret) => {
+        if (!secret) return null;
+        return {
+          writerKeyHex: Buffer.from(secret).toString('hex'),
+          secretHash: hashEscrowSecret(secret)
+        };
+      }
+    );
+    if (!secretResult?.writerKeyHex) return null;
+    const { writerKeyHex, secretHash } = secretResult;
     const now = Date.now();
     const cached = this.publicGatewayEscrowDeposits.get(relayKey);
-    if (cached && cached.writerHash === secretHash && cached.expiresAt && cached.expiresAt - now > 60_000) {
+    if (!force && cached && cached.writerHash === secretHash && cached.expiresAt && cached.expiresAt - now > 60_000) {
       return {
         enabled: true,
         escrowId: cached.escrowId,
@@ -548,7 +695,7 @@ export class GatewayService extends EventEmitter {
 
     const writerPackage = {
       relayKey,
-      writerKey: writerSecret,
+      writerKey: writerKeyHex,
       ownerPeerKey,
       createdAt: now,
       metadata: {
@@ -608,6 +755,26 @@ export class GatewayService extends EventEmitter {
     }
   }
 
+  async #revokeGatewayEscrowLease(relayKey, escrowId = null, reason = 'rotation') {
+    const client = await this.#ensureEscrowClient();
+    if (!client?.isEnabled?.()) {
+      throw new Error('escrow-client-unavailable');
+    }
+    try {
+      await client.revoke({
+        relayKey,
+        escrowId,
+        reason
+      });
+    } catch (error) {
+      if (error?.body?.error === 'escrow-record-not-found' || error?.message === 'escrow-record-not-found') {
+        this.log('debug', `[PublicGateway] No escrow record found to revoke for ${relayKey}`);
+        return;
+      }
+      throw error;
+    }
+  }
+
   #configurePublicGateway() {
     const config = this.publicGatewaySettings || { enabled: false };
 
@@ -630,10 +797,16 @@ export class GatewayService extends EventEmitter {
         logger: this.loggerBridge
       });
       this.publicGatewayWsBase = this.#computePublicGatewayWsBase(config.baseUrl);
+      this.publicGatewayRotationsInitialized = false;
+      this.gatewayEscrowRotations.clear();
+      this.gatewayRotationSequence = 0;
     } else {
       this.publicGatewayRegistrar = null;
       this.publicGatewayWsBase = null;
       this.#clearAllRelayTokens();
+      this.publicGatewayRotationsInitialized = false;
+      this.gatewayEscrowRotations.clear();
+      this.gatewayRotationSequence = 0;
     }
     this.discoveryDisabledReason = config.disabledReason || null;
     if (config.disabledReason) {
@@ -1238,7 +1411,7 @@ export class GatewayService extends EventEmitter {
     });
   }
 
-  async #syncPublicGatewayRelay(relayKey, { forceTokenRefresh = false } = {}) {
+  async #syncPublicGatewayRelay(relayKey, { forceTokenRefresh = false, forceEscrowRefresh = false } = {}) {
     const enabled = this.publicGatewaySettings?.enabled && this.publicGatewayRegistrar?.isEnabled?.();
 
     if (!enabled) {
@@ -1339,7 +1512,10 @@ export class GatewayService extends EventEmitter {
     };
 
     try {
-      const escrowAttachment = await this.#maybePrepareEscrowAttachment(relayKey, { metadata: metadataCopy });
+      const escrowAttachment = await this.#maybePrepareEscrowAttachment(relayKey, {
+        metadata: metadataCopy,
+        force: forceEscrowRefresh
+      });
       if (escrowAttachment) {
         payload.escrow = escrowAttachment;
       }
@@ -1579,16 +1755,133 @@ export class GatewayService extends EventEmitter {
   _onProtocolCreated({ publicKey, protocol, context = {} }) {
     if (!protocol) return;
     const isServer = !!context.isServer;
-    if (!isServer) return;
 
     this.log('debug', '[PublicGateway] Hyperswarm protocol created for peer', {
       peer: publicKey,
       isServer
     });
 
-    protocol.handle('/gateway/register', async (request) => {
-      return this._handleGatewayRegisterRequest(publicKey, request);
+    if (isServer) {
+      protocol.handle('/gateway/register', async (request) => {
+        return this._handleGatewayRegisterRequest(publicKey, request);
+      });
+    }
+
+    this.#registerGatewayControlHandlers(protocol, publicKey);
+  }
+
+  #registerGatewayControlHandlers(protocol, publicKey) {
+    if (!protocol || protocol.__gatewayControlHandlers) return;
+    protocol.__gatewayControlHandlers = true;
+    protocol.handle('/gateway/pending-writes', async (request) => {
+      try {
+        return await this.#handleGatewayPendingWritesPush(publicKey, request);
+      } catch (error) {
+        this.log('warn', `[PublicGateway] pending-writes handler failed for ${publicKey.slice(0, 8)}: ${error.message}`);
+        return {
+          statusCode: 500,
+          headers: { 'content-type': 'application/json' },
+          body: Buffer.from(JSON.stringify({ error: 'pending-writes-failed' }))
+        };
+      }
     });
+  }
+
+  async #handleGatewayPendingWritesPush(peerKey, request) {
+    const method = typeof request?.method === 'string' ? request.method.toUpperCase() : 'GET';
+    if (method !== 'POST') {
+      return {
+        statusCode: 405,
+        headers: { 'content-type': 'application/json' },
+        body: Buffer.from(JSON.stringify({ error: 'method-not-allowed' }))
+      };
+    }
+
+    let payload = null;
+    try {
+      payload = request?.body && request.body.length
+        ? JSON.parse(Buffer.from(request.body).toString())
+        : {};
+    } catch (error) {
+      return {
+        statusCode: 400,
+        headers: { 'content-type': 'application/json' },
+        body: Buffer.from(JSON.stringify({ error: 'invalid-json' }))
+      };
+    }
+
+    if (!this.#isTrustedGatewayPeer(peerKey)) {
+      this.log('warn', `[PublicGateway] Rejecting pending-writes push from untrusted peer ${peerKey.slice(0, 8)}`);
+      return {
+        statusCode: 403,
+        headers: { 'content-type': 'application/json' },
+        body: Buffer.from(JSON.stringify({ error: 'forbidden' }))
+      };
+    }
+
+    const relayKey = typeof payload?.relayKey === 'string' ? payload.relayKey.trim() : null;
+    if (!relayKey) {
+      return {
+        statusCode: 400,
+        headers: { 'content-type': 'application/json' },
+        body: Buffer.from(JSON.stringify({ error: 'relayKey-required' }))
+      };
+    }
+
+    const state = payload?.state === 'cleared' ? 'cleared' : 'pending';
+    const updatedAt = Number.isFinite(payload?.updatedAt) ? payload.updatedAt : Date.now();
+    const existing = this.gatewayPendingWriteState.get(relayKey);
+    if (existing && Number.isFinite(existing.updatedAt) && updatedAt <= existing.updatedAt) {
+      this.log('debug', `[PublicGateway] Duplicate pending-writes push ignored for ${relayKey.slice(0, 8)}`);
+      return {
+        statusCode: 200,
+        headers: { 'content-type': 'application/json' },
+        body: Buffer.from(JSON.stringify({ status: 'noop' }))
+      };
+    }
+
+    const record = {
+      relayKey,
+      state,
+      reason: payload?.reason || 'replica-write',
+      types: Array.isArray(payload?.types) ? payload.types : [],
+      driveIdentifier: payload?.driveIdentifier || relayKey,
+      driveVersion: Number.isFinite(payload?.driveVersion) ? payload.driveVersion : null,
+      lease: payload?.lease || null,
+      leaseVersion: Number.isFinite(payload?.leaseVersion) ? payload.leaseVersion : null,
+      leaseActive: payload?.leaseActive === true,
+      peerKey,
+      updatedAt,
+      pushId: payload?.pushId || null,
+      pendingSince: Number.isFinite(payload?.pendingSince) ? payload.pendingSince : updatedAt
+    };
+
+    this.gatewayPendingWriteState.set(relayKey, record);
+    this.log('info', '[PublicGateway] Pending writes notification', {
+      relayKey,
+      state,
+      reason: record.reason,
+      types: record.types,
+      peerKey: peerKey.slice(0, 8),
+      driveIdentifier: record.driveIdentifier,
+      driveVersion: record.driveVersion
+    });
+
+    this.emit('gateway-pending-writes', record);
+
+    return {
+      statusCode: 200,
+      headers: { 'content-type': 'application/json' },
+      body: Buffer.from(JSON.stringify({ status: 'accepted' }))
+    };
+  }
+
+  #isTrustedGatewayPeer(peerKey) {
+    if (!peerKey) return false;
+    if (this.gatewayProtocols.has(peerKey)) return true;
+    const handshake = this.peerHandshakes.get(peerKey);
+    if (!handshake) return false;
+    return this.#isResolvedGatewayPeer(peerKey, handshake) || handshake.isGateway === true || handshake.role === 'gateway';
   }
 
   #buildHandshakePayload({ isServer }) {
@@ -1679,6 +1972,7 @@ export class GatewayService extends EventEmitter {
     if (isGatewayLike) {
       if (protocol) {
         this.gatewayProtocols.set(publicKey, protocol);
+        this.#registerGatewayControlHandlers(protocol, publicKey);
         const cleanup = () => {
           this.gatewayProtocols.delete(publicKey);
         };
@@ -1849,6 +2143,7 @@ export class GatewayService extends EventEmitter {
     await this.publicGatewayRelayClient?.close?.();
     await this.#unregisterPublicGatewayVirtualRelay();
 
+    this.setPendingWriteCoordinator(null);
     await this.connectionPool.destroy();
 
     if (this.wss) {
@@ -1884,6 +2179,13 @@ export class GatewayService extends EventEmitter {
     const summaryKeys = summary?.publicKey ? [summary.publicKey] : [];
     const blindPeerKeys = summaryKeys.length ? summaryKeys : defaultKeys;
     const combinedBlindPeerKeys = Array.from(new Set([...manualKeys, ...blindPeerKeys]));
+    const workerLeaseMetrics = {
+      count: this.workerLeaseLagStats?.count || 0,
+      lastMs: this.workerLeaseLagStats?.lastMs ?? null,
+      avgMs: this.workerLeaseLagStats?.count
+        ? Math.round(this.workerLeaseLagStats.totalMs / this.workerLeaseLagStats.count)
+        : null
+    };
 
     return {
       enabled,
@@ -1918,10 +2220,15 @@ export class GatewayService extends EventEmitter {
       wsBase: enabled ? (config.resolvedWsUrl || this.publicGatewayWsBase) : null,
       lastUpdatedAt: this.publicGatewayStatusUpdatedAt,
       relays,
+      rotations: this.#serializeGatewayRotations(),
       discoveredGateways: this.discoveredGateways || [],
       discoveryUnavailableReason: this.discoveryDisabledReason,
       discoveryWarning: this.discoveryWarning,
-      disabledReason: enabled ? null : (config.disabledReason || this.discoveryDisabledReason || null)
+      disabledReason: enabled ? null : (config.disabledReason || this.discoveryDisabledReason || null),
+      pendingWrites: this.pendingWriteCoordinator?.getSnapshot?.() || null,
+      leaseMetrics: {
+        worker: workerLeaseMetrics
+      }
     };
   }
 
@@ -1955,8 +2262,80 @@ export class GatewayService extends EventEmitter {
     };
   }
 
-  async syncPublicGatewayRelay(relayKey, { forceTokenRefresh = true } = {}) {
-    await this.#syncPublicGatewayRelay(relayKey, { forceTokenRefresh });
+  async syncPublicGatewayRelay(relayKey, { forceTokenRefresh = true, forceEscrowRefresh = false } = {}) {
+    await this.#syncPublicGatewayRelay(relayKey, { forceTokenRefresh, forceEscrowRefresh });
+  }
+
+  async rotateGatewayWriter(relayKey, reason = 'manual') {
+    if (!relayKey) return false;
+    try {
+      await this.#triggerGatewayWriterRotation(relayKey, { reason, skipIfEscrowDisabled: false });
+      return true;
+    } catch (error) {
+      this.log('warn', `[PublicGateway] Gateway writer rotation failed for ${relayKey}: ${error.message}`);
+      return false;
+    }
+  }
+
+  async #rotateAllGatewayWriters(reason = 'worker-reconnect') {
+    if (!this.#isEscrowEnabled()) return;
+    for (const relayKey of this.activeRelays.keys()) {
+      try {
+        await this.#triggerGatewayWriterRotation(relayKey, { reason, skipIfEscrowDisabled: false });
+      } catch (error) {
+        this.log('warn', `[PublicGateway] ${reason} rotation failed for ${relayKey}: ${error.message}`);
+      }
+    }
+  }
+
+  async #triggerGatewayWriterRotation(relayKey, { reason = 'manual', skipIfEscrowDisabled = false } = {}) {
+    if (!relayKey) return false;
+    if (!this.#isEscrowEnabled()) {
+      if (!skipIfEscrowDisabled) {
+        this.log('debug', `[PublicGateway] Escrow disabled; skipping rotation for ${relayKey}`);
+      }
+      return false;
+    }
+
+    const rotationId = `rotation-${++this.gatewayRotationSequence}`;
+    const previousDeposit = this.publicGatewayEscrowDeposits.get(relayKey) || null;
+    const entry = {
+      rotationId,
+      relayKey,
+      reason,
+      status: 'pending',
+      attempts: (this.gatewayEscrowRotations.get(relayKey)?.attempts || 0) + 1,
+      previousEscrowId: previousDeposit?.escrowId || null,
+      startedAt: Date.now(),
+      error: null
+    };
+    this.#recordRotationSnapshot(relayKey, entry);
+
+    try {
+      await this.#revokeGatewayEscrowLease(relayKey, entry.previousEscrowId, reason);
+    } catch (error) {
+      entry.status = 'failed';
+      entry.error = error?.message || error;
+      entry.completedAt = Date.now();
+      this.#recordRotationSnapshot(relayKey, entry);
+      throw error;
+    }
+
+    this.publicGatewayEscrowDeposits.delete(relayKey);
+
+    try {
+      await this.#syncPublicGatewayRelay(relayKey, { forceTokenRefresh: false, forceEscrowRefresh: true });
+      entry.status = 'completed';
+      entry.completedAt = Date.now();
+      this.#recordRotationSnapshot(relayKey, entry);
+      return true;
+    } catch (error) {
+      entry.status = 'failed';
+      entry.error = error?.message || error;
+      entry.completedAt = Date.now();
+      this.#recordRotationSnapshot(relayKey, entry);
+      throw error;
+    }
   }
 
   async resyncPublicGateway() {
@@ -2001,12 +2380,18 @@ export class GatewayService extends EventEmitter {
     if (isEnabled) {
       try {
         await this.resyncPublicGateway();
+        if (!this.publicGatewayRotationsInitialized) {
+          await this.#rotateAllGatewayWriters('worker-reconnect');
+          this.publicGatewayRotationsInitialized = true;
+        }
       } catch (error) {
         this.log('warn', `[PublicGateway] Resync failed: ${error.message}`);
       }
     } else {
       this.publicGatewayRelayState.clear();
       this.#clearAllRelayTokens();
+      this.publicGatewayRotationsInitialized = false;
+      this.gatewayEscrowRotations.clear();
     }
 
     const previousHash = previousSettings?.resolvedSharedSecretHash || null;
@@ -3933,6 +4318,33 @@ export class GatewayService extends EventEmitter {
         this.blindPeerFallbackState.inflight = null;
       }
     }
+  }
+
+  #recordRotationSnapshot(relayKey, snapshot) {
+    if (!relayKey || !snapshot) return;
+    const entry = {
+      rotationId: snapshot.rotationId || null,
+      relayKey,
+      reason: snapshot.reason || 'unknown',
+      status: snapshot.status || 'pending',
+      attempts: snapshot.attempts || 1,
+      previousEscrowId: snapshot.previousEscrowId || null,
+      startedAt: snapshot.startedAt || Date.now(),
+      completedAt: snapshot.completedAt || null,
+      error: snapshot.error || null
+    };
+    this.gatewayEscrowRotations.set(relayKey, entry);
+    this.pendingWriteCoordinator?.recordRotation?.(entry);
+    this.emit('gateway-escrow-rotation', entry);
+    this.#emitPublicGatewayStatus();
+  }
+
+  #serializeGatewayRotations() {
+    const result = {};
+    for (const [relayKey, entry] of this.gatewayEscrowRotations.entries()) {
+      result[relayKey] = { ...entry };
+    }
+    return result;
   }
 
   getPeersWithPfpDrive() {

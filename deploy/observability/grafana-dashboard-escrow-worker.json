@@ -1,0 +1,82 @@
+{
+  "title": "Hypertuna Escrow & Worker",
+  "uid": "hypertuna-escrow",
+  "schemaVersion": 38,
+  "version": 1,
+  "time": { "from": "now-6h", "to": "now" },
+  "refresh": "1m",
+  "panels": [
+    {
+      "type": "timeseries",
+      "title": "Escrow Unlock Throughput",
+      "gridPos": { "x": 0, "y": 0, "w": 12, "h": 8 },
+      "targets": [
+        {
+          "expr": "rate(escrow_unlock_total[$__rate_interval])",
+          "legendFormat": "{{result}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Escrow Policy Rejections",
+      "gridPos": { "x": 12, "y": 0, "w": 12, "h": 8 },
+      "targets": [
+        {
+          "expr": "rate(escrow_policy_rejections_total[$__rate_interval])",
+          "legendFormat": "{{reason}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Active Escrow Leases",
+      "gridPos": { "x": 0, "y": 8, "w": 12, "h": 6 },
+      "targets": [
+        {
+          "expr": "escrow_active_leases",
+          "legendFormat": "active",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Unlock Duration p95",
+      "gridPos": { "x": 12, "y": 8, "w": 12, "h": 6 },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(escrow_unlock_duration_seconds_bucket[$__rate_interval])) by (le))",
+          "legendFormat": "p95 seconds",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Worker Pending Write Queue",
+      "gridPos": { "x": 0, "y": 14, "w": 12, "h": 8 },
+      "targets": [
+        {
+          "expr": "gateway_pending_write_push_wait_seconds_sum / gateway_pending_write_push_wait_seconds_count",
+          "legendFormat": "avg ack seconds",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Lease Lag Samples (Worker)",
+      "gridPos": { "x": 12, "y": 14, "w": 12, "h": 8 },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.9, sum(rate(gateway_escrow_lease_lag_seconds_bucket[$__rate_interval])) by (le))",
+          "legendFormat": "p90 gateway",
+          "refId": "A"
+        }
+      ]
+    }
+  ]
+}

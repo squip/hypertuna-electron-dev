@@ -9,17 +9,22 @@ RUN apt-get update && \
       build-essential \
       python3 \
       pkg-config \
-      libsodium-dev && \
+      libsodium-dev \
+      postgresql \
+      postgresql-client && \
     rm -rf /var/lib/apt/lists/*
 
 COPY public-gateway/package*.json ./
 RUN npm install --omit=dev
 
 COPY public-gateway/src ./src
+COPY public-gateway/bin ./bin
 COPY shared /app/shared
 
-RUN npm install --prefix /app/shared --omit=dev
+RUN npm install --prefix /app/shared --omit=dev && \
+    chmod +x ./bin/start.sh
 
 ENV NODE_PATH=/app/public-gateway/node_modules:/app/shared/node_modules
+ENV POSTGRES_DATA_DIR=/data/postgres
 EXPOSE 4430
-CMD ["node", "src/index.mjs"]
+CMD ["./bin/start.sh"]

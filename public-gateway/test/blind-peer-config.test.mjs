@@ -50,3 +50,24 @@ test('blind peer negative values fall back to defaults', () => {
   assert.equal(config.blindPeer.dedupeBatchSize, 100);
   assert.equal(config.blindPeer.staleCoreTtlMs, 7 * 24 * 60 * 60 * 1000);
 });
+
+test('escrow TLS settings are normalised', () => {
+  const config = loadConfig({
+    escrow: {
+      enabled: true,
+      baseUrl: 'https://gateway.example.com/api/escrow',
+      sharedSecret: 'secret',
+      tls: {
+        caPath: '/etc/escrow/ca.pem',
+        clientCertPath: '/etc/escrow/client.pem',
+        clientKeyPath: '/etc/escrow/client-key.pem',
+        rejectUnauthorized: false
+      }
+    }
+  });
+
+  assert.equal(config.escrow.tls.caPath, '/etc/escrow/ca.pem');
+  assert.equal(config.escrow.tls.clientCertPath, '/etc/escrow/client.pem');
+  assert.equal(config.escrow.tls.clientKeyPath, '/etc/escrow/client-key.pem');
+  assert.equal(config.escrow.tls.rejectUnauthorized, false);
+});

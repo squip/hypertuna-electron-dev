@@ -37,6 +37,31 @@ const relayErrorCounter = new client.Counter({
   labelNames: ['stage']
 });
 
+const relayFallbackReadCounter = new client.Counter({
+  name: 'gateway_relay_fallback_reads_total',
+  help: 'Count of relay reads served via local replicas',
+  labelNames: ['relay', 'reason']
+});
+
+const relayFallbackWriteCounter = new client.Counter({
+  name: 'gateway_relay_fallback_writes_total',
+  help: 'Count of relay EVENT writes handled via local replicas',
+  labelNames: ['relay', 'result']
+});
+
+const relayReplicaSessionsGauge = new client.Gauge({
+  name: 'gateway_relay_replica_sessions',
+  help: 'Number of websocket sessions currently served via replica fallback',
+  labelNames: ['relay']
+});
+
+const relayFallbackDurationHistogram = new client.Histogram({
+  name: 'gateway_relay_fallback_duration_seconds',
+  help: 'Duration spent serving a websocket session via replica fallback',
+  labelNames: ['relay'],
+  buckets: [0.1, 0.5, 1, 2, 5, 10, 30, 60, 120]
+});
+
 const relayTokenIssueCounter = new client.Counter({
   name: 'gateway_relay_token_issues_total',
   help: 'Count of relay tokens issued by the gateway',
@@ -93,6 +118,25 @@ const blindPeerMirrorLagGauge = new client.Gauge({
   labelNames: ['identifier', 'owner', 'type']
 });
 
+const pendingWritesGauge = new client.Gauge({
+  name: 'gateway_pending_writes',
+  help: 'Indicates whether a relay currently has pending gateway-authored writes (1 = pending, 0 = clear)',
+  labelNames: ['relay']
+});
+
+const pendingWritePushCounter = new client.Counter({
+  name: 'gateway_pending_write_push_total',
+  help: 'Count of pending-write push attempts emitted by the gateway',
+  labelNames: ['result']
+});
+
+const pendingWritePushWaitHistogram = new client.Histogram({
+  name: 'gateway_pending_write_push_wait_seconds',
+  help: 'Time between the first pending write and the first worker acknowledgement per relay',
+  labelNames: ['relay'],
+  buckets: [5, 15, 30, 60, 120, 300, 600]
+});
+
 const escrowUnlockCounter = new client.Counter({
   name: 'gateway_escrow_unlock_requests_total',
   help: 'Count of escrow unlock requests issued by the gateway',
@@ -105,12 +149,47 @@ const escrowLeaseGauge = new client.Gauge({
   labelNames: ['relay']
 });
 
+const escrowLeaseRotationCounter = new client.Counter({
+  name: 'gateway_escrow_rotation_total',
+  help: 'Count of gateway escrow lease rotations/releases grouped by reason/result',
+  labelNames: ['reason', 'result']
+});
+
+const escrowPolicyRejectionCounter = new client.Counter({
+  name: 'gateway_escrow_policy_rejections_total',
+  help: 'Count of escrow unlock attempts rejected by policy',
+  labelNames: ['reason']
+});
+
+const escrowLeaseLagHistogram = new client.Histogram({
+  name: 'gateway_escrow_lease_lag_seconds',
+  help: 'Time between lease issuance and release/peer recovery',
+  labelNames: ['relay', 'reason'],
+  buckets: [1, 5, 10, 30, 60, 120, 300, 600, 1200]
+});
+
+const escrowLeaseExpiryGauge = new client.Gauge({
+  name: 'gateway_escrow_lease_time_to_expiry_seconds',
+  help: 'Seconds until the current lease expires for each relay (0 when inactive)',
+  labelNames: ['relay']
+});
+
+const gatewayReplicaFallbackCounter = new client.Counter({
+  name: 'gateway_replica_fallback_total',
+  help: 'Count of replica fallback events served locally by the gateway',
+  labelNames: ['relay', 'mode']
+});
+
 register.registerMetric(sessionGauge);
 register.registerMetric(peerGauge);
 register.registerMetric(requestCounter);
 register.registerMetric(relayEventCounter);
 register.registerMetric(relayReqCounter);
 register.registerMetric(relayErrorCounter);
+register.registerMetric(relayFallbackReadCounter);
+register.registerMetric(relayFallbackWriteCounter);
+register.registerMetric(relayReplicaSessionsGauge);
+register.registerMetric(relayFallbackDurationHistogram);
 register.registerMetric(relayTokenIssueCounter);
 register.registerMetric(relayTokenRefreshCounter);
 register.registerMetric(relayTokenRevocationCounter);
@@ -121,8 +200,16 @@ register.registerMetric(blindPeerGcRunsCounter);
 register.registerMetric(blindPeerEvictionsCounter);
 register.registerMetric(blindPeerMirrorStateGauge);
 register.registerMetric(blindPeerMirrorLagGauge);
+register.registerMetric(pendingWritesGauge);
+register.registerMetric(pendingWritePushCounter);
+register.registerMetric(pendingWritePushWaitHistogram);
 register.registerMetric(escrowUnlockCounter);
 register.registerMetric(escrowLeaseGauge);
+register.registerMetric(escrowLeaseRotationCounter);
+register.registerMetric(escrowPolicyRejectionCounter);
+register.registerMetric(escrowLeaseLagHistogram);
+register.registerMetric(escrowLeaseExpiryGauge);
+register.registerMetric(gatewayReplicaFallbackCounter);
 
 function metricsMiddleware(path = '/metrics') {
   return async (req, res, next) => {
@@ -144,6 +231,10 @@ export {
   relayEventCounter,
   relayReqCounter,
   relayErrorCounter,
+  relayFallbackReadCounter,
+  relayFallbackWriteCounter,
+  relayReplicaSessionsGauge,
+  relayFallbackDurationHistogram,
   relayTokenIssueCounter,
   relayTokenRefreshCounter,
   relayTokenRevocationCounter,
@@ -154,7 +245,15 @@ export {
   blindPeerEvictionsCounter,
   blindPeerMirrorStateGauge,
   blindPeerMirrorLagGauge,
+  pendingWritesGauge,
+  pendingWritePushCounter,
+  pendingWritePushWaitHistogram,
   escrowUnlockCounter,
   escrowLeaseGauge,
+  escrowLeaseRotationCounter,
+  escrowPolicyRejectionCounter,
+  escrowLeaseLagHistogram,
+  escrowLeaseExpiryGauge,
+  gatewayReplicaFallbackCounter,
   metricsMiddleware
 };

@@ -3,8 +3,11 @@ import { dirname, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
 
 import AutobaseKeyEscrowStore from './AutobaseKeyEscrowStore.mjs';
+import AutobaseKeyEscrowPgStore from './AutobaseKeyEscrowPgStore.mjs';
 import AutobaseKeyEscrowPolicyEngine from './AutobaseKeyEscrowPolicyEngine.mjs';
 import AutobaseKeyEscrowAuditLog from './AutobaseKeyEscrowAuditLog.mjs';
+import AutobaseKeyEscrowPgAuditLog from './AutobaseKeyEscrowPgAuditLog.mjs';
+import AutobaseKeyEscrowPgLeaseHistory from './AutobaseKeyEscrowPgLeaseHistory.mjs';
 import {
   openPayload,
   sealPayload,
@@ -12,36 +15,58 @@ import {
   decodeKey,
   generateKeyPair,
   zeroize,
-  hashSecret
+  hashSecret,
+  withZeroizedBuffer
 } from '../../../shared/escrow/AutobaseKeyEscrowCrypto.mjs';
+import LeaseVault from '../../../shared/escrow/LeaseVault.mjs';
 
 class AutobaseKeyEscrowService {
-  constructor({ config, logger = console } = {}) {
+  constructor({ config, logger = console, dbPool = null, metrics = {} } = {}) {
     if (!config) throw new Error('AutobaseKeyEscrowService requires a config');
     if (!config.sharedSecret) {
       throw new Error('Escrow service requires a shared secret for request authentication');
     }
     this.config = config;
     this.logger = logger;
-    this.store = new AutobaseKeyEscrowStore({
-      persistPath: resolve(config.storageDir, 'escrow-records.json')
-    });
+    this.dbPool = dbPool;
+    this.useDbBackend = Boolean(dbPool && config?.db?.enabled);
+    if (this.useDbBackend) {
+      this.store = new AutobaseKeyEscrowPgStore({ pool: dbPool, logger });
+      this.auditLog = new AutobaseKeyEscrowPgAuditLog({ pool: dbPool, logger });
+      this.leaseHistory = new AutobaseKeyEscrowPgLeaseHistory({ pool: dbPool, logger });
+    } else {
+      this.store = new AutobaseKeyEscrowStore({
+        persistPath: resolve(config.storageDir, 'escrow-records.json')
+      });
+      this.auditLog = new AutobaseKeyEscrowAuditLog({
+        storageDir: config.auditDir,
+        namespace: 'autobase-escrow-audit',
+        logger
+      });
+      this.leaseHistory = null;
+    }
     this.policyEngine = new AutobaseKeyEscrowPolicyEngine(config.policy, { logger });
-    this.auditLog = new AutobaseKeyEscrowAuditLog({
-      storageDir: config.auditDir,
-      namespace: 'autobase-escrow-audit',
-      logger
-    });
     this.keyPair = null;
-    this.leases = new Map();
+    this.leaseVault = new LeaseVault({
+      logger,
+      label: 'autobase-escrow-service'
+    });
     this.cleanupTimer = null;
+    this.metrics = {
+      recordUnlock: metrics.recordUnlock || (() => {}),
+      recordPolicyRejection: metrics.recordPolicyRejection || (() => {}),
+      setActiveLeases: metrics.setActiveLeases || (() => {}),
+      observeUnlockDuration: metrics.observeUnlockDuration || (() => {})
+    };
   }
 
   async init() {
     await this.store.init();
     await this.auditLog.init();
+    await this.leaseHistory?.init?.();
     await this.#ensureKeyPair();
     this.#startCleanup();
+    this.#refreshActiveLeaseCount();
   }
 
   async stop() {
@@ -50,7 +75,8 @@ class AutobaseKeyEscrowService {
       this.cleanupTimer = null;
     }
     await this.auditLog.close();
-    this.leases.clear();
+    this.leaseVault?.destroy?.('autobase-escrow-service-stop');
+    this.metrics.setActiveLeases?.(0);
   }
 
   getSharedSecret() {
@@ -68,24 +94,23 @@ class AutobaseKeyEscrowService {
   }
 
   listLeases() {
-    return Array.from(this.leases.values()).map((lease) => ({
+    return this.leaseVault.list().map((lease) => ({
       leaseId: lease.leaseId,
       relayKey: lease.relayKey,
       escrowId: lease.escrowId,
       requesterId: lease.requesterId,
+      ownerPeerKey: lease.ownerPeerKey || lease.writerPackage?.ownerPeerKey || null,
       issuedAt: lease.issuedAt,
       expiresAt: lease.expiresAt,
       evidence: lease.evidence,
-      reasons: lease.reasons || []
+      reasons: lease.reasons || [],
+      payloadDigest: lease.payloadDigest || lease.writerPackage?.writerKeyDigest || null
     }));
   }
 
   getLeaseByRelay(relayKey) {
     if (!relayKey) return null;
-    for (const lease of this.leases.values()) {
-      if (lease.relayKey === relayKey) return lease;
-    }
-    return null;
+    return this.leaseVault.get(relayKey, { includeSecret: true });
   }
 
   async createDeposit({
@@ -162,84 +187,113 @@ class AutobaseKeyEscrowService {
     if (!relayKey || !sessionPublicKey) {
       throw new Error('relayKey and sessionPublicKey are required to request unlock');
     }
-    const record = this.store.getByRelayKey(relayKey);
+    const record = await this.store.getByRelayKey(relayKey);
     if (!record) {
       throw new Error('escrow-record-not-found');
     }
 
-    const evaluation = this.policyEngine.evaluateUnlock(record, evidence);
-    if (!evaluation.allow) {
-      await this.auditLog.append({
-        type: 'unlock-rejected',
-        relayKey,
-        escrowId: record.id,
-        requesterId,
-        evidence,
-        reasons: evaluation.reasons
-      });
-      const error = new Error(`unlock-rejected:${evaluation.reasons.join(',')}`);
-      error.statusCode = 412;
-      error.reasons = evaluation.reasons;
-      throw error;
-    }
-
-    const decrypted = this.#decryptPackage(record.encryptedPackage);
-    let writerPayload = null;
+    const stopTimer = this.#startUnlockTimer();
     try {
-      writerPayload = JSON.parse(decrypted.toString('utf8'));
+      const evaluation = this.policyEngine.evaluateUnlock(record, evidence);
+      if (!evaluation.allow) {
+        await this.auditLog.append({
+          type: 'unlock-rejected',
+          relayKey,
+          escrowId: record.id,
+          requesterId,
+          evidence,
+          reasons: evaluation.reasons
+        });
+        this.metrics.recordPolicyRejection(evaluation.reasons || ['unknown']);
+        this.metrics.recordUnlock('policy-rejection');
+        const error = new Error(`unlock-rejected:${evaluation.reasons.join(',')}`);
+        error.statusCode = 412;
+        error.reasons = evaluation.reasons;
+        throw error;
+      }
+
+      const writerPayload = await withZeroizedBuffer(
+        () => this.#decryptPackage(record.encryptedPackage),
+        (buffer) => {
+          if (!buffer) {
+            throw new Error('encrypted-writer-payload-empty');
+          }
+          return JSON.parse(Buffer.from(buffer).toString('utf8'));
+        }
+      );
+
+      if (writerPayload?.relayKey && writerPayload.relayKey !== relayKey) {
+        throw new Error('relay-mismatch');
+      }
+
+      const leaseId = `lease_${randomUUID()}`;
+      const now = Date.now();
+      const policy = this.policyEngine.getPolicyMetadata();
+      const expiresAt = now + policy.leaseTtlMs;
+      const payloadDigest = hashSecret(writerPayload.writerKey || writerPayload.secret || record.id);
+
+      const sealedLease = sealPayload({
+        payload: writerPayload,
+        recipientPublicKey: sessionPublicKey,
+        senderSecretKey: this.keyPair.secretKey,
+        senderPublicKey: this.keyPair.publicKey
+      });
+
+      const ownerPeerKey = writerPayload.ownerPeerKey || null;
+      const lease = {
+        leaseId,
+        escrowId: record.id,
+        relayKey,
+        requesterId: requesterId || null,
+        issuedAt: now,
+        expiresAt,
+        evidence,
+        reasons: evaluation.reasons || [],
+        ownerPeerKey,
+        payloadDigest,
+        writerPackage: {
+          ownerPeerKey,
+          writerKeyDigest: payloadDigest
+        }
+      };
+      const trackedLease = this.leaseVault.track(lease, { includeSecret: false });
+      this.#refreshActiveLeaseCount();
+      await this.#recordLeaseIssued(trackedLease || lease);
+
+      if (writerPayload.writerKey) {
+        writerPayload.writerKey = null;
+      }
+      if (writerPayload.secret) {
+        writerPayload.secret = null;
+      }
+
+      await this.auditLog.append({
+        type: 'unlock-issued',
+        leaseId,
+        escrowId: record.id,
+        relayKey,
+        requesterId,
+        expiresAt,
+        evidence
+      });
+
+      this.metrics.recordUnlock('success');
+
+      return {
+        leaseId,
+        escrowId: record.id,
+        relayKey,
+        expiresAt,
+        sealedLease
+      };
     } catch (error) {
-      zeroize(decrypted);
-      throw new Error('encrypted-writer-payload-invalid');
+      if (error?.statusCode !== 412) {
+        this.metrics.recordUnlock('error');
+      }
+      throw error;
     } finally {
-      zeroize(decrypted);
+      stopTimer();
     }
-
-    if (writerPayload?.relayKey && writerPayload.relayKey !== relayKey) {
-      throw new Error('relay-mismatch');
-    }
-
-    const leaseId = `lease_${randomUUID()}`;
-    const now = Date.now();
-    const policy = this.policyEngine.getPolicyMetadata();
-    const expiresAt = now + policy.leaseTtlMs;
-
-    const sealedLease = sealPayload({
-      payload: writerPayload,
-      recipientPublicKey: sessionPublicKey,
-      senderSecretKey: this.keyPair.secretKey,
-      senderPublicKey: this.keyPair.publicKey
-    });
-
-    const lease = {
-      leaseId,
-      escrowId: record.id,
-      relayKey,
-      requesterId: requesterId || null,
-      issuedAt: now,
-      expiresAt,
-      evidence,
-      reasons: evaluation.reasons || [],
-      payloadDigest: hashSecret(writerPayload.writerKey || writerPayload.secret || record.id)
-    };
-    this.leases.set(leaseId, lease);
-
-    await this.auditLog.append({
-      type: 'unlock-issued',
-      leaseId,
-      escrowId: record.id,
-      relayKey,
-      requesterId,
-      expiresAt,
-      evidence
-    });
-
-    return {
-      leaseId,
-      escrowId: record.id,
-      relayKey,
-      expiresAt,
-      sealedLease
-    };
   }
 
   async revoke({
@@ -249,8 +303,8 @@ class AutobaseKeyEscrowService {
     reason = 'unspecified'
   } = {}) {
     const record = escrowId
-      ? this.store.getById(escrowId)
-      : this.store.getByRelayKey(relayKey);
+      ? await this.store.getById(escrowId)
+      : await this.store.getByRelayKey(relayKey);
     if (!record) return false;
     if (record.revokedAt) return true;
     await this.store.update(record.id, {
@@ -258,11 +312,9 @@ class AutobaseKeyEscrowService {
       revokedBy: actor,
       revokedReason: reason
     });
-    for (const lease of this.leases.values()) {
-      if (lease.escrowId === record.id) {
-        this.leases.delete(lease.leaseId);
-      }
-    }
+    const released = this.leaseVault.releaseByEscrowId(record.id, `revoke:${reason}`);
+    this.#refreshActiveLeaseCount();
+    await this.#recordLeaseReleased(released, `revoke:${reason}`);
     await this.auditLog.append({
       type: 'deposit-revoked',
       escrowId: record.id,
@@ -327,13 +379,79 @@ class AutobaseKeyEscrowService {
   #startCleanup() {
     if (this.cleanupTimer) return;
     this.cleanupTimer = setInterval(() => {
-      const now = Date.now();
-      for (const [leaseId, lease] of this.leases.entries()) {
-        if (lease.expiresAt && lease.expiresAt < now) {
-          this.leases.delete(leaseId);
+      try {
+        const released = this.leaseVault.releaseExpired(Date.now());
+        if (released?.length) {
+          this.#refreshActiveLeaseCount();
+          this.#recordLeaseReleased(released, 'expired').catch((error) => {
+            this.logger?.warn?.('[EscrowService] Failed to record expired lease cleanup', {
+              error: error?.message || error
+            });
+          });
         }
+      } catch (error) {
+        this.logger?.warn?.('[EscrowService] Lease cleanup failed', {
+          error: error?.message || error
+        });
       }
     }, 30_000).unref();
+  }
+
+  async #recordLeaseIssued(lease) {
+    if (!this.leaseHistory || !lease) return;
+    await this.leaseHistory.recordIssued({
+      leaseId: lease.leaseId,
+      escrowId: lease.escrowId,
+      relayKey: lease.relayKey,
+      requesterId: lease.requesterId,
+      issuedAt: lease.issuedAt,
+      expiresAt: lease.expiresAt,
+      evidence: lease.evidence,
+      reasons: lease.reasons,
+      payloadDigest: lease.payloadDigest
+    });
+  }
+
+  async #recordLeaseReleased(released = [], reason = null) {
+    if (!this.leaseHistory || !Array.isArray(released) || !released.length) return;
+    const releasedAt = Date.now();
+    await Promise.allSettled(released.map((lease) => this.leaseHistory.recordReleased(lease.leaseId, {
+      releasedAt: lease.releasedAt || releasedAt,
+      reason
+    })));
+    await Promise.allSettled(released.map((lease) => this.auditLog.append({
+      type: 'lease-released',
+      leaseId: lease.leaseId,
+      escrowId: lease.escrowId,
+      relayKey: lease.relayKey,
+      actor: 'lease-vault',
+      metadata: {
+        reason,
+        releasedAt: lease.releasedAt || releasedAt
+      }
+    })));
+  }
+
+  #refreshActiveLeaseCount() {
+    const count = this.leaseVault?.count?.()
+      ?? (typeof this.leaseVault?.list === 'function' ? this.leaseVault.list().length : 0);
+    this.metrics.setActiveLeases?.(count);
+  }
+
+  #startUnlockTimer() {
+    const hasHrtime = typeof process?.hrtime?.bigint === 'function';
+    if (hasHrtime) {
+      const start = process.hrtime.bigint();
+      return () => {
+        const diff = Number(process.hrtime.bigint() - start) / 1e9;
+        this.metrics.observeUnlockDuration?.(diff);
+      };
+    }
+    const startMs = Date.now();
+    return () => {
+      const diff = (Date.now() - startMs) / 1000;
+      this.metrics.observeUnlockDuration?.(diff);
+    };
   }
 }
 

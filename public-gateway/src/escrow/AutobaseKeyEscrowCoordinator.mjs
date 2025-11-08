@@ -1,11 +1,16 @@
 import { EventEmitter } from 'node:events';
+import { readFile } from 'node:fs/promises';
 
 import AutobaseKeyEscrowClient from '../../../shared/escrow/AutobaseKeyEscrowClient.mjs';
+import LeaseVault from '../../../shared/escrow/LeaseVault.mjs';
 import {
   generateKeyPair,
   encodeKey,
   openPayload,
-  zeroize
+  zeroize,
+  withZeroizedBuffer,
+  toSecureBuffer,
+  hashSecret
 } from '../../../shared/escrow/AutobaseKeyEscrowCrypto.mjs';
 
 class AutobaseKeyEscrowCoordinator extends EventEmitter {
@@ -15,11 +20,15 @@ class AutobaseKeyEscrowCoordinator extends EventEmitter {
     this.logger = logger;
     this.metrics = {
       recordUnlock: metrics.recordUnlock || (() => {}),
-      setLeaseState: metrics.setLeaseState || (() => {})
+      setLeaseState: metrics.setLeaseState || (() => {}),
+      recordPolicyRejection: metrics.recordPolicyRejection || (() => {})
     };
     this.replicaManager = replicaManager;
     this.client = null;
-    this.leases = new Map(); // relayKey => lease
+    this.leaseVault = new LeaseVault({
+      logger,
+      label: 'public-gateway-coordinator'
+    });
   }
 
   isEnabled() {
@@ -31,11 +40,13 @@ class AutobaseKeyEscrowCoordinator extends EventEmitter {
       this.logger?.info?.('[EscrowCoordinator] Disabled (missing configuration)');
       return;
     }
+    const tls = await this.#loadTlsMaterials();
     this.client = new AutobaseKeyEscrowClient({
       baseUrl: this.config.baseUrl,
       sharedSecret: this.config.sharedSecret,
       clientId: this.config.clientId || 'public-gateway',
-      fetchImpl: globalThis.fetch?.bind(globalThis)
+      fetchImpl: globalThis.fetch?.bind(globalThis),
+      tls
     });
     this.logger?.info?.('[EscrowCoordinator] Initialized', {
       escrowBaseUrl: this.config.baseUrl
@@ -43,10 +54,7 @@ class AutobaseKeyEscrowCoordinator extends EventEmitter {
   }
 
   async stop() {
-    for (const lease of this.leases.values()) {
-      this.#clearLease(lease.relayKey, 'shutdown');
-    }
-    this.leases.clear();
+    this.leaseVault?.destroy?.('escrow-coordinator-stop');
   }
 
   setReplicaManager(replicaManager) {
@@ -54,18 +62,19 @@ class AutobaseKeyEscrowCoordinator extends EventEmitter {
   }
 
   getLeaseSummaries() {
-    return Array.from(this.leases.values()).map((lease) => ({
+    return this.leaseVault.list().map((lease) => ({
       relayKey: lease.relayKey,
       leaseId: lease.leaseId,
       escrowId: lease.escrowId,
       issuedAt: lease.issuedAt,
       expiresAt: lease.expiresAt,
-      ownerPeerKey: lease.writerPackage?.ownerPeerKey || null
+      ownerPeerKey: lease.ownerPeerKey || lease.writerPackage?.ownerPeerKey || null,
+      payloadDigest: lease.payloadDigest || lease.writerPackage?.writerKeyDigest || null
     }));
   }
 
   getLease(relayKey) {
-    return relayKey ? (this.leases.get(relayKey) || null) : null;
+    return this.leaseVault.get(relayKey, { includeSecret: true });
   }
 
   async requestLease({ relayKey, evidence = {}, requesterId = 'public-gateway' } = {}) {
@@ -88,30 +97,45 @@ class AutobaseKeyEscrowCoordinator extends EventEmitter {
         evidence
       });
     } catch (error) {
-      this.metrics.recordUnlock('error');
+      if (error?.statusCode === 412) {
+        this.metrics.recordPolicyRejection(error?.reasons || ['unknown']);
+        this.metrics.recordUnlock('policy-rejection');
+      } else {
+        this.metrics.recordUnlock('error');
+      }
       throw error;
     }
 
-    let decrypted = null;
-    try {
-      decrypted = openPayload({
+    const writerPackage = await withZeroizedBuffer(
+      () => openPayload({
         cipherText: response.sealedLease?.cipherText,
         nonce: response.sealedLease?.nonce,
         senderPublicKey: response.sealedLease?.publicKey,
         recipientSecretKey: sessionPair.secretKey
-      });
-    } finally {
-      zeroize(sessionPair.secretKey);
+      }),
+      (buffer) => {
+        if (!buffer) {
+          throw new Error('lease-payload-empty');
+        }
+        return JSON.parse(Buffer.from(buffer).toString('utf8'));
+      }
+    );
+    zeroize(sessionPair.secretKey);
+
+    if (!writerPackage || typeof writerPackage !== 'object') {
+      throw new Error('lease-payload-invalid');
     }
 
-    let writerPackage = null;
-    try {
-      writerPackage = JSON.parse(decrypted.toString('utf8'));
-    } catch (error) {
-      throw new Error('lease-payload-invalid');
-    } finally {
-      zeroize(decrypted);
+    if (writerPackage?.relayKey && writerPackage.relayKey !== relayKey) {
+      throw new Error('relay-mismatch');
     }
+
+    const writerKeyBuffer = toSecureBuffer(writerPackage.writerKey || writerPackage.secret, { encodings: ['hex'] });
+    if (!writerKeyBuffer) {
+      throw new Error('writer-key-missing');
+    }
+    writerPackage.writerKey = writerKeyBuffer;
+    writerPackage.writerKeyDigest = writerPackage.writerKeyDigest || hashSecret(writerKeyBuffer);
 
     const lease = {
       relayKey,
@@ -123,41 +147,79 @@ class AutobaseKeyEscrowCoordinator extends EventEmitter {
       evidence
     };
 
-    this.#trackLease(relayKey, lease);
+    const trackedLease = this.#trackLease(relayKey, lease);
     this.metrics.recordUnlock('success');
-    this.emit('lease-issued', lease);
+    this.emit('lease-issued', trackedLease);
     return {
       relayKey,
-      leaseId: lease.leaseId,
-      escrowId: lease.escrowId,
-      expiresAt: lease.expiresAt
+      leaseId: trackedLease?.leaseId,
+      escrowId: trackedLease?.escrowId,
+      expiresAt: trackedLease?.expiresAt
     };
   }
 
   releaseLease(relayKey, reason = 'manual-release') {
-    return this.#clearLease(relayKey, reason);
+    const released = this.leaseVault.release(relayKey, reason);
+    if (!released) return false;
+    this.metrics.setLeaseState(relayKey, false);
+    this.replicaManager?.setWriterLeaseState?.(
+      relayKey,
+      released.ownerPeerKey || released.writerPackage?.ownerPeerKey || null,
+      null
+    );
+    this.emit('lease-released', { relayKey, leaseId: released.leaseId, reason });
+    return true;
   }
 
   #trackLease(relayKey, lease) {
-    if (!relayKey || !lease) return;
-    this.#clearLease(relayKey, 'superseded');
-    this.leases.set(relayKey, lease);
+    if (!relayKey || !lease) return null;
+    const trackedLease = this.leaseVault.track({
+      ...lease,
+      ownerPeerKey: lease.writerPackage?.ownerPeerKey || lease.ownerPeerKey || null
+    });
+    if (!trackedLease) return null;
     this.metrics.setLeaseState(relayKey, true);
-    this.replicaManager?.setWriterLeaseState?.(relayKey, lease.writerPackage?.ownerPeerKey, lease);
+    this.replicaManager?.setWriterLeaseState?.(
+      relayKey,
+      trackedLease.ownerPeerKey || trackedLease.writerPackage?.ownerPeerKey || null,
+      trackedLease
+    );
+    return trackedLease;
   }
 
-  #clearLease(relayKey, reason = 'expired') {
-    if (!relayKey) return false;
-    const existing = this.leases.get(relayKey);
-    if (!existing) return false;
-    if (existing.writerPackage) {
-      zeroize(existing.writerPackage.writerKey);
+  async #loadTlsMaterials() {
+    const tlsConfig = this.config?.tls;
+    if (!tlsConfig) return null;
+    const [ca, cert, key] = await Promise.all([
+      this.#readMaybe(tlsConfig.caPath || tlsConfig.clientCaPath),
+      this.#readMaybe(tlsConfig.clientCertPath),
+      this.#readMaybe(tlsConfig.clientKeyPath)
+    ]);
+    if (!ca && !cert && !key) {
+      if (tlsConfig.rejectUnauthorized === false) {
+        return { rejectUnauthorized: false };
+      }
+      return null;
     }
-    this.leases.delete(relayKey);
-    this.metrics.setLeaseState(relayKey, false);
-    this.replicaManager?.setWriterLeaseState?.(relayKey, existing.writerPackage?.ownerPeerKey, null);
-    this.emit('lease-released', { relayKey, leaseId: existing.leaseId, reason });
-    return true;
+    return {
+      ca: ca || undefined,
+      cert: cert || undefined,
+      key: key || undefined,
+      rejectUnauthorized: tlsConfig.rejectUnauthorized !== false
+    };
+  }
+
+  async #readMaybe(path) {
+    if (!path) return null;
+    try {
+      return await readFile(path);
+    } catch (error) {
+      this.logger?.warn?.('[EscrowCoordinator] Failed to read TLS material', {
+        path,
+        error: error?.message || error
+      });
+      throw error;
+    }
   }
 }
 

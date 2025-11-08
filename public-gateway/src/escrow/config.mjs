@@ -1,3 +1,5 @@
+import { readFile } from 'node:fs/promises';
+
 const DEFAULT_ESCROW_CONFIG = Object.freeze({
   host: process.env.AUTOBASING_ESCROW_HOST || process.env.ESCROW_HOST || '0.0.0.0',
   port: Number(process.env.AUTOBASING_ESCROW_PORT || process.env.ESCROW_PORT) || 4795,
@@ -9,6 +11,24 @@ const DEFAULT_ESCROW_CONFIG = Object.freeze({
     || process.env.ESCROW_SHARED_SECRET
     || process.env.GATEWAY_REGISTRATION_SECRET
     || null,
+  tls: {
+    enabled: process.env.AUTOBASING_ESCROW_TLS_ENABLED === 'true' || process.env.ESCROW_TLS_ENABLED === 'true',
+    keyPath: process.env.AUTOBASING_ESCROW_TLS_KEY_PATH || process.env.ESCROW_TLS_SERVER_KEY || null,
+    certPath: process.env.AUTOBASING_ESCROW_TLS_CERT_PATH || process.env.ESCROW_TLS_SERVER_CERT || null,
+    caPath: process.env.AUTOBASING_ESCROW_TLS_CA_PATH || process.env.ESCROW_TLS_CA || null,
+    requestClientCert: process.env.AUTOBASING_ESCROW_TLS_REQUEST_CLIENT_CERT === 'false' ? false : true,
+    rejectUnauthorized: process.env.AUTOBASING_ESCROW_TLS_REJECT_UNAUTHORIZED === 'false' ? false : true
+  },
+  db: {
+    enabled: process.env.ESCROW_DB_ENABLED !== 'false',
+    connectionString: process.env.ESCROW_DATABASE_URL || '',
+    poolSize: Number(process.env.ESCROW_DB_POOL_SIZE) || 5,
+    idleTimeoutMs: Number(process.env.ESCROW_DB_IDLE_TIMEOUT_MS) || 10000
+  },
+  metrics: {
+    enabled: process.env.ESCROW_METRICS_DISABLED === 'true' ? false : true,
+    path: process.env.ESCROW_METRICS_PATH || '/metrics'
+  },
   policy: {
     version: process.env.AUTOBASING_ESCROW_POLICY_VERSION
       || process.env.ESCROW_POLICY_VERSION
@@ -52,8 +72,28 @@ function loadEscrowConfig(overrides = {}) {
   const config = {
     ...DEFAULT_ESCROW_CONFIG,
     ...overrides,
-    policy: mergedPolicy
+    policy: mergedPolicy,
+    tls: {
+      ...DEFAULT_ESCROW_CONFIG.tls,
+      ...(overrides.tls || {})
+    },
+    db: {
+      ...DEFAULT_ESCROW_CONFIG.db,
+      ...(overrides.db || {})
+    },
+    metrics: {
+      ...DEFAULT_ESCROW_CONFIG.metrics,
+      ...(overrides.metrics || {})
+    }
   };
+
+  config.db.enabled = Boolean(
+    config.db.enabled
+    && (config.db.connectionString || process.env.ESCROW_DATABASE_URL)
+  );
+  if (!config.db.connectionString) {
+    config.db.connectionString = process.env.ESCROW_DATABASE_URL || '';
+  }
 
   if (!config.keyPath) {
     config.keyPath = `${config.storageDir}/keypair.json`;
@@ -65,7 +105,30 @@ function loadEscrowConfig(overrides = {}) {
   return config;
 }
 
+async function loadEscrowTlsOptions(tlsConfig = {}) {
+  if (!tlsConfig.enabled) return null;
+  if (!tlsConfig.keyPath || !tlsConfig.certPath) {
+    throw new Error('Escrow TLS requires both keyPath and certPath when enabled');
+  }
+  const [key, cert, ca] = await Promise.all([
+    readFile(tlsConfig.keyPath),
+    readFile(tlsConfig.certPath),
+    tlsConfig.caPath ? readFile(tlsConfig.caPath) : Promise.resolve(null)
+  ]);
+  return {
+    httpsOptions: {
+      key,
+      cert,
+      ca: ca ? [ca] : undefined,
+      requestCert: tlsConfig.requestClientCert !== false,
+      rejectUnauthorized: tlsConfig.rejectUnauthorized !== false
+    },
+    watchFiles: [tlsConfig.keyPath, tlsConfig.certPath, tlsConfig.caPath].filter(Boolean)
+  };
+}
+
 export {
   DEFAULT_ESCROW_CONFIG,
-  loadEscrowConfig
+  loadEscrowConfig,
+  loadEscrowTlsOptions
 };

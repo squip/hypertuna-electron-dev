@@ -129,6 +129,54 @@ function hashSecret(value) {
   return createHash('sha256').update(buf).digest('hex');
 }
 
+function toSecureBuffer(source, { encodings = ['base64', 'hex'] } = {}) {
+  if (Buffer.isBuffer(source)) return Buffer.from(source);
+  if (source instanceof Uint8Array) return Buffer.from(source);
+  if (typeof source === 'string') {
+    const buf = bufferFromString(source, encodings);
+    return buf ? Buffer.from(buf) : Buffer.from(source);
+  }
+  if (source == null) return null;
+  return Buffer.from(String(source));
+}
+
+function withZeroizedBuffer(source, handler) {
+  if (typeof handler !== 'function') {
+    throw new Error('withZeroizedBuffer requires a handler function');
+  }
+  const resolveSource = () => {
+    if (typeof source === 'function') {
+      return source();
+    }
+    return source;
+  };
+  let buffer = resolveSource();
+  if (buffer && !(Buffer.isBuffer(buffer))) {
+    if (buffer instanceof Uint8Array) {
+      buffer = Buffer.from(buffer);
+    } else if (buffer != null) {
+      buffer = Buffer.from(buffer);
+    }
+  }
+  const finalize = () => {
+    if (buffer) {
+      zeroize(buffer);
+      buffer = null;
+    }
+  };
+  try {
+    const result = handler(buffer);
+    if (result && typeof result.then === 'function') {
+      return result.finally(finalize);
+    }
+    finalize();
+    return result;
+  } catch (error) {
+    finalize();
+    throw error;
+  }
+}
+
 export {
   createNonce,
   decodeKey,
@@ -138,5 +186,7 @@ export {
   normalizePayload,
   openPayload,
   sealPayload,
+  toSecureBuffer,
+  withZeroizedBuffer,
   zeroize
 };

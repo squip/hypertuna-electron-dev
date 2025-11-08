@@ -201,7 +201,7 @@ export function registerVirtualRelay(relayKey, manager, options = {}) {
     };
 }
 
-export function getRelayWriterSecret(relayKey) {
+export function getRelayWriterSecret(relayKey, { clone = true } = {}) {
     if (!relayKey) return null;
     const manager = activeRelays.get(relayKey);
     const coreKey = manager?.relay?.local?.key || manager?.relay?.localKey || null;
@@ -211,7 +211,7 @@ export function getRelayWriterSecret(relayKey) {
         : coreKey instanceof Uint8Array
             ? Buffer.from(coreKey)
             : Buffer.from(coreKey);
-    return buffer.toString('hex');
+    return clone ? Buffer.from(buffer) : buffer;
 }
 
 export async function unregisterVirtualRelay(relayKey, options = {}) {

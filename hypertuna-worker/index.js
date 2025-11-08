@@ -5,11 +5,15 @@
 /** @typedef {import('pear-interface')} */ 
 import process from 'node:process'
 import { promises as fs } from 'node:fs'
-import { join } from 'node:path'
+import { join, dirname } from 'node:path'
 import nodeCrypto from 'node:crypto'
 import swarmCrypto from 'hypercore-crypto'
 import b4a from 'b4a'
 import GatewayService from './gateway/GatewayService.mjs'
+import PendingWriteCoordinator from './gateway/PendingWriteCoordinator.mjs'
+import { decode as decodeHypercoreId } from 'hypercore-id-encoding'
+import { ensureRemoteMirror } from './mirror-sync-manager.mjs'
+import { ensureRelayFolder } from './hyperdrive-manager.mjs'
 import {
   getAllRelayProfiles,
   getRelayProfileByKey,
@@ -60,6 +64,7 @@ import {
   decryptSharedSecretFromString
 } from './challenge-manager.mjs'
 import BlindPeeringManager from './blind-peering-manager.mjs'
+import { createSignature } from '../shared/auth/PublicGatewayTokens.mjs'
 
 const pearRuntime = globalThis?.Pear
 const __dirname = process.env.APP_DIR || pearRuntime?.config?.dir || process.cwd()
@@ -68,6 +73,40 @@ const BLIND_PEERING_METADATA_FILENAME = 'blind-peering-metadata.json'
 const BLIND_PEER_REHYDRATION_TIMEOUT_MS = 45000
 
 global.userConfig = global.userConfig || { storage: defaultStorageDir }
+
+function getPendingWritesStatePath () {
+  const storageBase = config?.storage || defaultStorageDir
+  return join(storageBase, 'pending-writes-state.json')
+}
+
+async function persistPendingWriteState (state = null) {
+  try {
+    const path = getPendingWritesStatePath()
+    await fs.mkdir(dirname(path), { recursive: true })
+    await fs.writeFile(path, JSON.stringify(state || {}, null, 2), 'utf8')
+  } catch (error) {
+    console.warn('[PendingWrites] Failed to persist state:', error?.message || error)
+  }
+}
+
+async function restorePendingWriteState () {
+  try {
+    const path = getPendingWritesStatePath()
+    const raw = await fs.readFile(path, 'utf8')
+    const dump = JSON.parse(raw)
+    if (dump?.notifications && pendingWriteCoordinator) {
+      pendingWriteCoordinator.restoreNotifications(dump.notifications)
+      schedulePendingWriteProcessing()
+    }
+    if (dump?.rotations && pendingWriteCoordinator) {
+      pendingWriteCoordinator.restoreRotations(dump.rotations)
+    }
+  } catch (error) {
+    if (error?.code !== 'ENOENT') {
+      console.warn('[PendingWrites] Failed to restore state:', error?.message || error)
+    }
+  }
+}
 
 const relayMirrorSubscriptions = new Map()
 let lastBlindPeerFingerprint = null
@@ -280,6 +319,184 @@ async function ensureBlindPeeringManager(runtime = {}) {
   }
 
   return blindPeeringManager
+}
+
+function attachPendingWriteListener() {
+  if (!gatewayService) return
+  if (!pendingWriteCoordinator) {
+    pendingWriteCoordinator = new PendingWriteCoordinator({ logger: console })
+  }
+  gatewayService.setPendingWriteCoordinator(pendingWriteCoordinator)
+  if (pendingWriteCoordinatorStateListener) {
+    pendingWriteCoordinator.off('state-changed', pendingWriteCoordinatorStateListener)
+  }
+  pendingWriteCoordinatorStateListener = (snapshot) => {
+    const dump = {
+      notifications: pendingWriteCoordinator?.getNotificationRecords?.() || [],
+      rotations: pendingWriteCoordinator?.getRotationRecords?.() || []
+    }
+    persistPendingWriteState(dump).catch((error) => {
+      console.warn('[PendingWrites] Failed to persist state:', error?.message || error)
+    })
+    sendMessage({ type: 'gateway-pending-writes', state: snapshot })
+  }
+  pendingWriteCoordinator.on('state-changed', pendingWriteCoordinatorStateListener)
+  if (pendingWriteCoordinatorLeaseLagListener) {
+    pendingWriteCoordinator.off('lease-lag', pendingWriteCoordinatorLeaseLagListener)
+    pendingWriteCoordinatorLeaseLagListener = null
+  }
+  pendingWriteCoordinatorLeaseLagListener = (payload) => {
+    gatewayService?.recordWorkerLeaseLag?.(payload)
+    sendMessage({ type: 'gateway-lease-lag', stat: payload })
+  }
+  pendingWriteCoordinator.on('lease-lag', pendingWriteCoordinatorLeaseLagListener)
+  if (gatewayPendingWriteListener) {
+    if (typeof gatewayService.off === 'function') {
+      gatewayService.off('gateway-pending-writes', gatewayPendingWriteListener)
+    } else {
+      gatewayService.removeListener('gateway-pending-writes', gatewayPendingWriteListener)
+    }
+  }
+  gatewayPendingWriteListener = (record) => {
+    pendingWriteCoordinator?.handleGatewayNotification(record)
+    schedulePendingWriteProcessing()
+  }
+  gatewayService.on('gateway-pending-writes', gatewayPendingWriteListener)
+  if (gatewayEscrowRotationListener) {
+    gatewayService.off('gateway-escrow-rotation', gatewayEscrowRotationListener)
+    gatewayEscrowRotationListener = null
+  }
+  gatewayEscrowRotationListener = (rotation) => {
+    pendingWriteCoordinator?.recordRotation?.(rotation)
+  }
+  gatewayService.on('gateway-escrow-rotation', gatewayEscrowRotationListener)
+  restorePendingWriteState()
+}
+
+function schedulePendingWriteProcessing() {
+  setImmediate(() => {
+    processPendingWriteQueue().catch((error) => {
+      console.warn('[PendingWrites] Queue processing failed:', error?.message || error)
+    })
+  })
+}
+
+async function processPendingWriteQueue() {
+  if (pendingWriteProcessorRunning || !pendingWriteCoordinator) return
+  pendingWriteProcessorRunning = true
+  try {
+    while (pendingWriteCoordinator) {
+      const job = pendingWriteCoordinator.dequeueNextJob()
+      if (!job) break
+      let result = 'completed'
+      try {
+        await handlePendingWriteJob(job)
+      } catch (error) {
+        result = 'failed'
+        console.warn('[PendingWrites] Job failed', {
+          relayKey: job.relayKey,
+          error: error?.message || error
+        })
+      } finally {
+        pendingWriteCoordinator.markJobComplete(job.relayKey, { result })
+      }
+    }
+  } finally {
+    pendingWriteProcessorRunning = false
+  }
+}
+
+async function handlePendingWriteJob(job) {
+  const types = Array.isArray(job?.notification?.types) ? job.notification.types : []
+  if (types.includes('drive')) {
+    await resyncGatewayDrive(job)
+  }
+  if (types.includes('autobase')) {
+    await resyncRelayAutobase(job)
+  }
+  await notifyGatewayResyncComplete(job.relayKey)
+  await rotateGatewayWriterEscrow(job.relayKey)
+}
+
+async function resyncGatewayDrive(job) {
+  const driveIdentifier = job?.notification?.driveIdentifier || job.relayKey
+  const driveKey = resolveDriveKey(driveIdentifier)
+  if (!driveKey) {
+    throw new Error('drive-key-unavailable')
+  }
+  const folder = driveIdentifier.startsWith('/') ? driveIdentifier : `/${driveIdentifier}`
+  await ensureRemoteMirror(driveKey, folder)
+  await ensureRelayFolder(job.relayKey)
+}
+
+async function resyncRelayAutobase(job) {
+  const manager = await ensureBlindPeeringManager({
+    start: true,
+    corestore: getCorestore(),
+    wakeup: null
+  })
+  if (!manager?.started) {
+    throw new Error('blind-peering-disabled')
+  }
+  const relayManager = activeRelays.get(job.relayKey)
+  if (relayManager?.relay) {
+    manager.ensureRelayMirror({
+      relayKey: job.relayKey,
+      publicIdentifier: relayManager.publicIdentifier || null,
+      autobase: relayManager.relay
+    })
+  }
+  await manager.refreshFromBlindPeers(`pending-autobase:${job.relayKey}`)
+  await manager.rehydrateMirrors({
+    reason: `pending-autobase:${job.relayKey}`,
+    timeoutMs: BLIND_PEER_REHYDRATION_TIMEOUT_MS
+  })
+}
+
+async function notifyGatewayResyncComplete(relayKey) {
+  if (!gatewayService?.publicGatewaySettings?.sharedSecret || !gatewayService?.publicGatewaySettings?.baseUrl) {
+    console.warn('[PendingWrites] Cannot notify resync completion - gateway shared secret/baseUrl missing')
+    return
+  }
+  const baseUrl = gatewayService.publicGatewaySettings.baseUrl.replace(/\/+$/, '')
+  const url = `${baseUrl}/api/relays/${encodeURIComponent(relayKey)}/resync-complete`
+  const payload = { relayKey, action: 'resync-complete' }
+  const signature = createSignature(payload, gatewayService.publicGatewaySettings.sharedSecret)
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      'x-signature': signature
+    },
+    body: JSON.stringify(payload)
+  })
+  if (!response.ok) {
+    const body = await response.text().catch(() => '')
+    throw new Error(`gateway-resync-complete-failed (${response.status}): ${body}`)
+  }
+}
+
+async function rotateGatewayWriterEscrow(relayKey) {
+  if (!gatewayService?.rotateGatewayWriter) return
+  try {
+    await gatewayService.rotateGatewayWriter(relayKey, 'pending-write-resync')
+  } catch (error) {
+    console.warn('[PendingWrites] Gateway writer rotation failed:', error?.message || error)
+  }
+}
+
+function resolveDriveKey(identifier) {
+  if (!identifier || typeof identifier !== 'string') return null
+  const trimmed = identifier.trim()
+  if (/^[0-9a-f]{64}$/i.test(trimmed)) {
+    return trimmed.toLowerCase()
+  }
+  try {
+    const decoded = decodeHypercoreId(trimmed)
+    return Buffer.from(decoded).toString('hex')
+  } catch (_) {
+    return null
+  }
 }
 
 async function seedBlindPeeringMirrors(manager) {
@@ -522,6 +739,7 @@ async function startGatewayService(options = {}) {
       })
     }
   }
+  attachPendingWriteListener()
 
   await gatewayService.updatePublicGatewayConfig(publicGatewaySettings)
   sendMessage({ type: 'public-gateway-config', config: publicGatewaySettings })
@@ -580,6 +798,40 @@ async function startGatewayService(options = {}) {
 async function stopGatewayService() {
   if (!gatewayService) return
   try {
+    if (gatewayPendingWriteListener) {
+      if (typeof gatewayService.off === 'function') {
+        gatewayService.off('gateway-pending-writes', gatewayPendingWriteListener)
+      } else {
+        gatewayService.removeListener('gateway-pending-writes', gatewayPendingWriteListener)
+      }
+      gatewayPendingWriteListener = null
+    }
+  if (pendingWriteCoordinator && pendingWriteCoordinatorStateListener) {
+    pendingWriteCoordinator.off('state-changed', pendingWriteCoordinatorStateListener)
+    pendingWriteCoordinatorStateListener = null
+  }
+  if (pendingWriteCoordinator && pendingWriteCoordinatorLeaseLagListener) {
+    pendingWriteCoordinator.off('lease-lag', pendingWriteCoordinatorLeaseLagListener)
+    pendingWriteCoordinatorLeaseLagListener = null
+  }
+    if (gatewayEscrowRotationListener) {
+      if (typeof gatewayService.off === 'function') {
+        gatewayService.off('gateway-escrow-rotation', gatewayEscrowRotationListener)
+      } else if (gatewayService.removeListener) {
+        gatewayService.removeListener('gateway-escrow-rotation', gatewayEscrowRotationListener)
+      }
+      gatewayEscrowRotationListener = null
+    }
+    if (pendingWriteCoordinator) {
+      const dump = {
+        notifications: pendingWriteCoordinator.getNotificationRecords(),
+        rotations: pendingWriteCoordinator.getRotationRecords?.() || []
+      }
+      await persistPendingWriteState(dump)
+      pendingWriteCoordinator.reset()
+      pendingWriteCoordinator = null
+      pendingWriteProcessorRunning = false
+    }
     await gatewayService.stop()
     publicGatewayStatusCache = gatewayService.getPublicGatewayState()
     sendMessage({ type: 'public-gateway-status', state: publicGatewayStatusCache })
@@ -651,6 +903,12 @@ let gatewayOptions = { port: 8443, hostname: '127.0.0.1', listenHost: '127.0.0.1
 let publicGatewaySettings = null
 let publicGatewayStatusCache = null
 let pendingGatewayMetadataSync = false
+let pendingWriteCoordinator = null
+let pendingWriteCoordinatorStateListener = null
+let pendingWriteCoordinatorLeaseLagListener = null
+let gatewayPendingWriteListener = null
+let gatewayEscrowRotationListener = null
+let pendingWriteProcessorRunning = false
 
 async function appendFilekeyDbEntry (relayKey, fileHash) {
   if (!config?.driveKey || !config?.nostr_pubkey_hex) {

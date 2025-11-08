@@ -83,7 +83,11 @@ const DEFAULT_CONFIG = {
       || process.env.GATEWAY_REGISTRATION_SECRET
       || null,
     clientId: process.env.GATEWAY_ESCROW_CLIENT_ID || 'public-gateway',
-    requestTimeoutMs: Number(process.env.GATEWAY_ESCROW_TIMEOUT_MS) || 5000
+    requestTimeoutMs: Number(process.env.GATEWAY_ESCROW_TIMEOUT_MS) || 5000,
+    tlsCaPath: process.env.ESCROW_TLS_CA || null,
+    tlsClientCertPath: process.env.ESCROW_TLS_CLIENT_CERT || null,
+    tlsClientKeyPath: process.env.ESCROW_TLS_CLIENT_KEY || null,
+    tlsRejectUnauthorized: process.env.ESCROW_TLS_REJECT_UNAUTHORIZED === 'false' ? false : true
   }
 };
 
@@ -229,6 +233,11 @@ function normalizeEscrowSettings(settings = {}, fallbackBaseUrl, defaultSecret) 
     const trimmed = value.trim();
     return trimmed.length ? trimmed.replace(/\/+$/, '') : null;
   };
+  const sanitizePath = (value) => {
+    if (!value || typeof value !== 'string') return null;
+    const trimmed = value.trim();
+    return trimmed.length ? trimmed : null;
+  };
 
   const result = { ...settings };
   const normalizedBase = sanitizeBase(result.baseUrl) || sanitizeBase(fallbackBaseUrl ? `${fallbackBaseUrl}/api/escrow` : null);
@@ -237,6 +246,21 @@ function normalizeEscrowSettings(settings = {}, fallbackBaseUrl, defaultSecret) 
   const timeout = Number(result.requestTimeoutMs);
   result.requestTimeoutMs = Number.isFinite(timeout) && timeout > 0 ? Math.trunc(timeout) : 5000;
   result.enabled = Boolean(result.enabled && result.baseUrl && result.sharedSecret);
+
+  const tlsCaPath = sanitizePath(result.tls?.caPath || result.tlsCaPath || process.env.ESCROW_TLS_CA || null);
+  const tlsClientCertPath = sanitizePath(result.tls?.clientCertPath || result.tlsClientCertPath || process.env.ESCROW_TLS_CLIENT_CERT || null);
+  const tlsClientKeyPath = sanitizePath(result.tls?.clientKeyPath || result.tlsClientKeyPath || process.env.ESCROW_TLS_CLIENT_KEY || null);
+  const tlsRejectUnauthorized = (
+    result.tls?.rejectUnauthorized
+    ?? result.tlsRejectUnauthorized
+    ?? (process.env.ESCROW_TLS_REJECT_UNAUTHORIZED === 'false' ? false : true)
+  );
+  result.tls = {
+    caPath: tlsCaPath,
+    clientCertPath: tlsClientCertPath,
+    clientKeyPath: tlsClientKeyPath,
+    rejectUnauthorized: tlsRejectUnauthorized !== false
+  };
   return result;
 }
 

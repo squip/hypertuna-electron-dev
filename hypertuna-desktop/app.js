@@ -30,6 +30,9 @@ let gatewayLogVisible = false;
 let gatewayUptimeTimer = null;
 let gatewayPeerRelayMap = new Map();
 let gatewayPeerDetails = new Map();
+let gatewayPendingWriteState = null;
+let gatewayPendingListEl = null;
+let gatewayPendingSummaryEl = null;
 const DEFAULT_API_URL = 'http://localhost:1945';
 const DEFAULT_PUBLIC_GATEWAY_URL = 'https://hypertuna.com';
 const RELAY_CACHE_STORAGE_KEY = 'hypertuna_relays_cache_v1';
@@ -922,9 +925,79 @@ function renderGatewayLogs() {
     row.className = `gateway-log-entry ${entry.level || 'info'}`
     const time = entry.timestamp ? new Date(entry.timestamp).toLocaleTimeString() : ''
     row.textContent = time ? `[${time}] ${entry.message}` : entry.message
-    gatewayLogsContainer.appendChild(row)
+  gatewayLogsContainer.appendChild(row)
   }
   gatewayLogsContainer.scrollTop = gatewayLogsContainer.scrollHeight
+}
+
+function updateGatewayPendingWriteUI(state) {
+  gatewayPendingWriteState = state || null
+  if (!gatewayPendingListEl || !gatewayPendingSummaryEl) return
+  const relays = Array.isArray(state?.relays) ? state.relays : []
+  const queueSize = Number(state?.queueSize) || 0
+  const inflightSize = Number(state?.inflightSize) || 0
+  if (!relays.length && queueSize === 0 && inflightSize === 0) {
+    gatewayPendingSummaryEl.textContent = 'Queue empty'
+  } else {
+    const summaryParts = [`${relays.length} relays`, `${queueSize} queued`]
+    if (inflightSize > 0) summaryParts.push(`${inflightSize} in-flight`)
+    gatewayPendingSummaryEl.textContent = summaryParts.join(' • ')
+  }
+  gatewayPendingListEl.innerHTML = ''
+  if (!relays.length) {
+    gatewayPendingListEl.classList.add('empty')
+    const empty = document.createElement('p')
+    empty.className = 'muted'
+    empty.textContent = 'No pending gateway writes'
+    gatewayPendingListEl.appendChild(empty)
+    return
+  }
+  gatewayPendingListEl.classList.remove('empty')
+  for (const entry of relays) {
+    const item = document.createElement('div')
+    item.className = `pending-write-item status-${entry.status || 'queued'}`
+    const header = document.createElement('div')
+    header.className = 'pending-write-header'
+    const title = document.createElement('div')
+    title.className = 'pending-write-title'
+    title.textContent = entry.relayKey || 'unknown'
+    const status = document.createElement('span')
+    status.className = 'pending-write-status'
+    status.textContent = (entry.status || 'queued').replace(/-/g, ' ')
+    header.appendChild(title)
+    header.appendChild(status)
+    const details = document.createElement('div')
+    details.className = 'pending-write-details'
+    const reason = document.createElement('div')
+    reason.textContent = `Reason: ${entry.reason || 'replica-write'}`
+    const types = document.createElement('div')
+    const typeList = Array.isArray(entry.types) && entry.types.length
+      ? entry.types.join(', ')
+      : 'drive'
+    types.textContent = `Types: ${typeList}`
+    const pendingSince = document.createElement('div')
+    pendingSince.textContent = entry.pendingSince
+      ? `Pending since ${formatRelativeTime(entry.pendingSince)}`
+      : 'Pending since just now'
+    const leaseBlock = document.createElement('div')
+    const leaseVersion = entry.leaseVersion ?? entry.lease?.version ?? null
+    const leaseActive = entry.leaseActive ?? (entry.lease?.status === 'active')
+    const expiresAt = entry.lease?.expiresAt || null
+    if (leaseVersion != null) {
+      let text = `Lease v${leaseVersion} ${leaseActive ? '(active)' : '(released)'}`
+      if (expiresAt) {
+        text += ` • expires ${formatRelativeTime(expiresAt)}`
+      } else if (!leaseActive && entry.lease?.releasedAt) {
+        text += ` • cleared ${formatRelativeTime(entry.lease.releasedAt)}`
+      }
+      leaseBlock.textContent = text
+    } else {
+      leaseBlock.textContent = 'Lease metadata unavailable'
+    }
+    details.append(reason, types, pendingSince, leaseBlock)
+    item.append(header, details)
+    gatewayPendingListEl.appendChild(item)
+  }
 }
 
 function normalizePublicGatewayConfig(config = {}) {
@@ -1145,6 +1218,10 @@ function renderPublicGatewayStatus(state) {
   populatePublicGatewaySelectionOptions()
   updatePublicGatewayFormState()
   const summary = buildPublicGatewaySummary()
+  if (state?.pendingWrites) {
+    gatewayPendingWriteState = state.pendingWrites
+  }
+  updateGatewayPendingWriteUI(gatewayPendingWriteState || state?.pendingWrites || null)
   if (window.App?.refreshRelayGatewayCard) {
     try {
       window.App.refreshRelayGatewayCard()
@@ -2154,6 +2231,15 @@ async function handleWorkerMessage(message) {
     case 'health-update':
       updateHealthStatus(message.healthState)
       break
+
+    case 'gateway-pending-writes':
+      gatewayPendingWriteState = message.state || null
+      if (publicGatewayState) {
+        publicGatewayState.pendingWrites = gatewayPendingWriteState
+      }
+      updateGatewayPendingWriteUI(gatewayPendingWriteState)
+      window.dispatchEvent(new CustomEvent('gateway-pending-writes', { detail: gatewayPendingWriteState }))
+      break
       
     case 'gateway-registered':
       gatewayRegistered = true
@@ -2182,6 +2268,10 @@ async function handleWorkerMessage(message) {
         gatewayLogs = message.logs.slice(-500)
         if (gatewayLogVisible) renderGatewayLogs()
       }
+      break
+
+    case 'gateway-lease-lag':
+      window.dispatchEvent(new CustomEvent('gateway-lease-lag', { detail: message.stat || null }))
       break
 
     case 'gateway-started':
@@ -2930,6 +3020,8 @@ function initializeDOMElements() {
   gatewayLastCheckEl = document.getElementById('gateway-last-check')
   gatewayLogsContainer = document.getElementById('gateway-logs-container')
   gatewayToggleLogsButton = document.getElementById('gateway-toggle-logs')
+  gatewayPendingSummaryEl = document.getElementById('gateway-pending-summary')
+  gatewayPendingListEl = document.getElementById('gateway-pending-writes')
   publicGatewayEnableToggle = document.getElementById('public-gateway-enable')
   publicGatewaySelectionSelect = document.getElementById('public-gateway-selection')
   publicGatewayUrlInput = document.getElementById('public-gateway-url')
@@ -2965,6 +3057,8 @@ function initializeDOMElements() {
     gatewayLastCheckEl,
     gatewayLogsContainer,
     gatewayToggleLogsButton,
+    gatewayPendingSummaryEl,
+    gatewayPendingListEl,
     publicGatewayEnableToggle,
     publicGatewaySelectionSelect,
     publicGatewayUrlInput,
@@ -2980,6 +3074,8 @@ function initializeDOMElements() {
   for (const [name, element] of Object.entries(elements)) {
     console.log(`- ${name}:`, element ? 'found' : 'NOT FOUND');
   }
+
+  updateGatewayPendingWriteUI(gatewayPendingWriteState);
 
   hydrateRelayListFromCache()
 

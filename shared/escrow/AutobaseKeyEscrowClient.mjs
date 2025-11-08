@@ -1,3 +1,7 @@
+import http from 'node:http';
+import https from 'node:https';
+import { URL } from 'node:url';
+
 import { buildAuthHeaders, stableStringify } from './AutobaseKeyEscrowAuth.mjs';
 
 function normalizeBaseUrl(url) {
@@ -6,15 +10,31 @@ function normalizeBaseUrl(url) {
   return trimmed.length ? trimmed : null;
 }
 
+function normalizeTlsOptions(tls = null) {
+  if (!tls || typeof tls !== 'object') return null;
+  const normalized = {
+    ca: tls.ca || null,
+    cert: tls.cert || null,
+    key: tls.key || null,
+    rejectUnauthorized: tls.rejectUnauthorized !== false
+  };
+  if (!normalized.ca && !normalized.cert && !normalized.key && normalized.rejectUnauthorized === true) {
+    return null;
+  }
+  return normalized;
+}
+
 class AutobaseKeyEscrowClient {
-  constructor({ baseUrl, sharedSecret, clientId, fetchImpl = globalThis.fetch?.bind(globalThis) } = {}) {
+  constructor({
+    baseUrl,
+    sharedSecret,
+    clientId,
+    tls = null
+  } = {}) {
     this.baseUrl = normalizeBaseUrl(baseUrl);
     this.sharedSecret = sharedSecret;
     this.clientId = clientId || '';
-    this.fetch = fetchImpl;
-    if (typeof this.fetch !== 'function') {
-      throw new Error('AutobaseKeyEscrowClient requires a fetch implementation');
-    }
+    this.tls = normalizeTlsOptions(tls);
   }
 
   isEnabled() {
@@ -22,12 +42,12 @@ class AutobaseKeyEscrowClient {
   }
 
   async fetchPolicy() {
-    const url = this.#url('/policy');
-    const response = await this.fetch(url);
-    if (!response.ok) {
-      throw new Error(`Escrow policy request failed with status ${response.status}`);
+    const response = await this.#sendRequest('/policy');
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw new Error(`Escrow policy request failed with status ${response.statusCode}`);
     }
-    return await response.json();
+    const text = response.body.toString('utf8');
+    return text ? JSON.parse(text) : {};
   }
 
   async deposit(payload) {
@@ -43,13 +63,13 @@ class AutobaseKeyEscrowClient {
   }
 
   async listLeases() {
-    const url = this.#url('/leases');
     const headers = this.#signedHeaders({});
-    const response = await this.fetch(url, { headers });
-    if (!response.ok) {
-      throw new Error(`Escrow leases request failed with status ${response.status}`);
+    const response = await this.#sendRequest('/leases', { headers });
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw new Error(`Escrow leases request failed with status ${response.statusCode}`);
     }
-    return await response.json();
+    const text = response.body.toString('utf8');
+    return text ? JSON.parse(text) : {};
   }
 
   async #post(path, body = {}) {
@@ -58,16 +78,18 @@ class AutobaseKeyEscrowClient {
       'content-type': 'application/json',
       ...this.#signedHeaders(body)
     };
-    const response = await this.fetch(url, {
+    const payload = stableStringify(body);
+    headers['content-length'] = String(Buffer.byteLength(payload));
+    const response = await this.#sendRequest(path, {
       method: 'POST',
       headers,
-      body: stableStringify(body)
+      body: payload
     });
-    const text = await response.text();
+    const text = response.body.toString('utf8');
     const json = text ? JSON.parse(text) : {};
-    if (!response.ok) {
-      const error = new Error(json?.error || `Escrow service responded with status ${response.status}`);
-      error.statusCode = response.status;
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      const error = new Error(json?.error || `Escrow service responded with status ${response.statusCode}`);
+      error.statusCode = response.statusCode;
       error.body = json;
       throw error;
     }
@@ -91,6 +113,45 @@ class AutobaseKeyEscrowClient {
     }
     const normalized = path.startsWith('/') ? path : `/${path}`;
     return `${this.baseUrl}${normalized}`;
+  }
+
+  async #sendRequest(path, { method = 'GET', headers = {}, body = null } = {}) {
+    const resolvedUrl = new URL(this.#url(path));
+    const isHttps = resolvedUrl.protocol === 'https:';
+    const transport = isHttps ? https : http;
+    const requestOptions = {
+      method,
+      headers,
+      hostname: resolvedUrl.hostname,
+      port: resolvedUrl.port || (isHttps ? 443 : 80),
+      path: `${resolvedUrl.pathname}${resolvedUrl.search}`
+    };
+    if (isHttps && this.tls) {
+      requestOptions.rejectUnauthorized = this.tls.rejectUnauthorized !== false;
+      if (this.tls.ca) requestOptions.ca = this.tls.ca;
+      if (this.tls.cert) requestOptions.cert = this.tls.cert;
+      if (this.tls.key) requestOptions.key = this.tls.key;
+    }
+
+    const payloadBuffer = typeof body === 'string' ? Buffer.from(body) : null;
+
+    return await new Promise((resolve, reject) => {
+      const req = transport.request(requestOptions, (res) => {
+        const chunks = [];
+        res.on('data', (chunk) => chunks.push(chunk));
+        res.on('end', () => {
+          resolve({
+            statusCode: res.statusCode || 0,
+            body: Buffer.concat(chunks)
+          });
+        });
+      });
+      req.on('error', reject);
+      if (payloadBuffer) {
+        req.write(payloadBuffer);
+      }
+      req.end();
+    });
   }
 }
 
