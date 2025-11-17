@@ -312,6 +312,21 @@ export class NostrUtils {
     }
 
     /**
+     * Compute deterministic relay hash with namespace salt.
+     * @param {string} identifier - Public relay identifier string.
+     * @returns {Promise<string>} - Hex encoded hash.
+     */
+    static async computeRelayHash(identifier) {
+        if (typeof identifier !== 'string') {
+            throw new Error('Relay identifier must be a string');
+        }
+        const normalized = identifier.trim().toLowerCase().replace(/\s+/g, ' ');
+        const salted = `hypertuna-relay-id:${normalized}`;
+        return this.computeSha256(salted);
+    }
+    // TODO: use computeRelayHash wherever relay hashes are needed for replication payloads/indexes (publish/backfill).
+
+    /**
      * Extract all HTTP/HTTPS URLs from a string
      * @param {string} text - Text to search
      * @returns {Array<string>} - Array of URLs

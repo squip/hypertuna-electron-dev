@@ -136,3 +136,17 @@
 **Phase 6: Observability, Settings, and Rollout**
 - Settings extensions (Hyperbee URL/auth); metrics (lag, append, fallback, backlog, rotations); status endpoint.
 - Test harness (unit/integration/load); gated rollout plan; enable per relay then globally when stable.
+
+## 8. Status (Phase 1)
+- Relay UI toggle added (default ON) for encrypted replication; create flow passes through to group metadata.
+- Group creation/metadata events now include replication tags; parsing sets `encryptedReplication` on group state; settings tab includes editable toggle wired to metadata updates.
+- In-memory ReplicationSecretManager scaffold added with `getSecret`, `getSecretForTimestamp`, `setSecret`, `hasSecret`, `subscribe`, and secret subscription hook for kind 30078 per relay.
+- Relay hashing helper added (salted SHA-256 of normalized identifier).
+- Replication index key patterns documented and primary row stores ciphertext plus minimal cleartext header under `relayID:<hash>:id:<eventId>`.
+- Gateway token defaults and retry/backoff defaults captured as configurable settings; telemetry-only backpressure retained (no hard caps yet).
+
+### Follow-ups
+- Wire ReplicationSecretManager into publish/decrypt paths when replication payloads are built/consumed; persist worker-side secrets encrypted at rest and clean up subscriptions on group leave/destroy.
+- Ensure `computeRelayHash` is used wherever relay hashes are needed for replication payloads/indexes (publish/backfill).
+- Consider a neutral/unknown UI state for replication toggle when metadata is missing; currently defaults to ON when absent.
+- Add telemetry/tests for create/edit flows with replication toggle on/off and secret subscription error handling.

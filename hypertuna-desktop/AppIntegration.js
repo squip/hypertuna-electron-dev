@@ -2885,6 +2885,9 @@ App.syncHypertunaConfigToFile = async function() {
                 
                 const editOpenCheckbox = document.getElementById('edit-group-open');
                 if (editOpenCheckbox) editOpenCheckbox.checked = group.isOpen;
+                
+                const editReplicationCheckbox = document.getElementById('edit-group-replication');
+                if (editReplicationCheckbox) editReplicationCheckbox.checked = group.encryptedReplication !== false;
 
                 const editAvatarPreview = document.getElementById('edit-relay-avatar-preview');
                 if (editAvatarPreview) {
@@ -2895,6 +2898,8 @@ App.syncHypertunaConfigToFile = async function() {
                         editAvatarPreview.innerHTML = '<span>🛰️</span>';
                     }
                 }
+
+                this.nostr.ensureSecretSubscription(this.currentGroupId);
                 this.pendingEditRelayAvatar = null;
             } else if (settingsForm && noPermissionMsg) {
                 settingsForm.classList.add('hidden');
@@ -3394,6 +3399,7 @@ App.syncHypertunaConfigToFile = async function() {
         const about = document.getElementById('new-group-description').value.trim();
         const isPublic = document.getElementById('new-group-public').checked;
         const isOpen = document.getElementById('new-group-open').checked;
+        const encryptedReplication = document.getElementById('new-group-replication')?.checked !== false;
         const fileSharing = true;
         
         if (!name) {
@@ -3443,19 +3449,20 @@ App.syncHypertunaConfigToFile = async function() {
                 registrationWait = this.waitForRelayRegistration(relayKey.relayKey || null, relayKey.publicIdentifier || null);
             }
 
-            const eventsCollection = await this.nostr.createGroup(
+            const eventsCollection = await this.nostr.createGroup({
                 name,
                 about,
                 isPublic,
                 isOpen,
-                relayKey,
+                fileSharing,
+                identifier: relayKey?.relayKey || null,
                 proxyServer,
                 proxyProtocol,
                 npub,
-                relayKey?.relayUrl || null,
-                fileSharing,
-                { avatar: this.pendingCreateRelayAvatar }
-            );
+                authenticatedRelayUrl: relayKey?.relayUrl || null,
+                avatar: this.pendingCreateRelayAvatar,
+                encryptedReplicationEnabled: encryptedReplication
+            });
 
             if (registrationWait) {
                 const registrationKey = relayKey?.relayKey || null;
@@ -4022,7 +4029,8 @@ App.syncHypertunaConfigToFile = async function() {
                 name,
                 about,
                 isPublic,
-                isOpen
+                isOpen,
+                encryptedReplicationEnabled: document.getElementById('edit-group-replication')?.checked !== false
             }, { avatar: avatarOption });
             
             // Reload group details to reflect changes

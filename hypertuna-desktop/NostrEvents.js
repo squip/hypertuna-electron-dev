@@ -247,6 +247,7 @@ class NostrEvents {
      */
     static async createGroupCreationEvent(name, about, isPublic, isOpen, fileSharing, privateKey, relayKey = null, proxyServer = '', npub, proxyProtocol = 'wss', options = {}) {
         const fileSharingEnabled = fileSharing !== false;
+        const replicationEnabled = options?.encryptedReplicationEnabled !== false;
         // Import the utility
         const { PublicIdentifierUtils } = await import('./PublicIdentifierUtils.js');
         
@@ -289,6 +290,8 @@ class NostrEvents {
             groupTags.push(['file-sharing-off']);
         }
 
+        groupTags.push(['replication', replicationEnabled ? 'encrypted' : 'off']);
+
         if (avatar?.tagUrl) {
             groupTags.push(['picture', avatar.tagUrl, 'hypertuna:drive:pfp']);
         }
@@ -327,6 +330,8 @@ class NostrEvents {
         } else {
             metadataTags.push(['file-sharing-off']);
         }
+
+        metadataTags.push(['replication', replicationEnabled ? 'encrypted' : 'off']);
 
         if (avatar?.tagUrl) {
             metadataTags.push(['picture', avatar.tagUrl, 'hypertuna:drive:pfp']);
@@ -708,6 +713,11 @@ class NostrEvents {
             fileSharing = true;
         }
 
+        const replicationEnabled = this._hasTag(event, 'replication') && event.tags.some(tag => tag[0] === 'replication' && tag[1] === 'encrypted')
+          ? true
+          : event.tags.some(tag => tag[0] === 'replication' && tag[1] === 'off') ? false : true;
+        // TODO: consider a neutral/unknown state when replication tag is absent.
+
         console.log(`Parsing group metadata: id=${groupId}, hypertunaId=${hypertunaId}, hasIdentifierTag=${hasIdentifierTag}`);
 
         return {
@@ -723,7 +733,8 @@ class NostrEvents {
             isHypertunaRelay: hasIdentifierTag,
             fileSharing,
             picture: pictureUrl,
-            pictureIsHypertunaPfp
+            pictureIsHypertunaPfp,
+            encryptedReplication: replicationEnabled
         };
     }
     

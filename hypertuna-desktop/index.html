@@ -361,15 +361,23 @@
                                         </div>
                                         <div class="toggle-item">
                                             <label class="toggle-label">
-                                                <input type="checkbox" id="edit-group-open" class="toggle-checkbox">
-                                                <span class="toggle-switch"></span>
-                                                <span class="toggle-text">Open to Join</span>
-                                            </label>
-                                        </div>
-                                    </div>
-                                    <div class="settings-actions">
-                                        <button id="btn-save-group-settings" class="btn btn-primary">Save Changes</button>
-                                        <button id="btn-delete-group" class="btn btn-danger">Delete Relay</button>
+                                        <input type="checkbox" id="edit-group-open" class="toggle-checkbox">
+                                        <span class="toggle-switch"></span>
+                                        <span class="toggle-text">Open to Join</span>
+                                    </label>
+                                </div>
+                                <div class="toggle-item">
+                                    <label class="toggle-label">
+                                        <input type="checkbox" id="edit-group-replication" class="toggle-checkbox">
+                                        <span class="toggle-switch"></span>
+                                        <span class="toggle-text">Encrypted Replication</span>
+                                    </label>
+                                    <p class="toggle-description">Mirror encrypted events to gateway Hyperbee</p>
+                                </div>
+                            </div>
+                            <div class="settings-actions">
+                                <button id="btn-save-group-settings" class="btn btn-primary">Save Changes</button>
+                                <button id="btn-delete-group" class="btn btn-danger">Delete Relay</button>
                                     </div>
                                 </div>
                                 <div id="group-settings-no-permission" class="no-permission-message hidden">
@@ -458,6 +466,14 @@
                                         <span class="toggle-text">Open to Join</span>
                                     </label>
                                     <p class="toggle-description">No invite code required</p>
+                                </div>
+                                <div class="toggle-item">
+                                    <label class="toggle-label">
+                                        <input type="checkbox" id="new-group-replication" class="toggle-checkbox" checked>
+                                        <span class="toggle-switch"></span>
+                                        <span class="toggle-text">Encrypted Replication</span>
+                                    </label>
+                                    <p class="toggle-description">Mirror encrypted events to gateway Hyperbee</p>
                                 </div>
                             </div>
                         <button id="btn-create-group" type="button" class="btn btn-primary btn-block">Create Relay</button>

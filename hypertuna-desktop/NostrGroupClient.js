@@ -9,6 +9,7 @@ import WebSocketRelayManager from './WebSocketRelayManager.js';
 import NostrEvents from './NostrEvents.js';
 import { NostrUtils } from './NostrUtils.js';
 import { prepareFileAttachment } from './FileAttachmentHelper.js';
+import ReplicationSecretManager from './ReplicationSecretManager.js';
 
 const GROUP_METADATA_CACHE_KEY = 'hypertuna_group_metadata_cache_v1';
 
@@ -86,6 +87,7 @@ class NostrGroupClient {
         this.groupSubscriptions = new Map(); // Map of groupId -> Set of subscription IDs
         this.invites = new Map(); // Map of inviteId -> invite data
         this.joinRequests = new Map(); // Map of groupId -> Map of pubkey -> event
+        this.secretSubscriptions = new Map();
 
         this.gatewayReady = false;
         this.connectionRetryTimers = new Map();
@@ -94,11 +96,14 @@ class NostrGroupClient {
         this._authFailureListenerRegistered = false;
         this.shutdownRequested = false;
         this.cancelled = false;
+        // TODO: phase 2 – unsubscribe secret subscriptions on group leave/destroy to avoid leaks.
 
         // Discovery bootstrap state
         this.discoveryPending = false;
         this.discoveryBootstrapPromise = null;
         this.discoverySubscriptionsReady = false;
+        this.replicationSecrets = new ReplicationSecretManager();
+        this.secretSubscriptions = new Map(); // TODO: phase 2 – use secrets in replication publish/decrypt flows; unsubscribe on leave/destroy.
 
         this._registerAuthFailureListener();
 
@@ -2944,7 +2949,8 @@ async fetchMultipleProfiles(pubkeys) {
             proxyProtocol: groupData.proxyProtocol || 'wss',
             authenticatedRelayUrl: groupData.authenticatedRelayUrl || null,
             fileSharing: Boolean(groupData.fileSharing),
-            avatar: groupData.avatar || null
+            avatar: groupData.avatar || null,
+            encryptedReplicationEnabled: groupData.encryptedReplicationEnabled !== false
         };
         
         console.log('Creating group with normalized data:', normalizedData);
@@ -2961,7 +2967,10 @@ async fetchMultipleProfiles(pubkeys) {
             normalizedData.proxyServer,
             npub,
             normalizedData.proxyProtocol,
-            { avatar: normalizedData.avatar }
+            {
+                avatar: normalizedData.avatar,
+                encryptedReplicationEnabled: normalizedData.encryptedReplicationEnabled
+            }
         );
         
         const {
@@ -3063,6 +3072,33 @@ async fetchMultipleProfiles(pubkeys) {
         this.subscribeToGroup(groupId);
 
         return eventsCollection;
+    }
+
+    ensureSecretSubscription(relayId) {
+        if (!relayId || !this.user?.privateKey) return null;
+        if (this.secretSubscriptions.has(relayId)) return this.secretSubscriptions.get(relayId);
+
+        const subscriptionId = `secret-${relayId}`;
+        const filters = [{
+            kinds: [30078],
+            '#h': [relayId],
+            '#p': [this.user.pubkey]
+        }];
+
+        const handler = async (event) => {
+            try {
+                const secret = await NostrUtils.decrypt(this.user.privateKey, event.pubkey, event.content);
+                if (secret) {
+                    this.replicationSecrets.setSecret(relayId, secret, (event.created_at || 0) * 1000);
+                }
+            } catch (_) {
+                // ignore decrypt failures
+            }
+        };
+
+        this.relayManager.subscribe(subscriptionId, filters, handler);
+        this.secretSubscriptions.set(relayId, subscriptionId);
+        return subscriptionId;
     }
 
     _throttledRecomputeGroupMembers(groupId) {
