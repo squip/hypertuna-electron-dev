@@ -151,6 +151,13 @@ export class HyperbeeRelayHost extends EventEmitter {
       const batch = this.db.batch();
       await batch.put(key, payload);
 
+      // Store replication primary entry if relay-scoped payload
+      if (typeof event?.relayID === 'string' && event.relayID.trim()) {
+        const relayId = event.relayID.trim();
+        const replicationKey = b4a.from(`relayID:${relayId}:id:${event.id}`, 'utf8');
+        await batch.put(replicationKey, payload);
+      }
+
       for (const entry of this.#buildIndexEntries(event)) {
         await batch.put(entry.key, entry.value);
       }
@@ -237,6 +244,28 @@ export class HyperbeeRelayHost extends EventEmitter {
         if (typeof name !== 'string' || typeof value !== 'string') continue;
         const tagKey = b4a.from(`tagKey:${name}:tagValue:${value}:created_at:${paddedCreatedAt}:id:${event.id}`, 'utf8');
         entries.push({ key: tagKey, value: eventIdValue });
+      }
+    }
+
+    // Replication-specific indexes (relay-scoped)
+    if (typeof event?.relayID === 'string' && event.relayID.trim()) {
+      const relayId = event.relayID.trim();
+      const relayValue = eventIdValue;
+
+      const replTimeKey = b4a.from(`relayID:${relayId}:created_at:${paddedCreatedAt}:id:${event.id}`, 'utf8');
+      entries.push({ key: replTimeKey, value: relayValue });
+
+      if (Number.isInteger(event?.kind)) {
+        const paddedKind = padNumber(event.kind, 5);
+        const replKindKey = b4a.from(`relayID:${relayId}:kind:${paddedKind}:created_at:${paddedCreatedAt}:id:${event.id}`, 'utf8');
+        entries.push({ key: replKindKey, value: relayValue });
+      }
+
+      if (typeof event?.fileKey === 'string' && event.fileKey.trim()) {
+        const fileKey = event.fileKey.trim();
+        const driveKey = typeof event?.driveKey === 'string' ? event.driveKey.trim() : '';
+        const replFileKey = b4a.from(`relayID:${relayId}:filekey:${fileKey}:drivekey:${driveKey}`, 'utf8');
+        entries.push({ key: replFileKey, value: relayValue });
       }
     }
 

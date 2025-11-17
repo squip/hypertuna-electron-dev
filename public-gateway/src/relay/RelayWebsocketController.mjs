@@ -101,6 +101,12 @@ export default class RelayWebsocketController {
     }
 
     const event = frame[1];
+    if (event?.relayID && !session?.clientToken) {
+      this.#incrementError('auth-required');
+      this.#sendOk(session, event?.id || null, false, 'auth-required');
+      return;
+    }
+
     try {
       const result = await this.relayHost.applyEvent(event);
       const success = result?.status === 'accepted';
@@ -125,6 +131,13 @@ export default class RelayWebsocketController {
 
     const subscriptionId = frame[1];
     const filters = frame.slice(2);
+
+    const requestingReplication = Array.isArray(filters) && filters.some((f) => f && (f.relayID || f['#relay']));
+    if (requestingReplication && !session?.clientToken) {
+      this.#incrementError('auth-required');
+      this.#sendNotice(session, 'auth token required for replication');
+      return;
+    }
 
     this.#recordSubscription(session.connectionKey, subscriptionId, filters);
 

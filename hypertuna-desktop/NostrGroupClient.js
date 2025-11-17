@@ -10,6 +10,7 @@ import NostrEvents from './NostrEvents.js';
 import { NostrUtils } from './NostrUtils.js';
 import { prepareFileAttachment } from './FileAttachmentHelper.js';
 import ReplicationSecretManager from './ReplicationSecretManager.js';
+import { getCachedPublicGatewaySettings } from '../shared/config/PublicGatewaySettings.mjs';
 
 const GROUP_METADATA_CACHE_KEY = 'hypertuna_group_metadata_cache_v1';
 
@@ -113,14 +114,14 @@ class NostrGroupClient {
         // Add debug event handling if debug mode is enabled
         if (this.debugMode) {
             // Add a relay event handler that logs all events
-            this.relayManager.onEvent((event, relayUrl) => {
-                console.log(`DEBUG - Received event kind ${event.kind} from ${relayUrl}:`, {
-                    id: event.id.substring(0, 8) + '...',
-                    pubkey: event.pubkey.substring(0, 8) + '...',
-                    created_at: event.created_at,
-                    tags: event.tags.map(t => t[0]).join(',')
-                });
+        this.relayManager.onEvent((event, relayUrl) => {
+            console.log(`DEBUG - Received event kind ${event.kind} from ${relayUrl}:`, {
+                id: event.id.substring(0, 8) + '...',
+                pubkey: event.pubkey.substring(0, 8) + '...',
+                created_at: event.created_at,
+                tags: event.tags.map(t => t[0]).join(',')
             });
+        });
         }
 
         this.metadataCache = new Map();
@@ -3101,6 +3102,82 @@ async fetchMultipleProfiles(pubkeys) {
         return subscriptionId;
     }
 
+    async publishReplicationEvent(event, relayId) {
+        try {
+            const group = this.getGroupById(relayId) || {};
+            if (group.encryptedReplication === false) return;
+
+            const secret = this.replicationSecrets.getSecret(relayId);
+            if (!secret) return;
+
+            const relayHash = await NostrUtils.computeRelayHash(relayId);
+            const gatewayUrl = this._getGatewayRelayUrl(relayId);
+            if (!gatewayUrl) return;
+
+            const fileKey = event.tags?.find((t) => t[0] === 'filekey')?.[1] || null;
+            const driveKey = event.tags?.find((t) => t[0] === 'drivekey')?.[1] || null;
+            const ciphertext = await this._encryptReplicationPayload(event, secret);
+            if (!ciphertext) return;
+
+            const replicationEvent = {
+                id: event.id,
+                relayID: relayHash,
+                kind: event.kind,
+                created_at: event.created_at,
+                fileKey: fileKey || undefined,
+                driveKey: driveKey || undefined,
+                eventData: ciphertext
+            };
+
+            await this.relayManager.publishToRelays(replicationEvent, [gatewayUrl]);
+        } catch (err) {
+            console.warn('[NostrGroupClient] publishReplicationEvent error', err?.message || err);
+        }
+    }
+
+    _getGatewayRelayUrl(relayId) {
+        try {
+            const settings = getCachedPublicGatewaySettings();
+            const base = settings?.baseUrl || settings?.preferredBaseUrl || 'https://hypertuna.com';
+            const token = this.relayAuthTokens.get(relayId) || null;
+            const url = base.replace(/\/$/, '') + '/relay';
+            if (token) {
+                return this._appendTokenToUrl(url, token);
+            }
+            return url;
+        } catch (err) {
+            console.warn('[NostrGroupClient] Failed to build gateway relay URL', err?.message || err);
+            return null;
+        }
+    }
+
+    async _encryptReplicationPayload(event, secret) {
+        try {
+            const payload = JSON.stringify(event);
+            const keyBytes = this._deriveAesKeyBytes(secret);
+            const iv = crypto.getRandomValues(new Uint8Array(12));
+            const key = await crypto.subtle.importKey('raw', keyBytes, { name: 'AES-GCM' }, false, ['encrypt']);
+            const enc = new TextEncoder();
+            const cipherBuf = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, enc.encode(payload));
+            const combined = new Uint8Array(iv.byteLength + cipherBuf.byteLength);
+            combined.set(iv, 0);
+            combined.set(new Uint8Array(cipherBuf), iv.byteLength);
+            return btoa(String.fromCharCode(...combined));
+        } catch (err) {
+            console.warn('[NostrGroupClient] Encrypt replication payload failed', err?.message || err);
+            return null;
+        }
+    }
+
+    _deriveAesKeyBytes(secret) {
+        const enc = new TextEncoder();
+        const bytes = enc.encode(typeof secret === 'string' ? secret : String(secret));
+        if (bytes.length >= 32) return bytes.slice(0, 32);
+        const out = new Uint8Array(32);
+        out.set(bytes);
+        return out;
+    }
+
     _throttledRecomputeGroupMembers(groupId) {
         if (this._recomputeTimeouts && this._recomputeTimeouts[groupId]) {
             clearTimeout(this._recomputeTimeouts[groupId]);
@@ -3296,6 +3373,11 @@ async fetchMultipleProfiles(pubkeys) {
         } else {
             throw new Error('Group relay not connected');
         }
+
+        // Best-effort replication publish to gateway Hyperbee
+        this.publishReplicationEvent(event, groupId).catch((err) => {
+            console.warn('[NostrGroupClient] Replication publish failed', err?.message || err);
+        });
         
         return event;
     }

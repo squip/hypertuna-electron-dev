@@ -30,6 +30,24 @@ export default class PublicGatewayHyperbeeAdapter {
     this.setRelayClient(relayClient);
   }
 
+  /**
+   * Fetch replication events for a relay since a timestamp (seconds).
+   * @param {string} relayId - relay hash
+   * @param {number} since - timestamp (seconds)
+   * @param {number} limit - optional limit
+   * @returns {Promise<Array>} events sorted desc by created_at
+   */
+  async fetchReplicationSince(relayId, since = 0, limit = null) {
+    if (!relayId) return [];
+    const filter = {
+      relayID: relayId,
+      kinds: [],
+      since: since || 0
+    };
+    const { events } = await this.query([filter], { limit });
+    return events;
+  }
+
   setRelayClient(relayClient) {
     this.relayClient = relayClient || null;
   }
@@ -364,6 +382,11 @@ export default class PublicGatewayHyperbeeAdapter {
       if (!filter.kinds.includes(event.kind)) return false;
     }
 
+    const relayId = this.#extractRelayId(filter);
+    if (relayId) {
+      if (event.relayID !== relayId) return false;
+    }
+
     if (Array.isArray(filter.authors) && filter.authors.length > 0) {
       if (!filter.authors.includes(event.pubkey)) return false;
     }
@@ -391,6 +414,20 @@ export default class PublicGatewayHyperbeeAdapter {
     const since = this.#coerceTimestamp(filter.since);
     const until = this.#coerceTimestamp(filter.until, 9999999999);
     const groups = [];
+
+    const relayId = this.#extractRelayId(filter);
+    if (relayId) {
+      const hasKindFilters = Array.isArray(filter.kinds) && filter.kinds.length > 0;
+      if (hasKindFilters) {
+        const kindGroup = filter.kinds
+          .filter((kind) => Number.isInteger(kind))
+          .map((kind) => this.#constructReplicationKindRangeQuery(relayId, kind, since, until));
+        if (kindGroup.length) groups.push(kindGroup);
+      } else {
+        groups.push([this.#constructReplicationTimeRangeQuery(relayId, since, until)]);
+      }
+      return groups;
+    }
 
     const hasKindFilters = Array.isArray(filter.kinds) && filter.kinds.length > 0;
     const hasAuthorFilters = Array.isArray(filter.authors) && filter.authors.length > 0;
@@ -451,6 +488,19 @@ export default class PublicGatewayHyperbeeAdapter {
     return { gte, lte };
   }
 
+  #constructReplicationTimeRangeQuery(relayId, since, until) {
+    const gte = b4a.from(`relayID:${relayId}:created_at:${this.#padTimestamp(since)}:id:`, 'utf8');
+    const lte = b4a.from(`relayID:${relayId}:created_at:${this.#padTimestamp(until)}:id:#`, 'utf8');
+    return { gte, lte };
+  }
+
+  #constructReplicationKindRangeQuery(relayId, kind, since, until) {
+    const paddedKind = this.#padNumber(kind, 5);
+    const gte = b4a.from(`relayID:${relayId}:kind:${paddedKind}:created_at:${this.#padTimestamp(since)}:id:`, 'utf8');
+    const lte = b4a.from(`relayID:${relayId}:kind:${paddedKind}:created_at:${this.#padTimestamp(until)}:id:#`, 'utf8');
+    return { gte, lte };
+  }
+
   #constructAuthorRangeQuery(author, since, until) {
     const gte = b4a.from(`pubkey:${author}:created_at:${this.#padTimestamp(since)}:id:`, 'utf8');
     const lte = b4a.from(`pubkey:${author}:created_at:${this.#padTimestamp(until)}:id:#`, 'utf8');
@@ -469,6 +519,17 @@ export default class PublicGatewayHyperbeeAdapter {
       return Math.min(this.maxIndexScan, Math.max(limit * 4, 16));
     }
     return this.maxIndexScan;
+  }
+
+  #extractRelayId(filter) {
+    if (typeof filter?.relayID === 'string') return filter.relayID;
+    if (Array.isArray(filter?.relayID) && filter.relayID.length > 0) {
+      return filter.relayID[0];
+    }
+    if (Array.isArray(filter?.['#relay']) && filter['#relay'].length > 0) {
+      return filter['#relay'][0];
+    }
+    return null;
   }
 
   #padNumber(num, length) {

@@ -29,6 +29,7 @@ class PublicGatewayRelayClient extends EventEmitter {
       updatedAt: 0
     };
     this._ensureSyncPromise = null;
+    this.hyperbeeAdapter = null;
   }
 
   async configure(options = {}) {
@@ -181,6 +182,17 @@ class PublicGatewayRelayClient extends EventEmitter {
       });
     }
     return lag;
+  }
+
+  /**
+   * Fetch replication events since timestamp (seconds).
+   * Requires the worker to inject a hyperbeeAdapter configured with this client.
+   */
+  async fetchReplicationSince(relayId, sinceSeconds = 0, limit = null) {
+    if (!this.hyperbeeAdapter || typeof this.hyperbeeAdapter.fetchReplicationSince !== 'function') {
+      return [];
+    }
+    return this.hyperbeeAdapter.fetchReplicationSince(relayId, sinceSeconds, limit);
   }
 
   async _waitWithTimeout(promise, timeoutMs) {
@@ -525,6 +537,7 @@ class PublicGatewayRelayClient extends EventEmitter {
       this.core = null;
     }
     this.store = null;
+    this.hyperbeeAdapter = null;
     this.hyperbeeKey = null;
     this.discoveryKey = null;
     this.replicaSnapshot = {

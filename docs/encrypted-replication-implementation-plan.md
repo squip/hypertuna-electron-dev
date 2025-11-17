@@ -150,3 +150,11 @@
 - Ensure `computeRelayHash` is used wherever relay hashes are needed for replication payloads/indexes (publish/backfill).
 - Consider a neutral/unknown UI state for replication toggle when metadata is missing; currently defaults to ON when absent.
 - Add telemetry/tests for create/edit flows with replication toggle on/off and secret subscription error handling.
+- Replication publish wiring (client) is staged until server Hyperbee index/host/adapter changes land; pick up in the backend-aligned phase when the relay endpoint is ready.
+
+## 9. Status (Phase 2)
+- Hyperbee relay host now stores replication primary rows under `relayID:<hash>:id:<eventId>` (payload ciphertext + minimal cleartext header) and builds replication indexes (time/kind/file) using the `relayID:` namespace.
+- Hyperbee adapter supports replication-index range queries via `relayID`/`#relay` filters (time/kind) and filters events by `event.relayID`; other indexes remain unchanged.
+- Client-side replication publish wiring implemented: publish path derives gateway relay URL from public gateway settings (baseUrl + /relay, optional token per relay), encrypts full event payload with shared secret (AES-GCM), and sends replication event with relay hash + metadata; uses stored shared secret and group replication toggle.
+- Relay websocket controller enforces hybrid auth for replication: replication EVENT/REQ frames require a client token; non-replication traffic may proceed without a token.
+- Hyperbee adapter + worker relay client expose `fetchReplicationSince(relayId, since, limit)` to support backfill queries.
