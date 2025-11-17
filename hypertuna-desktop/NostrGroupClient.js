@@ -11,6 +11,7 @@ import { NostrUtils } from './NostrUtils.js';
 import { prepareFileAttachment } from './FileAttachmentHelper.js';
 import ReplicationSecretManager from './ReplicationSecretManager.js';
 import { getCachedPublicGatewaySettings } from '../shared/config/PublicGatewaySettings.mjs';
+import EncryptedReplicationStore from './EncryptedReplicationStore.js';
 
 const GROUP_METADATA_CACHE_KEY = 'hypertuna_group_metadata_cache_v1';
 
@@ -105,6 +106,8 @@ class NostrGroupClient {
         this.discoverySubscriptionsReady = false;
         this.replicationSecrets = new ReplicationSecretManager();
         this.secretSubscriptions = new Map(); // TODO: phase 2 – use secrets in replication publish/decrypt flows; unsubscribe on leave/destroy.
+        this.replicationStore = typeof indexedDB !== 'undefined' ? new EncryptedReplicationStore() : null;
+        this.replicationCursors = new Map();
 
         this._registerAuthFailureListener();
 
@@ -2007,6 +2010,75 @@ async fetchMultipleProfiles(pubkeys) {
         });
         
         this.activeSubscriptions.add(actualSubId);
+
+        this._subscribeToReplicationFallback(groupId);
+        // Replay any cached replication events for this group
+        this._replayReplicationCache(groupId).catch((err) => {
+            console.warn('[NostrGroupClient] replay replication cache failed', err?.message || err);
+        });
+    }
+
+    async _subscribeToReplicationFallback(groupId) {
+        try {
+            if (!this.replicationStore) return;
+            const group = this.getGroupById(groupId) || {};
+            if (group.encryptedReplication === false) return;
+            const secret = this.replicationSecrets.getSecret(groupId);
+            if (!secret) return;
+
+            const relayHash = await NostrUtils.computeRelayHash(groupId);
+            const gatewayUrl = this._getGatewayRelayUrl(groupId);
+            if (!gatewayUrl) return;
+
+            const subId = `repl-${groupId.substring(0, 8)}`;
+            if (this.activeSubscriptions.has(subId)) return;
+
+            const filters = [{
+                relayID: relayHash
+            }];
+
+            const actualSubId = this.relayManager.subscribeWithRouting(
+                subId,
+                filters,
+                async (event) => {
+                    await this.ingestReplicationEvents(groupId, [event]);
+                },
+                { targetRelays: [gatewayUrl], suppressGlobalEvents: true }
+            );
+
+            this.activeSubscriptions.add(actualSubId);
+            this._trackSubscription(groupId, actualSubId, filters);
+            // Initial broad fetch
+            this._fetchReplicationSnapshot(groupId).catch((err) => {
+                console.warn('[NostrGroupClient] replication snapshot fetch failed', err?.message || err);
+            });
+        } catch (err) {
+            console.warn('[NostrGroupClient] replication fallback subscribe failed', err?.message || err);
+        }
+    }
+
+    async _fetchReplicationSnapshot(groupId) {
+        if (!this.replicationStore) return;
+        const relayHash = await NostrUtils.computeRelayHash(groupId);
+        const gatewayUrl = this._getGatewayRelayUrl(groupId);
+        if (!gatewayUrl) return;
+        const since = this._getReplicationCursor(groupId) || 0;
+        const subId = `repl-snap-${groupId.substring(0, 8)}-${Date.now()}`;
+        const filters = [{ relayID: relayHash, since }];
+        const collected = [];
+
+        const handler = async (event) => {
+            collected.push(event);
+        };
+
+        this.relayManager.subscribeWithRouting(subId, filters, handler, { targetRelays: [gatewayUrl], suppressGlobalEvents: true });
+
+        await new Promise((resolve) => setTimeout(resolve, 2000));
+        this.relayManager.unsubscribe(subId);
+
+        if (collected.length) {
+            await this.ingestReplicationEvents(groupId, collected);
+        }
     }
     
     /**
@@ -2497,6 +2569,7 @@ async fetchMultipleProfiles(pubkeys) {
         // Subscribe to group metadata, membership and content
         this._subscribeToGroupMembership(groupId);
         this._subscribeToGroupContent(groupId);
+        this._subscribeToReplicationFallback(groupId);
         
         return groupId;
     }
@@ -3176,6 +3249,82 @@ async fetchMultipleProfiles(pubkeys) {
         const out = new Uint8Array(32);
         out.set(bytes);
         return out;
+    }
+
+    async _decryptReplicationPayload(ciphertext, secret) {
+        try {
+            const buf = Uint8Array.from(atob(ciphertext), c => c.charCodeAt(0));
+            const iv = buf.slice(0, 12);
+            const data = buf.slice(12);
+            const keyBytes = this._deriveAesKeyBytes(secret);
+            const key = await crypto.subtle.importKey('raw', keyBytes, { name: 'AES-GCM' }, false, ['decrypt']);
+            const plainBuf = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, data);
+            const dec = new TextDecoder();
+            return JSON.parse(dec.decode(plainBuf));
+        } catch (err) {
+            console.warn('[NostrGroupClient] Decrypt replication payload failed', err?.message || err);
+            return null;
+        }
+    }
+
+    async ingestReplicationEvents(relayId, events = []) {
+        if (!this.replicationStore || !Array.isArray(events) || !events.length) return;
+        const secret = this.replicationSecrets.getSecretForTimestamp(relayId, Date.now());
+        if (!secret) return;
+        const decrypted = [];
+        for (const ev of events) {
+            if (!ev?.eventData) continue;
+            if (ev.relayID && ev.relayID !== relayId) continue;
+            const plain = await this._decryptReplicationPayload(ev.eventData, secret);
+            if (plain) {
+                decrypted.push({
+                    ...plain,
+                    relayId,
+                    replicated_at: ev.created_at
+                });
+            }
+        }
+        if (decrypted.length) {
+            await this.replicationStore.putEvents(relayId, decrypted);
+            const maxTs = decrypted.reduce((acc, ev) => Math.max(acc, Number(ev.created_at || 0)), this._getReplicationCursor(relayId) || 0);
+            this._setReplicationCursor(relayId, maxTs);
+            await this._replayReplicationCache(relayId);
+        }
+    }
+
+    _getReplicationCursor(relayId) {
+        return this.replicationCursors.get(relayId) || 0;
+    }
+
+    _setReplicationCursor(relayId, ts) {
+        if (!relayId || !Number.isFinite(ts)) return;
+        this.replicationCursors.set(relayId, Math.max(0, Math.floor(ts)));
+    }
+
+    async _replayReplicationCache(relayId, opts = {}) {
+        if (!this.replicationStore) return;
+        const since = this._getReplicationCursor(relayId) || 0;
+        const filters = {
+            since,
+            until: opts.until || 9999999999,
+            kinds: opts.kinds || null
+        };
+        const cached = await this.replicationStore.getEvents(relayId, filters);
+        for (const ev of cached) {
+            // Basic filter: ensure group tag matches
+            const hTag = Array.isArray(ev.tags) ? ev.tags.find(t => t[0] === 'h') : null;
+            if (hTag && hTag[1] === relayId) {
+                if (ev.kind === NostrEvents.KIND_TEXT_NOTE) {
+                    this._processGroupMessageEvent(ev);
+                } else {
+                    this._processContentEvent(ev);
+                }
+            }
+        }
+        if (cached.length) {
+            const maxTs = cached.reduce((acc, ev) => Math.max(acc, Number(ev.created_at || 0)), since);
+            this._setReplicationCursor(relayId, maxTs);
+        }
     }
 
     _throttledRecomputeGroupMembers(groupId) {

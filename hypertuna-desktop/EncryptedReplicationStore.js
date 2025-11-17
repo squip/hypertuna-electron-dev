@@ -29,6 +29,7 @@ export default class EncryptedReplicationStore {
 
   async putEvents(relayId, events = []) {
     if (!relayId || !Array.isArray(events) || !events.length) return;
+    if (typeof indexedDB === 'undefined') return;
     const db = await this._open();
     return new Promise((resolve, reject) => {
       const tx = db.transaction('events', 'readwrite');
@@ -43,6 +44,7 @@ export default class EncryptedReplicationStore {
 
   async getEvents(relayId, filters = {}) {
     if (!relayId) return [];
+    if (typeof indexedDB === 'undefined') return [];
     const db = await this._open();
     const { since = 0, until = 9999999999, kinds = null, limit = null } = filters;
     return new Promise((resolve, reject) => {
@@ -69,6 +71,7 @@ export default class EncryptedReplicationStore {
   }
 
   async clearRelay(relayId) {
+    if (typeof indexedDB === 'undefined') return;
     const db = await this._open();
     return new Promise((resolve, reject) => {
       const tx = db.transaction('events', 'readwrite');
@@ -87,6 +90,7 @@ export default class EncryptedReplicationStore {
   }
 
   async purgeAll() {
+    if (typeof indexedDB === 'undefined') return;
     const db = await this._open();
     return new Promise((resolve, reject) => {
       const tx = db.transaction('events', 'readwrite');

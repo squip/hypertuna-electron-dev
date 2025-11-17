@@ -137,6 +137,7 @@
 - Settings extensions (Hyperbee URL/auth); metrics (lag, append, fallback, backlog, rotations); status endpoint.
 - Test harness (unit/integration/load); gated rollout plan; enable per relay then globally when stable.
 
+
 ## 8. Status (Phase 1)
 - Relay UI toggle added (default ON) for encrypted replication; create flow passes through to group metadata.
 - Group creation/metadata events now include replication tags; parsing sets `encryptedReplication` on group state; settings tab includes editable toggle wired to metadata updates.
@@ -158,3 +159,9 @@
 - Client-side replication publish wiring implemented: publish path derives gateway relay URL from public gateway settings (baseUrl + /relay, optional token per relay), encrypts full event payload with shared secret (AES-GCM), and sends replication event with relay hash + metadata; uses stored shared secret and group replication toggle.
 - Relay websocket controller enforces hybrid auth for replication: replication EVENT/REQ frames require a client token; non-replication traffic may proceed without a token.
 - Hyperbee adapter + worker relay client expose `fetchReplicationSince(relayId, since, limit)` to support backfill queries.
+
+
+## 10. Status (Phase 3 - complete)
+- Added `EncryptedReplicationStore` (IndexedDB-backed) with insert/query/clear APIs (guarded for availability).
+- Client decrypt helper (AES-GCM) and `ingestReplicationEvents` wired to secret manager for decrypt-then-store; store instantiation in NostrGroupClient.
+- Replication fallback subscribes to gateway relay using relay hash; ingests decrypted events into the store; tracks cursors; performs broad fetch; replays cached replication events into normal processing with cursor updates (local cache + filter path active).
