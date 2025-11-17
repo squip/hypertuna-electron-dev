@@ -1094,7 +1094,7 @@ async function reconcileRelayFiles() {
     }
     let fileMap
     try {
-      fileMap = await manager.relay.queryFilekeyIndex()
+      fileMap = await manager.relay.queryFilekeyIndex({ relayId: relayKey })
     } catch (err) {
       console.error(`[Worker] Failed to query filekey index for ${relayKey}:`, err)
       continue
@@ -1192,7 +1192,7 @@ async function ensureMirrorsForAllRelays() {
     // Collect all provider drive keys for this relay from the filekey index
     let fileMap
     try {
-      fileMap = await manager.relay.queryFilekeyIndex()
+      fileMap = await manager.relay.queryFilekeyIndex({ relayId: relayKey })
     } catch (err) {
       console.error(`[Worker] Mirror: Failed to query filekey index for ${relayKey}:`, err)
       continue
@@ -1225,7 +1225,7 @@ async function ensureMirrorsForAllRelays() {
     if (providers.size === 0) {
       try { await backfillRelayFilekeyIndex(relayKey, identifier) } catch (e) { console.warn('[Mirror] backfill failed:', e) }
       try {
-        const fm2 = await manager.relay.queryFilekeyIndex()
+        const fm2 = await manager.relay.queryFilekeyIndex({ relayId: relayKey })
         console.log(`[Mirror] relay ${relayKey}: re-check filekey index size=${fm2.size}`)
         for (const [_fh, dm] of fm2.entries()) {
           for (const [driveKey] of dm.entries()) providers.add(driveKey)
@@ -1282,7 +1282,7 @@ async function collectRelayHealth(relayKey, manager, maxChecks = 200) {
   // filekey index map: Map<fileHash, Map<driveKey,pubkey>>
   let fileMap
   try {
-    fileMap = await manager.relay.queryFilekeyIndex()
+    fileMap = await manager.relay.queryFilekeyIndex({ relayId })
   } catch (err) {
     console.error(`[Worker] Health: queryFilekeyIndex failed for ${relayKey}:`, err)
     return {

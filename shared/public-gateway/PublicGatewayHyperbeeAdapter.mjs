@@ -78,7 +78,8 @@ export default class PublicGatewayHyperbeeAdapter {
       return {
         length: 0,
         downloaded: 0,
-        lag: 0
+        lag: 0,
+        updatedAt: Date.now()
       };
     }
 
@@ -89,7 +90,8 @@ export default class PublicGatewayHyperbeeAdapter {
       return {
         length,
         downloaded,
-        lag: Math.max(0, length - downloaded)
+        lag: Math.max(0, length - downloaded),
+        updatedAt: Date.now()
       };
     } catch (error) {
       this.logger?.debug?.('[PublicGatewayHyperbeeAdapter] Failed to read replica stats', {
@@ -153,6 +155,7 @@ export default class PublicGatewayHyperbeeAdapter {
     const events = Array.from(resultMap.values());
     events.sort((a, b) => (b?.created_at || 0) - (a?.created_at || 0));
 
+    const updatedAt = Date.now();
     return {
       events,
       stats: {
@@ -160,7 +163,8 @@ export default class PublicGatewayHyperbeeAdapter {
         truncated,
         returned: events.length,
         replicaLag,
-        synchronized
+        synchronized,
+        updatedAt
       }
     };
   }

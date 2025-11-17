@@ -5,6 +5,8 @@ import Hyperbee from 'hyperbee';
 import { openHyperbeeReplicationChannel } from '../../shared/public-gateway/hyperbeeReplicationChannel.mjs';
 
 import { getCorestore } from '../hyperdrive-manager.mjs';
+import { getRelaySecret } from '../relay-secret-store.mjs';
+import { decryptReplicationPayload } from '../../shared/replication-crypto.mjs';
 
 class PublicGatewayRelayClient extends EventEmitter {
   constructor({ logger = console } = {}) {
@@ -192,7 +194,16 @@ class PublicGatewayRelayClient extends EventEmitter {
     if (!this.hyperbeeAdapter || typeof this.hyperbeeAdapter.fetchReplicationSince !== 'function') {
       return [];
     }
-    return this.hyperbeeAdapter.fetchReplicationSince(relayId, sinceSeconds, limit);
+    const events = await this.hyperbeeAdapter.fetchReplicationSince(relayId, sinceSeconds, limit);
+    const secret = getRelaySecret(relayId);
+    if (!secret) return [];
+    const decrypted = [];
+    for (const ev of events) {
+      if (!ev?.eventData) continue;
+      const plain = await decryptReplicationPayload(ev.eventData, secret, this.logger);
+      if (plain) decrypted.push(plain);
+    }
+    return decrypted;
   }
 
   async _waitWithTimeout(promise, timeoutMs) {

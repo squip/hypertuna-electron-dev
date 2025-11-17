@@ -165,3 +165,12 @@
 - Added `EncryptedReplicationStore` (IndexedDB-backed) with insert/query/clear APIs (guarded for availability).
 - Client decrypt helper (AES-GCM) and `ingestReplicationEvents` wired to secret manager for decrypt-then-store; store instantiation in NostrGroupClient.
 - Replication fallback subscribes to gateway relay using relay hash; ingests decrypted events into the store; tracks cursors; performs broad fetch; replays cached replication events into normal processing with cursor updates (local cache + filter path active).
+
+## 11. Status (Phase 4 - complete)
+- Worker-side secret store/API added (`getRelaySecret`/`setRelaySecret`).
+- Shared decrypt helper for replication payloads added (`shared/replication-crypto.mjs`).
+- Worker gateway client decrypts replication events when secret is available and exposes `fetchReplicationSince`.
+- Replication sync wired into lifecycle: shared gateway relay client/adapter; per-relay sync starts on metadata updates; stops when relays go offline/disabled and on shutdown; stop helpers available for all relays.
+- File/drive index HMAC conversion applied on write (constructIndexKeyFilekey) using relay secret; range queries compute HMAC when relayId/secret provided; reconcile/mirror callers pass relayId to queryFilekeyIndex.
+- Replication metrics: adapter stats expose updatedAt and lag; replication sync stats surfaced via GatewayService.getStatus; cursors reset on first start; sync stats track lagMs, backlog count, batch size, apply/duplicate/failed counts, and fetch duration.
+- Worker replication backfill scaffold added: worker-side secret store/API (`getRelaySecret`), shared decrypt helper, and `ReplicationSyncService` to fetch replication events since cursor, decrypt, and append via relay event processor. Hook-in to gateway client pending wiring in worker lifecycle.

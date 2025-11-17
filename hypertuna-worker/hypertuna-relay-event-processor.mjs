@@ -4,6 +4,8 @@ import Autobee from './hypertuna-relay-helper.mjs';
 import b4a from 'b4a';
 import { nobleSecp256k1 } from './crypto-libraries.js';
 import { NostrUtils } from './nostr-utils.js';
+import crypto from 'node:crypto';
+import { getRelaySecret } from './relay-secret-store.mjs';
 
 export { validateEvent, verifyEventSignature, getEventHash, serializeEvent };
 
@@ -239,6 +241,14 @@ export default class NostrRelay extends Autobee {
   }
 
   static constructIndexKeyFilekey(event, filekey, driveKey) {
+    const relayId = this._getTagValue(event, 'h') || this._getTagValue(event, 'hypertuna');
+    const secret = relayId ? getRelaySecret(relayId) : null;
+    if (secret) {
+      const hmac = crypto.createHmac('sha256', String(secret));
+      hmac.update(`${filekey}:${driveKey || ''}`);
+      const digest = hmac.digest('hex');
+      return `filekey:${digest}:drivekey:${driveKey}:pubkey:${event.pubkey}`;
+    }
     return `filekey:${filekey}:drivekey:${driveKey}:pubkey:${event.pubkey}`;
   }
 
@@ -564,24 +574,28 @@ export default class NostrRelay extends Autobee {
     return { gte, lte };
   }
 
-  static constructFilekeyRangeQuery({ filekey, drivekey, pubkey } = {}) {
+  static constructFilekeyRangeQuery({ filekey, drivekey, pubkey, relayId = null } = {}) {
     // To select all keys with a given prefix in Hyperbee, use an upper bound
     // that is the prefix plus a 0xFF byte (max byte) — not '#', which sorts
     // before digits/letters and inadvertently excludes valid keys.
     const MAX_BYTE = b4a.from([0xff]);
+    const secret = relayId ? getRelaySecret(relayId) : null;
+    const keyPart = secret && filekey
+      ? crypto.createHmac('sha256', String(secret)).update(`${filekey}:${drivekey || ''}`).digest('hex')
+      : filekey;
 
-    if (filekey && drivekey && pubkey) {
+    if (keyPart && drivekey && pubkey) {
       return {
         key: b4a.from(
-          `filekey:${filekey}:drivekey:${drivekey}:pubkey:${pubkey}`,
+          `filekey:${keyPart}:drivekey:${drivekey}:pubkey:${pubkey}`,
           'utf8'
         )
       };
     }
 
-    if (filekey && drivekey) {
+    if (keyPart && drivekey) {
       const prefix = b4a.from(
-        `filekey:${filekey}:drivekey:${drivekey}:pubkey:`,
+        `filekey:${keyPart}:drivekey:${drivekey}:pubkey:`,
         'utf8'
       );
       const gte = prefix;
@@ -589,8 +603,8 @@ export default class NostrRelay extends Autobee {
       return { gte, lte };
     }
 
-    if (filekey) {
-      const prefix = b4a.from(`filekey:${filekey}:`, 'utf8');
+    if (keyPart) {
+      const prefix = b4a.from(`filekey:${keyPart}:`, 'utf8');
       const gte = prefix;
       const lte = b4a.concat([prefix, MAX_BYTE]);
       return { gte, lte };

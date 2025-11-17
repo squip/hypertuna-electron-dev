@@ -21,6 +21,7 @@ import PublicGatewayDiscoveryClient from './PublicGatewayDiscoveryClient.mjs';
 import PublicGatewayRelayClient from './PublicGatewayRelayClient.mjs';
 import PublicGatewayHyperbeeAdapter from '../../shared/public-gateway/PublicGatewayHyperbeeAdapter.mjs';
 import PublicGatewayVirtualRelayManager from './PublicGatewayVirtualRelayManager.mjs';
+import ReplicationSyncService from '../replication-sync.mjs';
 import {
   registerVirtualRelay,
   unregisterVirtualRelay
@@ -220,6 +221,9 @@ export class GatewayService extends EventEmitter {
     this.pfpDriveKeys = new Map(); // peerPublicKey -> driveKey
     this.peerHandshakes = new Map();
     this.loggerBridge = null;
+    this.replicationSync = null;
+    this.gatewayRelayClient = null;
+    this.gatewayHyperbeeAdapter = null;
     this.publicGatewaySettings = this.#normalizePublicGatewayConfig(options.publicGateway);
     this.publicGatewayRegistrar = null;
     this.publicGatewayRelayState = new Map();
@@ -1049,6 +1053,7 @@ export class GatewayService extends EventEmitter {
       this.publicGatewayRelayState.delete(relayKey);
       this.#clearRelayToken(relayKey);
       await this.#unregisterPublicGatewayVirtualRelay(relayKey);
+      this.stopReplicationSync(relayKey);
       this.#emitPublicGatewayStatus();
       return;
     }
@@ -1062,6 +1067,7 @@ export class GatewayService extends EventEmitter {
       this.publicGatewayRelayState.delete(relayKey);
       this.#clearRelayToken(relayKey);
       await this.#unregisterPublicGatewayVirtualRelay(relayKey);
+      this.stopReplicationSync(relayKey);
       this.#emitPublicGatewayStatus();
       return;
     }
@@ -1133,6 +1139,7 @@ export class GatewayService extends EventEmitter {
         this.log('warn', `[PublicGateway] Failed to unregister relay ${relayKey}: ${error.message}`);
       }
       this.#clearRelayToken(relayKey);
+      this.stopReplicationSync(relayKey);
       this.#emitPublicGatewayStatus();
       return;
     }
@@ -1619,6 +1626,8 @@ export class GatewayService extends EventEmitter {
 
     this.log('info', 'Stopping gateway');
 
+    this.stopAllReplicationSync();
+
     if (this.healthInterval) {
       clearInterval(this.healthInterval);
       this.healthInterval = null;
@@ -1802,6 +1811,7 @@ export class GatewayService extends EventEmitter {
     } else {
       this.publicGatewayRelayState.clear();
       this.#clearAllRelayTokens();
+      this.stopAllReplicationSync();
     }
 
     const previousHash = previousSettings?.resolvedSharedSecretHash || null;
@@ -2016,7 +2026,7 @@ export class GatewayService extends EventEmitter {
     };
   }
 
-  getStatus() {
+  async getStatus() {
     const peerRelayMap = {};
     for (const [identifier, relay] of this.activeRelays.entries()) {
       peerRelayMap[identifier] = {
@@ -2054,7 +2064,13 @@ export class GatewayService extends EventEmitter {
       relays: this.activeRelays.size,
       peerRelayMap,
       peerDetails,
-      publicGateway: this.getPublicGatewayState()
+      publicGateway: this.getPublicGatewayState(),
+      replication: {
+        perRelay: Array.isArray(this.replicationSync?.getStats?.()) ? this.replicationSync.getStats() : [],
+        replica: this.gatewayHyperbeeAdapter && typeof this.gatewayHyperbeeAdapter.getReplicaStats === 'function'
+          ? await this.gatewayHyperbeeAdapter.getReplicaStats().catch(() => null)
+          : null
+      }
     };
   }
 
@@ -2517,11 +2533,23 @@ export class GatewayService extends EventEmitter {
       });
     }
 
+    if (updatedRelays.length) {
+      for (const rid of updatedRelays) {
+        this.#ensureReplicationSync(rid);
+      }
+    }
+
     if (data.gatewayReplica && typeof data.gatewayReplica === 'object') {
       peer.gatewayReplica = {
         ...(peer.gatewayReplica || {}),
         ...data.gatewayReplica
       };
+    }
+
+    if (updatedRelays.length) {
+      for (const rid of updatedRelays) {
+        this.#ensureReplicationSync(rid).catch(() => {});
+      }
     }
 
     peer.address = address || null;
@@ -2846,6 +2874,11 @@ export class GatewayService extends EventEmitter {
     if (this.publicGatewayVirtualRelayManager) {
       this.publicGatewayVirtualRelayManager = null;
       this.log('info', `[PublicGateway] Virtual relay unregistered for ${relayKey}`);
+    }
+
+    // stop replication sync for public gateway relay
+    if (this.replicationSync) {
+      this.replicationSync.stop(relayKey);
     }
   }
 
@@ -3730,6 +3763,29 @@ export class GatewayService extends EventEmitter {
     }
   }
 
+  async #ensureReplicationSync(relayId) {
+    if (!relayId) return;
+    const resolved = this.publicGatewaySettings?.resolvedGatewayRelay;
+    if (!resolved?.hyperbeeKey) return;
+    try {
+      if (!this.gatewayRelayClient) {
+        this.gatewayRelayClient = new PublicGatewayRelayClient({ logger: this.logger });
+        this.gatewayHyperbeeAdapter = new PublicGatewayHyperbeeAdapter({ logger: this.logger, relayClient: this.gatewayRelayClient });
+        await this.gatewayRelayClient.configure({
+          hyperbeeKey: resolved.hyperbeeKey,
+          discoveryKey: resolved.discoveryKey,
+          hyperbeeAdapter: this.gatewayHyperbeeAdapter
+        });
+      }
+      if (!this.replicationSync) {
+        this.replicationSync = new ReplicationSyncService({ logger: this.logger, relayManager: this });
+      }
+      this.replicationSync.start(relayId);
+    } catch (error) {
+      this.log('debug', `[ReplicationSync] ensure failed for ${relayId}: ${error?.message || error}`);
+    }
+  }
+
   getPeersWithPfpDrive() {
     return this.activePeers
       .filter(peer => !!peer.pfpDriveKey)
@@ -3738,6 +3794,19 @@ export class GatewayService extends EventEmitter {
         pfpDriveKey: peer.pfpDriveKey,
         nostrPubkeyHex: peer.nostrPubkeyHex || null
       }));
+  }
+
+  stopReplicationSync(relayKey) {
+    if (this.replicationSync && relayKey) {
+      this.replicationSync.stop(relayKey);
+    }
+  }
+
+  stopAllReplicationSync() {
+    if (!this.replicationSync) return;
+    for (const key of this.activeRelays.keys()) {
+      this.replicationSync.stop(key);
+    }
   }
 }
 
