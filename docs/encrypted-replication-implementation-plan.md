@@ -73,6 +73,7 @@
 ### 4.8 File/Drive Metadata (HMAC Indexing)
 - Replace plaintext `fileKey`/`driveKey` indexes with `fileIndex = HMAC-SHA256(sharedSecret, fileKey || driveKey || '')`; store real keys only inside encrypted `eventData`.
 - Update writers/readers (`constructFilekeyRangeQuery`/`queryFilekeyIndex` in `hypertuna-worker/hypertuna-relay-event-processor.mjs`) to compute HMACs; decrypt payloads to recover driveKey/fileKey for reconcile/mirror flows. HTTP GET `/drive/:identifier/:fileHash` remains unchanged.
+- No special replication event kind; separation relies on `relayID:` namespace + replication index keys.
 
 ### 4.9 Public Gateway Web Client
 - In-repo hosted client using existing build chain; reuse desktop UI minus create/join and uploads.
@@ -84,6 +85,7 @@
 - Metrics: replication lag, Hyperbee append success/fail, fallback hit rate, sync backlog, secret rotations.
 - Status endpoint for replication per relay (latest ts, lag).
 - Telemetry-only backpressure: no hard append caps initially; emit warnings when queue/backlog/scan thresholds are crossed to inform tuning.
+- Replication retry/backoff defaults (configurable): start 500–1000 ms, factor ~2.0, max backoff 30–60s, max 5–7 attempts; warn when pending queue per relay exceeds ~100 or lag exceeds configured thresholds.
 
 ### 4.11 Testing & Release Readiness
 - Unit: index builders, secret manager, HMAC file index, encrypt/decrypt, cache eviction.
