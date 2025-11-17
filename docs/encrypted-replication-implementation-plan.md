@@ -38,11 +38,18 @@
 - Publish NIP-78 kind `30078` envelopes per member on create/rotation with `d=hypertuna:relay:<relayId>:secret:v<version>`, tags `['h', relayId]`, `['p', pubkey]`; encrypt `content` per pubkey; trust only admin-pubkey issuers.
 - Rotation on 9001: mint new secret, publish to remaining members; pick secret by created_at when decrypting replication payloads.
 - Desktop/web: background REQ for 30078, cache latest per relay.
+- Secret manager API: `getSecret(relayId)`, `getSecretForTimestamp(relayId, createdAt)`, `setSecret(relayId, secret, createdAt)`, `hasSecret(relayId)`, optional `subscribe(relayId, onUpdate)` for cache refresh.
 
 ### 4.3 Encrypted Replication Publish Path
 - Mirror every EVENT: encrypt full nostr event with relay secret; payload `{relayID, kind, created_at, eventId, fileKey?, driveKey?, eventData:ciphertext}`.
 - Publish to worker relay (existing) + Hyperbee relay target with hybrid auth (gateway token + nostr signature); retry/backoff + telemetry; Autobase write must not block on Hyperbee failure.
 - Deterministic index key builders for replication event/kind/time/file using relay hash + padded numeric fields.
+- Primary replication row: store ciphertext plus minimal cleartext header (relayID, original_kind, created_at, HMAC’d file index) under `relayID:<hash>:id:<eventId>`; other replication indexes store only the event id/pointer.
+- Replication index keys:
+  - `replicationEventKey` → `relayID:<relay hash>:id:<event.id>`
+  - `replicationKindKey` → `relayID:<relay hash>:kind:<kind padded 5>:created_at:<timestamp>:id:<event.id>`
+  - `replicationTimeKey` → `relayID:<relay hash>:created_at:<timestamp>:id:<event.id>`
+  - `replicationFileKey` → `relayID:<relay hash>:filekey:<fileKey>:drivekey:<driveKey>`
 
 ### 4.4 Hyperbee Storage & Adapter
 - HyperbeeRelayHost stores replication entries and relay-scoped indexes (event, kind, time, file).
@@ -73,8 +80,10 @@
 
 ### 4.10 Observability & Settings
 - Extend public-gateway settings to include Hyperbee URL/auth; validation and parsing.
+- Gateway tokens: default TTL 15–30 minutes; refresh at ~80% of TTL (silent/background in browser; prompt only on failure).
 - Metrics: replication lag, Hyperbee append success/fail, fallback hit rate, sync backlog, secret rotations.
 - Status endpoint for replication per relay (latest ts, lag).
+- Telemetry-only backpressure: no hard append caps initially; emit warnings when queue/backlog/scan thresholds are crossed to inform tuning.
 
 ### 4.11 Testing & Release Readiness
 - Unit: index builders, secret manager, HMAC file index, encrypt/decrypt, cache eviction.
