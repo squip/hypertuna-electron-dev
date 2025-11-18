@@ -10,7 +10,11 @@ export default defineConfig({
   resolve: {
     alias: {
       '@desktop': desktopRoot,
-      '@shared': sharedRoot
+      '@shared': sharedRoot,
+      // Ensure browser build resolves crypto deps from this package's node_modules
+      'noble-secp256k1': resolve(__dirname, 'node_modules/noble-secp256k1'),
+      'browserify-cipher': resolve(__dirname, 'node_modules/browserify-cipher'),
+      bech32: resolve(__dirname, 'node_modules/bech32')
     }
   },
   server: {

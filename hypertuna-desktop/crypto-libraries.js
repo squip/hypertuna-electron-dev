@@ -3,24 +3,36 @@
  * Load cryptographic libraries for Nostr operations
  */
 
+// Polyfill globals before pulling in crypto deps
+import './process-shim.js';
+
+// Static imports ensure bundlers include these deps for the browser build
+import * as nobleImport from 'noble-secp256k1';
+import * as cipherImport from 'browserify-cipher';
+import * as bech32Import from 'bech32';
+
 const { electronAPI } = window;
 
-if (!electronAPI || (!electronAPI.importModule && !electronAPI.requireModule)) {
-    throw new Error('electronAPI module loaders are not available in renderer context.');
-}
-
+// Use Electron preload loaders when available; otherwise fall back to bundler/browser imports.
 const loadModule = async (specifier) => {
+  if (electronAPI?.requireModule || electronAPI?.importModule) {
     if (electronAPI.requireModule) {
-        try {
-            return electronAPI.requireModule(specifier);
-        } catch (error) {
-            console.warn(`Failed to require ${specifier}, falling back to dynamic import`, error);
-        }
+      try {
+        return electronAPI.requireModule(specifier);
+      } catch (error) {
+        console.warn(`Failed to require ${specifier}, falling back to dynamic import`, error);
+      }
     }
     if (electronAPI.importModule) {
-        return electronAPI.importModule(specifier);
+      return electronAPI.importModule(specifier);
     }
-    throw new Error(`Unable to load module: ${specifier}`);
+  }
+
+  // Browser/Vite fallback uses statically imported modules (ensures bundling)
+  if (specifier === 'noble-secp256k1') return nobleImport;
+  if (specifier === 'browserify-cipher') return cipherImport;
+  if (specifier === 'bech32') return bech32Import;
+  return import(specifier);
 };
 
 console.log('[Crypto] Loading cryptographic dependencies...');

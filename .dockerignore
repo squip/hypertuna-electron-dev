@@ -1,4 +1,7 @@
 shared/node_modules
+hypertuna-desktop/node_modules
+public-gateway/node_modules
+public-gateway/public-web/node_modules
 shared/public-gateway/node_modules
 .git
 .gitignore

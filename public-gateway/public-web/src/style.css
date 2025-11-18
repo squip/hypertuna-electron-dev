@@ -196,6 +196,22 @@ body {
   flex: 1 1 160px;
 }
 
+.row.align-start {
+  align-items: flex-start;
+}
+
+.btn.justify-start {
+  justify-content: flex-start;
+}
+
+.text-left {
+  text-align: left;
+}
+
+.text-xs {
+  font-size: 12px;
+}
+
 .status {
   font-size: 13px;
   color: #475569;

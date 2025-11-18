@@ -1,3 +1,6 @@
+// Set Node-like globals before loading any other modules
+import './shims.js';
+
 import './style.css';
 import '@desktop/styles.css';
 
@@ -10,7 +13,7 @@ import {
   getCachedPublicGatewaySettings
 } from '@shared/config/PublicGatewaySettings.mjs';
 import { NostrUtils } from '@desktop/NostrUtils.js';
-import { postTelemetry } from './telemetry.js';
+import { postTelemetry, getClientId } from './telemetry.js';
 
 installWebShims();
 
@@ -252,7 +255,7 @@ function render(app) {
       <section class="card">
         <h2>Groups</h2>
         <p class="muted">Read-only view: lists discovered groups and latest messages. Create/join/uploads/worker actions are hidden in web.</p>
-        <div class="row" style="align-items:flex-start;">
+        <div class="row align-start">
           <div class="half">
             ${renderGroupsList()}
           </div>
@@ -797,10 +800,10 @@ function renderGroupsList() {
   return `
     <div class="stack">
       ${entries.map((g) => `
-        <button class="btn secondary" type="button" data-group-id="${escapeHtml(g.id)}" style="justify-content: flex-start;">
-          <div style="text-align:left;">
+        <button class="btn secondary justify-start" type="button" data-group-id="${escapeHtml(g.id)}">
+          <div class="text-left">
             <div><strong>${escapeHtml(g.name)}</strong></div>
-            <div class="muted" style="font-size:12px;">${escapeHtml(g.id)}</div>
+            <div class="muted text-xs">${escapeHtml(g.id)}</div>
           </div>
         </button>
       `).join('')}

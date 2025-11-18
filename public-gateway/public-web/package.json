@@ -8,6 +8,13 @@
     "build": "vite build",
     "preview": "vite preview"
   },
+  "dependencies": {
+    "bech32": "^2.0.0",
+    "browserify-cipher": "^1.0.1",
+    "noble-secp256k1": "^1.2.14",
+    "buffer": "^6.0.3",
+    "process": "^0.11.10"
+  },
   "devDependencies": {
     "uuid": "^9.0.1",
     "vite": "^5.2.0"
