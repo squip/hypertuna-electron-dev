@@ -1,5 +1,5 @@
 import { readFile } from 'node:fs/promises';
-import { resolve } from 'node:path';
+import { isAbsolute, resolve } from 'node:path';
 
 const LEGACY_PUBLIC_GATEWAY_PATH = 'public-gateway/hyperbee';
 
@@ -75,6 +75,13 @@ const DEFAULT_CONFIG = {
     dedupeBatchSize: Number(process.env.GATEWAY_BLINDPEER_DEDUPE_BATCH) || 100,
     staleCoreTtlMs: Number(process.env.GATEWAY_BLINDPEER_STALE_TTL_MS) || (7 * 24 * 60 * 60 * 1000),
     trustedPeersPersistPath: process.env.GATEWAY_BLINDPEER_TRUSTED_PATH || null
+  },
+  publicWeb: {
+    enabled: process.env.GATEWAY_PUBLIC_WEB_ENABLED !== 'false',
+    basePath: process.env.GATEWAY_PUBLIC_WEB_BASEPATH || '/public',
+    distPath: process.env.GATEWAY_PUBLIC_WEB_DIST || 'public-web/dist',
+    cacheSeconds: Number(process.env.GATEWAY_PUBLIC_WEB_CACHE_SECONDS || 300),
+    cspDirectives: null
   }
 };
 
@@ -131,6 +138,10 @@ function loadConfig(overrides = {}) {
     blindPeer: {
       ...DEFAULT_CONFIG.blindPeer,
       ...(overrides.blindPeer || {})
+    },
+    publicWeb: {
+      ...DEFAULT_CONFIG.publicWeb,
+      ...(overrides.publicWeb || {})
     }
   };
 
@@ -144,6 +155,7 @@ function loadConfig(overrides = {}) {
 
   merged.relay = normalizeRelaySettings(merged.relay);
   merged.blindPeer = normalizeBlindPeerSettings(merged.blindPeer);
+  merged.publicWeb = normalizeWebClientSettings(merged.publicWeb);
 
   return merged;
 }
@@ -206,6 +218,31 @@ function normalizeBlindPeerSettings(settings = {}) {
     dedupeBatchSize: toPositiveInt(settings.dedupeBatchSize, 100),
     staleCoreTtlMs: toPositiveInt(settings.staleCoreTtlMs, 7 * 24 * 60 * 60 * 1000),
     trustedPeersPersistPath: sanitizePath(settings.trustedPeersPersistPath)
+  };
+}
+
+function normalizeWebClientSettings(settings = {}) {
+  const sanitizedPath = normalizeGatewayPathValue(settings.basePath) || 'public';
+  const distPath = typeof settings.distPath === 'string' && settings.distPath.trim()
+    ? settings.distPath.trim()
+    : null;
+  const toPositiveInt = (value, fallback) => {
+    const num = Number(value);
+    return Number.isFinite(num) && num >= 0 ? Math.trunc(num) : fallback;
+  };
+
+  const cspDirectives = settings.cspDirectives && typeof settings.cspDirectives === 'object'
+    ? { ...settings.cspDirectives }
+    : null;
+
+  return {
+    enabled: settings.enabled !== false,
+    basePath: `/${sanitizedPath}`,
+    distPath: distPath
+      ? (isAbsolute(distPath) ? distPath : resolve(process.cwd(), distPath))
+      : null,
+    cacheSeconds: toPositiveInt(settings.cacheSeconds, 300),
+    cspDirectives
   };
 }
 

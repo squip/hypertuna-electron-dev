@@ -45,6 +45,8 @@ hypertuna-worker/package-lock.json
 hypertuna-desktop/node_modules/
 public-gateway/node_modules/
 public-gateway/package-lock.json
+public-gateway/public-web/node_modules/
+public-gateway/public-web/package-lock.json
 shared/package-lock.json
 shared/node_modules/
 hypertuna-desktop/test/

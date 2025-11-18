@@ -9,7 +9,10 @@
     "start": "node src/index.mjs",
     "lint": "eslint src --ext .js,.mjs",
     "test": "node --test",
-    "blind-peer:status": "node ./bin/blind-peer-status.mjs"
+    "blind-peer:status": "node ./bin/blind-peer-status.mjs",
+    "web:dev": "npm run dev --prefix public-web",
+    "web:build": "npm run build --prefix public-web",
+    "web:preview": "npm run preview --prefix public-web"
   },
   "dependencies": {
     "blind-peer": "^2.9.2",

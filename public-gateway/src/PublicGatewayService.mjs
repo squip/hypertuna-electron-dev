@@ -1,7 +1,8 @@
 import http from 'node:http';
 import https from 'node:https';
 import { randomBytes } from 'node:crypto';
-import { resolve } from 'node:path';
+import { existsSync } from 'node:fs';
+import { join, resolve } from 'node:path';
 import express from 'express';
 import WebSocket, { WebSocketServer } from 'ws';
 import helmet from 'helmet';
@@ -102,6 +103,7 @@ class PublicGatewayService {
     this.relayCanonicalPath = this.relayConfig?.canonicalPath || this.#toGatewayPath(this.internalRelayKey);
     this.relayPathAliases = Array.isArray(this.relayConfig?.aliasPaths) ? this.relayConfig.aliasPaths : [];
     this.relayAliasMap = this.#buildRelayAliasMap(this.relayPathAliases, this.internalRelayKey);
+    this.webClientConfig = this.#normalizeWebConfig(config?.publicWeb);
     this.relayHost = null;
     this.relayTelemetryUnsub = null;
     this.relayWebsocketController = null;
@@ -355,6 +357,7 @@ class PublicGatewayService {
       app.use(metricsMiddleware(this.config.metrics.path));
     }
 
+    app.post('/api/web-telemetry', (req, res) => this.#handleWebTelemetry(req, res));
     app.get('/api/blind-peer', (req, res) => this.#handleBlindPeerStatus(req, res));
     app.get('/api/blind-peer/replicas', (req, res) => this.#handleBlindPeerReplicas(req, res));
     app.post('/api/blind-peer/gc', (req, res) => this.#handleBlindPeerGc(req, res));
@@ -367,6 +370,8 @@ class PublicGatewayService {
     if (this.#shouldExposeSecretEndpoint()) {
       app.get(this.secretEndpointPath, (req, res) => this.#handleSecretRequest(req, res));
     }
+
+    this.#maybeMountPublicWeb(app);
 
     app.get('/drive/:identifier/:file', async (req, res) => {
       const { identifier, file } = req.params;
@@ -442,6 +447,109 @@ class PublicGatewayService {
 
     this.wss = new WebSocketServer({ server: this.server });
     this.wss.on('connection', (ws, req) => this.#handleWebSocket(ws, req));
+  }
+
+  #maybeMountPublicWeb(app) {
+    const webConfig = this.webClientConfig;
+    if (!webConfig?.enabled) return;
+
+    const normalizedBase = this.#normalizePathValue(webConfig.basePath) || 'public';
+    const basePath = `/${normalizedBase}`;
+    const distPath = webConfig.distPath;
+
+    if (!distPath || !existsSync(distPath)) {
+      this.logger?.warn?.('[PublicGateway] Web client enabled but dist path missing', {
+        basePath,
+        distPath
+      });
+      return;
+    }
+
+    const cacheSeconds = Number.isFinite(webConfig.cacheSeconds) && webConfig.cacheSeconds >= 0
+      ? Math.trunc(webConfig.cacheSeconds)
+      : 300;
+    const assetCacheHeader = `public, max-age=${cacheSeconds}`;
+    const htmlCacheHeader = 'no-cache';
+    const cspHeader = this.#buildWebCspHeader(webConfig.cspDirectives);
+
+    app.use(basePath, express.static(distPath, {
+      fallthrough: true,
+      maxAge: cacheSeconds * 1000,
+      setHeaders: (res, filePath) => {
+        res.setHeader('Cache-Control', assetCacheHeader);
+        if (cspHeader && typeof filePath === 'string' && filePath.endsWith('.html')) {
+          res.setHeader('Content-Security-Policy', cspHeader);
+        }
+      }
+    }));
+
+    app.get(`${basePath}/*`, (_req, res) => {
+      res.setHeader('Cache-Control', htmlCacheHeader);
+      if (cspHeader) {
+        res.setHeader('Content-Security-Policy', cspHeader);
+      }
+      res.sendFile(join(distPath, 'index.html'));
+    });
+
+    this.logger?.info?.('[PublicGateway] Serving public web client', {
+      basePath,
+      distPath,
+      cacheSeconds
+    });
+  }
+
+  #buildWebCspHeader(directives = null) {
+    const baseDirectives = directives && typeof directives === 'object'
+      ? directives
+      : {
+          'default-src': ["'self'"],
+          'connect-src': ["'self'", 'https:', 'http:', 'wss:', 'ws:'],
+          'img-src': ["'self'", 'https:', 'data:', 'blob:'],
+          'media-src': ["'self'", 'https:', 'data:', 'blob:'],
+          'style-src': ["'self'"],
+          'script-src': ["'self'"],
+          'font-src': ["'self'", 'data:'],
+          'object-src': ["'none'"]
+        };
+
+    try {
+      return Object.entries(baseDirectives)
+        .filter(([_, value]) => value != null)
+        .map(([key, value]) => {
+          if (Array.isArray(value)) {
+            return `${key} ${value.join(' ')}`;
+          }
+          return `${key} ${String(value)}`;
+        })
+        .join('; ');
+    } catch (error) {
+      this.logger?.warn?.('[PublicGateway] Failed to build CSP header for web client', {
+        error: error?.message || error
+      });
+      return null;
+    }
+  }
+
+  #handleWebTelemetry(req, res) {
+    try {
+      const payload = req.body || {};
+      const clientId = req.headers['x-client-id'] || null;
+      const normalized = {
+        clientId: typeof clientId === 'string' ? clientId : null,
+        replicationMirrors: Number(payload.replicationMirrors) || 0,
+        replicationMirrorErrors: Number(payload.replicationMirrorErrors) || 0,
+        secretSnapshots: Number(payload.secretSnapshots) || 0,
+        secretSnapshotErrors: Number(payload.secretSnapshotErrors) || 0,
+        online: payload.online === true || payload.online === 'true',
+        timestamp: Date.now()
+      };
+
+      this.logger?.info?.('[PublicGateway] Web telemetry', normalized);
+      res.json({ ok: true });
+    } catch (error) {
+      this.logger?.warn?.('[PublicGateway] Web telemetry rejected', { error: error?.message || error });
+      res.status(400).json({ error: 'telemetry-invalid' });
+    }
   }
 
   async #initializeBlindPeerReplicaManager() {
@@ -526,6 +634,30 @@ class PublicGatewayService {
       }
     }
     return map;
+  }
+
+  #normalizeWebConfig(raw = {}) {
+    const basePath = this.#normalizePathValue(raw?.basePath) || 'public';
+    const cacheSeconds = Number(raw?.cacheSeconds);
+    const distPath = typeof raw?.distPath === 'string' && raw.distPath.trim()
+      ? raw.distPath.trim()
+      : null;
+    const toAbsolute = (value) => {
+      if (!value || typeof value !== 'string') return null;
+      if (value.startsWith('/') || value.match(/^[A-Za-z]:\\/)) return value;
+      return resolve(process.cwd(), value);
+    };
+    const cspDirectives = raw?.cspDirectives && typeof raw.cspDirectives === 'object'
+      ? { ...raw.cspDirectives }
+      : null;
+
+    return {
+      enabled: raw?.enabled !== false,
+      basePath: `/${basePath}`,
+      cacheSeconds: Number.isFinite(cacheSeconds) && cacheSeconds >= 0 ? Math.trunc(cacheSeconds) : 300,
+      distPath: toAbsolute(distPath || this.config?.publicWeb?.distPath || null),
+      cspDirectives
+    };
   }
 
   #resolveRelayKeyFromPath(value) {

@@ -173,4 +173,52 @@
 - Replication sync wired into lifecycle: shared gateway relay client/adapter; per-relay sync starts on metadata updates; stops when relays go offline/disabled and on shutdown; stop helpers available for all relays.
 - File/drive index HMAC conversion applied on write (constructIndexKeyFilekey) using relay secret; range queries compute HMAC when relayId/secret provided; reconcile/mirror callers pass relayId to queryFilekeyIndex.
 - Replication metrics: adapter stats expose updatedAt and lag; replication sync stats surfaced via GatewayService.getStatus; cursors reset on first start; sync stats track lagMs, backlog count, batch size, apply/duplicate/failed counts, and fetch duration.
+
+## 12. Phase 5 – Public Web Client (Planning & Task Breakdown)
+Scope: hosted web client (gateway) that mirrors the desktop UI within the reduced feature set, connects via gateway URLs, supports encrypted replication (publish + fallback), and omits create/join/uploads/worker IPC.
+
+### Pass A – Web Client Scaffold & Build
+- Functional: Standalone SPA served from gateway (e.g., `/public`), reusing shared components/styles from desktop where feasible. No worker IPC.
+- Technical:
+  - Create web build entrypoint (HTML/JS/CSS) and bundler config (Vite/Rollup/Webpack) targeting browser.
+  - Shared module reuse: extract/import NostrGroupClient, NostrUtils, NostrEvents, WebSocketRelayManager, EncryptedReplicationStore/SecretManager; stub/omit worker-specific APIs.
+  - Environment detection: gate any Node/electron APIs; ensure IndexedDB and WebCrypto availability checks.
+  - Hosting: configure gateway server to serve static assets (e.g., Express `app.use(express.static('public-web'))` or equivalent). Add cache headers, CSP defaults.
+
+### Pass B – Auth & Settings (Gateway-first)
+- Functional: User logs in with private key; gateway settings derived from PublicGatewaySettings (baseUrl + /relay); tokens refreshed silently.
+- Technical:
+  - Login form for Nostr key; reuse existing keypair handling from desktop, without worker IPC.
+  - Load/normalize PublicGatewaySettings (baseUrl, token TTL/refresh) for web use; persist in localStorage.
+  - Token handling: silent refresh at ~80% TTL; attach token to gateway relay URL; handle failures with prompt.
+  - Ensure discovery list comes from kind 10009 via gateway-connected relays (URL uses gateway base).
+
+### Pass C – Relay/Group Connectivity & UI Parity (minus excluded features)
+- Functional: Show groups list, group detail (messages/settings/members), follows, discover list; exclude create/join, uploads, worker actions.
+- Technical:
+  - Build pages/components mirroring desktop layout; hide create/join buttons and upload UI.
+  - Connect to relays using gateway URL variants; reuse NostrGroupClient connection logic but remove worker IPC paths.
+  - Settings tab: display replication toggle state (read-only in web); allow view of members/settings (no save unless explicitly allowed in scope).
+  - Discover/follows: reuse existing client logic; ensure websockets point to gateway.
+
+### Pass D – Replication Publish & Fallback (Web)
+- Functional: Publish to relay + mirror to gateway Hyperbee (if replication enabled); fallback reads when peers offline.
+- Technical:
+  - Reuse replication publish helper (AES-GCM, relay hash) with gateway URL + token from settings.
+  - Ensure secret retrieval via 30078 subscription (web version of ReplicationSecretManager) and cache in-memory only.
+  - Fallback subscription + broad fetch + local filter using EncryptedReplicationStore as implemented on desktop; ensure browser-only guards and error handling.
+
+### Pass E – Telemetry, Error Handling, Hosting Glue
+- Functional: Basic telemetry/logging for replication publish/fallback success/fail; graceful error surfaces.
+- Technical:
+  - Hook into console/logger to emit replication publish/fallback stats (counts, failures) optionally to gateway status endpoint.
+  - Add offline detection messaging and token error prompts.
+  - Deployment README: build commands, env vars (gateway base URL), hosting path, CSP considerations.
+
+### Pass F – Validation & QA
+- Functional: Smoke tests for login, list relays, open messages, publish message, replication fallback read when peers offline.
+- Technical:
+  - Manual test checklist; optional simple Cypress/Playwright script (if feasible) hitting a mock gateway relay.
+  - Verify IndexedDB cache creation/eviction in browser; confirm no worker/electron calls throw.
+
 - Worker replication backfill scaffold added: worker-side secret store/API (`getRelaySecret`), shared decrypt helper, and `ReplicationSyncService` to fetch replication events since cursor, decrypt, and append via relay event processor. Hook-in to gateway client pending wiring in worker lifecycle.

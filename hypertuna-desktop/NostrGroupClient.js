@@ -3164,15 +3164,73 @@ async fetchMultipleProfiles(pubkeys) {
                 const secret = await NostrUtils.decrypt(this.user.privateKey, event.pubkey, event.content);
                 if (secret) {
                     this.replicationSecrets.setSecret(relayId, secret, (event.created_at || 0) * 1000);
+                    // Mirror the secret envelope into replication dataset so web/gateway can recover offline.
+                    this._publishSecretReplicationEnvelope(relayId, event).catch((err) => {
+                        console.warn('[NostrGroupClient] secret replication mirror failed', err?.message || err);
+                    });
                 }
             } catch (_) {
                 // ignore decrypt failures
             }
         };
 
-        this.relayManager.subscribe(subscriptionId, filters, handler);
+        const gatewayUrl = this._getGatewayRelayUrl(relayId);
+        if (gatewayUrl) {
+            this.relayManager.subscribeWithRouting(subscriptionId, filters, handler, { targetRelays: [gatewayUrl] });
+        } else {
+            this.relayManager.subscribe(subscriptionId, filters, handler);
+        }
+
         this.secretSubscriptions.set(relayId, subscriptionId);
+        // Best-effort snapshot fetch so secrets are available when no peers are online.
+        this._fetchSecretSnapshot(relayId).catch((err) => {
+            console.warn('[NostrGroupClient] secret snapshot fetch failed', err?.message || err);
+        });
         return subscriptionId;
+    }
+
+    async _fetchSecretSnapshot(relayId) {
+        if (!relayId || !this.user?.privateKey) return;
+        const gatewayUrl = this._getGatewayRelayUrl(relayId);
+        if (!gatewayUrl) return;
+        const subId = `secret-snap-${relayId.substring(0, 8)}-${Date.now()}`;
+        const filters = [{
+            kinds: [30078],
+            '#h': [relayId],
+            '#p': [this.user.pubkey],
+            limit: 1
+        }];
+
+        return new Promise((resolve) => {
+            const handler = async (event) => {
+                try {
+                    const secret = await NostrUtils.decrypt(this.user.privateKey, event.pubkey, event.content);
+                    if (secret) {
+                        this.replicationSecrets.setSecret(relayId, secret, (event.created_at || 0) * 1000);
+                        this._publishSecretReplicationEnvelope(relayId, event).catch((err) => {
+                            console.warn('[NostrGroupClient] secret replication mirror failed', err?.message || err);
+                        });
+                        if (this.telemetry) {
+                            this.telemetry.secretSnapshots = (this.telemetry.secretSnapshots || 0) + 1;
+                        }
+                    }
+                } catch (_) {
+                    // ignore
+                }
+            };
+
+            this.relayManager.subscribeWithRouting(subId, filters, async (event) => {
+                await handler(event);
+                this.relayManager.unsubscribe(subId);
+                resolve();
+            }, { targetRelays: [gatewayUrl], suppressGlobalEvents: true });
+
+            // Timeout safety
+            setTimeout(() => {
+                this.relayManager.unsubscribe(subId);
+                resolve();
+            }, 4000);
+        });
     }
 
     async publishReplicationEvent(event, relayId) {
@@ -3251,6 +3309,28 @@ async fetchMultipleProfiles(pubkeys) {
         return out;
     }
 
+    async _publishSecretReplicationEnvelope(relayId, secretEvent) {
+        try {
+            if (!relayId || !secretEvent) return;
+            const group = this.getGroupById(relayId) || {};
+            if (group.encryptedReplication === false) return;
+            const gatewayUrl = this._getGatewayRelayUrl(relayId);
+            if (!gatewayUrl) return;
+            const relayHash = await NostrUtils.computeRelayHash(relayId);
+            const eventData = btoa(JSON.stringify(secretEvent));
+            const replicationEvent = {
+                id: secretEvent.id,
+                relayID: relayHash,
+                kind: secretEvent.kind || 30078,
+                created_at: secretEvent.created_at,
+                eventData
+            };
+            await this.relayManager.publishToRelays(replicationEvent, [gatewayUrl]);
+        } catch (error) {
+            console.warn('[NostrGroupClient] _publishSecretReplicationEnvelope failed', error?.message || error);
+        }
+    }
+
     async _decryptReplicationPayload(ciphertext, secret) {
         try {
             const buf = Uint8Array.from(atob(ciphertext), c => c.charCodeAt(0));
@@ -3268,13 +3348,27 @@ async fetchMultipleProfiles(pubkeys) {
     }
 
     async ingestReplicationEvents(relayId, events = []) {
-        if (!this.replicationStore || !Array.isArray(events) || !events.length) return;
+        if (!Array.isArray(events) || !events.length) return;
         const secret = this.replicationSecrets.getSecretForTimestamp(relayId, Date.now());
-        if (!secret) return;
         const decrypted = [];
         for (const ev of events) {
             if (!ev?.eventData) continue;
             if (ev.relayID && ev.relayID !== relayId) continue;
+            if (ev.kind === 30078) {
+                // Secret envelopes mirrored as-is (already encrypted per member)
+                try {
+                    const raw = atob(ev.eventData);
+                    const parsed = JSON.parse(raw);
+                    const secretValue = await NostrUtils.decrypt(this.user?.privateKey, parsed.pubkey, parsed.content);
+                    if (secretValue) {
+                        this.replicationSecrets.setSecret(relayId, secretValue, (parsed.created_at || ev.created_at || 0) * 1000);
+                    }
+                } catch (error) {
+                    console.warn('[NostrGroupClient] replication secret ingest failed', error?.message || error);
+                }
+                continue;
+            }
+            if (!secret) continue;
             const plain = await this._decryptReplicationPayload(ev.eventData, secret);
             if (plain) {
                 decrypted.push({
@@ -3284,7 +3378,7 @@ async fetchMultipleProfiles(pubkeys) {
                 });
             }
         }
-        if (decrypted.length) {
+        if (this.replicationStore && decrypted.length) {
             await this.replicationStore.putEvents(relayId, decrypted);
             const maxTs = decrypted.reduce((acc, ev) => Math.max(acc, Number(ev.created_at || 0)), this._getReplicationCursor(relayId) || 0);
             this._setReplicationCursor(relayId, maxTs);
