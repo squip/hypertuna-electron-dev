@@ -6,12 +6,8 @@
 // Polyfill globals before pulling in crypto deps
 import './process-shim.js';
 
-// Static imports ensure bundlers include these deps for the browser build
-import * as nobleImport from 'noble-secp256k1';
-import * as cipherImport from 'browserify-cipher';
-import * as bech32Import from 'bech32';
-
 const { electronAPI } = window;
+const nodeRequire = typeof require === 'function' ? require : null;
 
 // Use Electron preload loaders when available; otherwise fall back to bundler/browser imports.
 const loadModule = async (specifier) => {
@@ -28,6 +24,14 @@ const loadModule = async (specifier) => {
     }
   }
 
+  if (nodeRequire) {
+    try {
+      return nodeRequire(specifier);
+    } catch (error) {
+      console.warn(`Node require failed for ${specifier}, falling back to dynamic import`, error);
+    }
+  }
+
   // Browser/Vite fallback uses statically imported modules (ensures bundling)
   if (specifier === 'noble-secp256k1') return nobleImport;
   if (specifier === 'browserify-cipher') return cipherImport;
@@ -37,9 +41,26 @@ const loadModule = async (specifier) => {
 
 console.log('[Crypto] Loading cryptographic dependencies...');
 
-const secpModule = await loadModule('noble-secp256k1');
-const cipherModule = await loadModule('browserify-cipher');
-const bech32Module = await loadModule('bech32');
+let secpModule;
+let cipherModule;
+let bech32Module;
+
+// Prefer Electron/Node require when available to avoid bare-specifier resolution issues
+if (nodeRequire || electronAPI?.requireModule) {
+  try {
+    secpModule = (electronAPI?.requireModule || nodeRequire)('noble-secp256k1');
+    cipherModule = (electronAPI?.requireModule || nodeRequire)('browserify-cipher');
+    bech32Module = (electronAPI?.requireModule || nodeRequire)('bech32');
+  } catch (err) {
+    console.warn('[Crypto] Node require failed, falling back to dynamic import', err);
+  }
+}
+
+if (!secpModule || !cipherModule || !bech32Module) {
+  secpModule = secpModule || await loadModule('noble-secp256k1');
+  cipherModule = cipherModule || await loadModule('browserify-cipher');
+  bech32Module = bech32Module || await loadModule('bech32');
+}
 
 const secp256k1 = secpModule.default || secpModule;
 const cipher = cipherModule.default || cipherModule;

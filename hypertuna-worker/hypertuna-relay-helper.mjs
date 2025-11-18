@@ -165,3 +165,8 @@ export default class Autobee extends Autobase {
     if (this.local) this.local.wakeupCapability = value;
   }
 }
+
+export function logWithTimestamp(message) {
+  const ts = new Date().toISOString();
+  console.log(`[${ts}] ${message}`);
+}

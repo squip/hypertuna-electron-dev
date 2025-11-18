@@ -618,4 +618,13 @@ class PublicGatewayRelayClient extends EventEmitter {
   }
 }
 
+// Singleton accessor matching previous API expectation
+let _singleton = null;
+export function getGatewayRelayClient(options = {}) {
+  if (!_singleton) {
+    _singleton = new PublicGatewayRelayClient(options);
+  }
+  return _singleton;
+}
+
 export default PublicGatewayRelayClient;

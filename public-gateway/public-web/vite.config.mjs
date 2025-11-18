@@ -31,5 +31,8 @@ export default defineConfig({
     emptyOutDir: true,
     sourcemap: true,
     target: 'esnext'
+  },
+  optimizeDeps: {
+    include: ['noble-secp256k1', 'browserify-cipher', 'bech32']
   }
 });
