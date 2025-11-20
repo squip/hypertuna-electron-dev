@@ -184,6 +184,12 @@ export async function openHyperbeeReplicationChannel({
   });
 
   if (!channel) {
+    logger?.warn?.('[HyperbeeReplicationChannel] Failed to create replication channel (duplicate?)', {
+      hyperbeeKey,
+      replicationMode,
+      role,
+      isInitiator
+    });
     throw new Error('Failed to create replication channel (duplicate?)');
   }
 
@@ -204,6 +210,13 @@ export async function openHyperbeeReplicationChannel({
 
   const opened = await channel.fullyOpened();
   if (!opened) {
+    logger?.warn?.('[HyperbeeReplicationChannel] Replication channel rejected by remote peer', {
+      hyperbeeKey,
+      replicationMode,
+      role,
+      isInitiator,
+      remoteHandshake: channel?.handshake || null
+    });
     stream.destroy(new Error('Replication channel rejected by remote peer'));
     throw new Error('Replication channel rejected by remote peer');
   }

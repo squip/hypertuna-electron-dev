@@ -1282,7 +1282,7 @@ async function collectRelayHealth(relayKey, manager, maxChecks = 200) {
   // filekey index map: Map<fileHash, Map<driveKey,pubkey>>
   let fileMap
   try {
-    fileMap = await manager.relay.queryFilekeyIndex({ relayId })
+    fileMap = await manager.relay.queryFilekeyIndex({ relayId: relayKey })
   } catch (err) {
     console.error(`[Worker] Health: queryFilekeyIndex failed for ${relayKey}:`, err)
     return {

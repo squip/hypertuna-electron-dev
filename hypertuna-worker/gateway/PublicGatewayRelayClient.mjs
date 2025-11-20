@@ -23,6 +23,7 @@ class PublicGatewayRelayClient extends EventEmitter {
     this.lastLength = 0;
     this.lastReplicationLog = 0;
     this.lastReplicaUpdateAt = 0;
+    this._lastCoreLog = 0;
     this.replicaSnapshot = {
       length: 0,
       contiguousLength: 0,
@@ -70,6 +71,7 @@ class PublicGatewayRelayClient extends EventEmitter {
     });
 
     this.core.on('download', (index, data) => {
+      this._logCoreStatsOnce('download').catch(() => {});
       const contiguous = typeof this.core.contiguousLength === 'number'
         ? this.core.contiguousLength
         : null;
@@ -112,12 +114,7 @@ class PublicGatewayRelayClient extends EventEmitter {
       }
     });
 
-    this.logger?.info?.('[PublicGatewayRelayClient] Configured', {
-      hyperbeeKey: this.hyperbeeKey,
-      discoveryKey: this.discoveryKey,
-      contiguousLength: this.lastDownloaded,
-      totalLength: this.lastLength
-    });
+    this._logCoreStatsOnce('configured').catch(() => {});
   }
 
   _updateReplicaSnapshot({ length, contiguousLength, version } = {}) {
@@ -453,6 +450,7 @@ class PublicGatewayRelayClient extends EventEmitter {
       isInitiator,
       remoteHandshake
     });
+    this._logCoreStatsOnce('channel-established').catch(() => {});
 
     let replication;
     try {
@@ -560,6 +558,35 @@ class PublicGatewayRelayClient extends EventEmitter {
     };
     this.lastReplicaUpdateAt = 0;
     this._ensureSyncPromise = null;
+  }
+
+  async _logCoreStatsOnce(stage = 'unknown') {
+    const now = Date.now();
+    if (this._lastCoreLog && (now - this._lastCoreLog) < 1000) {
+      return;
+    }
+    this._lastCoreLog = now;
+    try {
+      let info = null;
+      if (typeof this.core?.info === 'function') {
+        info = await this.core.info();
+      }
+      const length = typeof this.core?.length === 'number' ? this.core.length : info?.length || null;
+      const contiguous = typeof this.core?.contiguousLength === 'number'
+        ? this.core.contiguousLength
+        : info?.contiguousLength || null;
+      this.logger?.info?.('[PublicGatewayRelayClient] Replica core stats', {
+        stage,
+        hyperbeeKey: this.hyperbeeKey,
+        length,
+        contiguousLength: contiguous
+      });
+    } catch (error) {
+      this.logger?.debug?.('[PublicGatewayRelayClient] Failed to log core stats', {
+        stage,
+        error: error?.message || error
+      });
+    }
   }
 
   async getTelemetry() {

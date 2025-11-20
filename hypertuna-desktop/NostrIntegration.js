@@ -508,26 +508,12 @@ class NostrIntegration {
      * @param {string} [authenticatedRelayUrl] - Tokenized relay URL from the worker
      * @returns {Promise<Object>} - Create group events collection
      */
-    async createGroup(name, about, isPublic, isOpen, relayKey, proxyServer, proxyProtocol, npub, authenticatedRelayUrl = null, fileSharing = true, options = {}) {
+    async createGroup(nameOrOptions, about, isPublic, isOpen, relayKey, proxyServer, proxyProtocol, npub, authenticatedRelayUrl = null, fileSharing = true, options = {}) {
         try {
-            // Validate inputs
-            if (typeof name !== 'string') {
-                throw new Error('Group name must be a string');
-            }
-            if (about !== undefined && typeof about !== 'string') {
-                throw new Error('Group description must be a string');
-            }
-            if (isPublic !== undefined && typeof isPublic !== 'boolean') {
-                throw new Error('isPublic must be a boolean');
-            }
-            if (isOpen !== undefined && typeof isOpen !== 'boolean') {
-                throw new Error('isOpen must be a boolean');
-            }
-            
-            console.log("NostrIntegration creating group:", { name, about, isPublic, isOpen, npub, authenticatedRelayUrl, fileSharing });
-        
-            const eventsCollection = await this.client.createGroup({
-                name,
+            // Support both positional args (legacy) and options object (new)
+            const hasOptionsObject = typeof nameOrOptions === 'object' && nameOrOptions !== null && !Array.isArray(nameOrOptions);
+            const input = hasOptionsObject ? nameOrOptions : {
+                name: nameOrOptions,
                 about,
                 isPublic,
                 isOpen,
@@ -537,7 +523,54 @@ class NostrIntegration {
                 npub,
                 authenticatedRelayUrl,
                 fileSharing,
-                avatar: options.avatar || null
+                avatar: options?.avatar,
+                encryptedReplicationEnabled: options?.encryptedReplicationEnabled
+            };
+
+            const {
+                name,
+                about: aboutText,
+                isPublic: publicFlag,
+                isOpen: openFlag,
+                relayKey: relayKeyInput,
+                proxyServer: proxyServerInput,
+                proxyProtocol: proxyProtocolInput,
+                npub: npubInput,
+                authenticatedRelayUrl: authRelayUrl,
+                fileSharing: fileSharingInput = true,
+                avatar: avatarInput = null,
+                encryptedReplicationEnabled
+            } = input;
+
+            // Validate inputs
+            if (typeof name !== 'string') {
+                throw new Error('Group name must be a string');
+            }
+            if (aboutText !== undefined && typeof aboutText !== 'string') {
+                throw new Error('Group description must be a string');
+            }
+            if (publicFlag !== undefined && typeof publicFlag !== 'boolean') {
+                throw new Error('isPublic must be a boolean');
+            }
+            if (openFlag !== undefined && typeof openFlag !== 'boolean') {
+                throw new Error('isOpen must be a boolean');
+            }
+            
+            console.log("NostrIntegration creating group:", { name, about: aboutText, isPublic: publicFlag, isOpen: openFlag, npub: npubInput, authenticatedRelayUrl: authRelayUrl, fileSharing: fileSharingInput });
+        
+            const eventsCollection = await this.client.createGroup({
+                name,
+                about: aboutText,
+                isPublic: publicFlag,
+                isOpen: openFlag,
+                relayKey: relayKeyInput,
+                proxyServer: proxyServerInput,
+                proxyProtocol: proxyProtocolInput,
+                npub: npubInput,
+                authenticatedRelayUrl: authRelayUrl,
+                fileSharing: fileSharingInput,
+                avatar: avatarInput,
+                encryptedReplicationEnabled
             });
             
             console.log('Group created successfully with the following events:');

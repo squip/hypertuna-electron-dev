@@ -3513,8 +3513,12 @@ App.syncHypertunaConfigToFile = async function() {
             }
             // this.navigateTo('groups'); // Don't navigate away immediately, let user see modal
         } catch (e) {
+            const msg = e?.message || (typeof e === 'string' ? e : JSON.stringify(e));
             console.error('Error creating group:', e);
-            alert('Error creating group: ' + e.message);
+            if (e?.stack) {
+                console.error(e.stack);
+            }
+            alert('Error creating group: ' + msg);
         }
     };
     

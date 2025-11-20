@@ -1470,15 +1470,24 @@ export class GatewayService extends EventEmitter {
     if (handshake.role === 'relay' || handshake.isGateway === false) {
       this.healthState.services.hyperswarmStatus = 'connected';
       this.healthState.services.protocolStatus = 'connected';
-      this.emit('status', this.getStatus());
+      this.#emitResolvedStatus();
+    }
+
+    const normalized = (value) => (typeof value === 'string' ? value.toLowerCase() : null);
+    const normalizedPeer = normalized(publicKey);
+    const normalizedSelf = normalized(this.ownPeerPublicKey);
+    if (normalizedPeer && normalizedSelf && normalizedPeer === normalizedSelf) {
+      this.log('debug', '[PublicGateway] Skipping self-connection during handshake', { peer: publicKey });
+      return;
     }
 
     const isGatewayLike = handshake?.isGateway === true
       || handshake?.role === 'gateway'
       || handshake?.role === 'gateway-replica'
       || this.#isResolvedGatewayPeer(publicKey, handshake);
+    const hasHyperbeeKey = typeof handshake?.hyperbeeKey === 'string' && handshake.hyperbeeKey.length > 0;
 
-    if (isGatewayLike) {
+    if (isGatewayLike && hasHyperbeeKey) {
       if (protocol) {
         this.gatewayProtocols.set(publicKey, protocol);
         const cleanup = () => {
@@ -1492,11 +1501,18 @@ export class GatewayService extends EventEmitter {
         peer: publicKey,
         handshakeRole: handshake.role,
         isGateway: handshake.isGateway,
+        hyperbeeKey: handshake.hyperbeeKey || null,
         protocolOpen: protocol?.isOpen
       });
       this.attachGatewayProtocol(publicKey, protocol);
     } else {
-      this.log('debug', `[PublicGateway] Hyperswarm handshake did not identify peer as gateway (peer=${publicKey} role=${handshake?.role ?? 'unknown'} isGateway=${handshake?.isGateway ?? 'unknown'})`);
+      this.log('debug', '[PublicGateway] Skipping replication attach for peer', {
+        peer: publicKey,
+        reason: !isGatewayLike ? 'not-gateway' : 'missing-hyperbee-key',
+        handshakeRole: handshake?.role ?? 'unknown',
+        isGateway: handshake?.isGateway ?? 'unknown',
+        hyperbeeKey: handshake?.hyperbeeKey || null
+      });
     }
   }
 
@@ -1615,10 +1631,10 @@ export class GatewayService extends EventEmitter {
 
     this.healthInterval = setInterval(() => {
       this.healthState.lastCheck = Date.now();
-      this.emit('status', this.getStatus());
+      this.#emitResolvedStatus();
     }, 30000);
 
-    this.emit('status', this.getStatus());
+    await this.#emitResolvedStatus();
   }
 
   async stop() {
@@ -1671,7 +1687,7 @@ export class GatewayService extends EventEmitter {
     this.healthState.status = 'offline';
     this.healthState.services.gatewayStatus = 'offline';
 
-    this.emit('status', this.getStatus());
+      this.#emitResolvedStatus();
   }
 
   getPublicGatewayState() {
@@ -2072,6 +2088,17 @@ export class GatewayService extends EventEmitter {
           : null
       }
     };
+  }
+
+  async #emitResolvedStatus() {
+    try {
+      const status = await this.getStatus();
+      this.emit('status', status);
+    } catch (error) {
+      this.log('warn', '[PublicGateway] Failed to emit status', {
+        error: error?.message || error
+      });
+    }
   }
 
   getOwnPeerPublicKey() {
@@ -2564,14 +2591,14 @@ export class GatewayService extends EventEmitter {
     this.healthState.activeRelaysCount = this.activeRelays.size;
     this.healthState.services.hyperswarmStatus = 'connected';
 
-    this.emit('status', this.getStatus());
+    this.#emitResolvedStatus();
 
     const connectAndCheck = async () => {
       try {
         await this.connectionPool.getConnection(publicKey);
         peer.status = 'connected';
         await this.peerHealthManager.checkPeerHealth(peer, this.connectionPool);
-        this.emit('status', this.getStatus());
+        this.#emitResolvedStatus();
       } catch (error) {
         this.log('warn', `Failed to connect to peer ${publicKey.slice(0, 8)} (${source}): ${error.message}`);
       }

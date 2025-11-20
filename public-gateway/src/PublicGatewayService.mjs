@@ -716,9 +716,21 @@ class PublicGatewayService {
         getCore: () => this.relayHost?.getCore?.()
       }
     });
-    this.logger?.info?.('Hyperbee relay host ready', {
-      relayKey: host.getPublicKey()
-    });
+    try {
+      const core = this.relayHost.getCore();
+      const length = typeof core?.length === 'number' ? core.length : null;
+      const contiguous = typeof core?.contiguousLength === 'number' ? core.contiguousLength : length;
+      this.logger?.info?.('Hyperbee relay host ready', {
+        relayKey: host.getPublicKey(),
+        discoveryKey: this.relayHost.getDiscoveryKey?.() || null,
+        length,
+        contiguousLength: contiguous
+      });
+    } catch (error) {
+      this.logger?.info?.('Hyperbee relay host ready', {
+        relayKey: host.getPublicKey()
+      });
+    }
 
     this.relayWebsocketController = new RelayWebsocketController({
       relayHost: host,
@@ -3595,6 +3607,12 @@ class PublicGatewayService {
   async #attachHyperbeeReplication(publicKey, protocol, handshake = {}) {
     if (!this.relayHost?.getCore || typeof this.relayHost.getCore !== 'function') return;
     if (!protocol) return;
+    if (!handshake?.hyperbeeKey) {
+      this.logger?.debug?.('[PublicGateway] Skipping replication attach – peer missing hyperbeeKey', {
+        peer: publicKey
+      });
+      return;
+    }
 
     const hostKey = this.relayHost.getPublicKey?.();
     if (hostKey && handshake?.hyperbeeKey && handshake.hyperbeeKey !== hostKey) {
