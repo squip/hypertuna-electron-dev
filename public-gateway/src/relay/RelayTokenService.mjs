@@ -2,6 +2,7 @@ import {
   issueClientToken,
   verifyClientToken
 } from '../../../shared/auth/PublicGatewayTokens.mjs';
+import { randomUUID } from 'node:crypto';
 
 const DEFAULT_TTL_SECONDS = 3600;
 const DEFAULT_REFRESH_WINDOW_SECONDS = 300;
@@ -180,5 +181,122 @@ export default class RelayTokenService {
 
   async getTokenState(relayKey) {
     return this.registrationStore.getTokenMetadata?.(relayKey) || null;
+  }
+
+  /**
+   * Capability tokens are scoped to a relay + capabilityId (hashed member identifier).
+   */
+  async issueCapability({ relayKey, capabilityId, scope = 'replication-write', ttlSeconds, commitment = null, relayId = null, salt = null } = {}) {
+    if (!relayKey) throw new Error('relayKey required');
+    if (!capabilityId) throw new Error('capabilityId required');
+
+    const registration = await this.registrationStore.getRelay?.(relayKey);
+    if (!registration) {
+      throw new Error('relay-not-registered');
+    }
+
+    const issuedAt = Date.now();
+    const ttl = toNumber(ttlSeconds, this.defaultTtlSeconds);
+    const expiresAt = issuedAt + ttl * 1000;
+    const jti = randomUUID();
+
+    const payload = {
+      relayKey,
+      relayId: relayId || null,
+      capabilityId,
+      commitment: commitment || null,
+      salt: salt || null,
+      scope,
+      expiresAt,
+      jti
+    };
+
+    const token = issueClientToken(payload, this.sharedSecret);
+    await this.registrationStore.storeCapabilityMetadata?.(relayKey, capabilityId, {
+      token,
+      scope,
+      issuedAt,
+      expiresAt,
+      jti,
+      commitment: commitment || null,
+      relayId: relayId || null,
+      salt: salt || null,
+      revokedAt: null
+    });
+
+    this.logger?.info?.('[RelayTokenService] Capability issued', {
+      relayKey,
+      capabilityId,
+      scope,
+      expiresAt,
+      jti
+    });
+
+    return { token, expiresAt, jti };
+  }
+
+  async revokeCapability({ relayKey, capabilityId, reason } = {}) {
+    if (!relayKey) throw new Error('relayKey required');
+    if (!capabilityId) throw new Error('capabilityId required');
+    const record = await this.registrationStore.revokeCapability?.(relayKey, capabilityId, reason);
+    this.logger?.warn?.('[RelayTokenService] Capability revoked', {
+      relayKey,
+      capabilityId,
+      reason: reason || null
+    });
+    return record;
+  }
+
+  async verifyCapability(token, relayKey, capabilityId, { expectedScope = null } = {}) {
+    if (!token || typeof token !== 'string') {
+      throw new Error('token-required');
+    }
+    if (!relayKey) throw new Error('relayKey required');
+    if (!capabilityId) throw new Error('capabilityId required');
+
+    const payload = verifyClientToken(token, this.sharedSecret);
+    if (!payload) throw new Error('token-invalid');
+
+    if (payload.relayKey && payload.relayKey !== relayKey) {
+      throw new Error('relay-mismatch');
+    }
+    if (payload.capabilityId && payload.capabilityId !== capabilityId) {
+      throw new Error('capability-mismatch');
+    }
+    if (expectedScope && payload.scope !== expectedScope) {
+      throw new Error('scope-mismatch');
+    }
+    if (payload.expiresAt && payload.expiresAt < Date.now()) {
+      throw new Error('token-expired');
+    }
+
+    const stored = await this.registrationStore.getCapabilityMetadata?.(relayKey, capabilityId);
+    if (stored?.revokedAt) {
+      throw new Error('token-revoked');
+    }
+    if (stored?.token && stored.token !== token) {
+      throw new Error('token-mismatch');
+    }
+
+    // Persist last-seen state
+    await this.registrationStore.storeCapabilityMetadata?.(relayKey, capabilityId, {
+      ...(stored || {}),
+      token,
+      scope: payload.scope || stored?.scope || null,
+      expiresAt: payload.expiresAt || stored?.expiresAt || null,
+      jti: payload.jti || stored?.jti || null,
+      commitment: payload.commitment || stored?.commitment || null,
+      relayId: payload.relayId || stored?.relayId || null,
+      salt: payload.salt || stored?.salt || null,
+      issuedAt: payload.issuedAt || stored?.issuedAt || Date.now(),
+      lastValidatedAt: Date.now()
+    });
+
+    return {
+      payload,
+      scope: payload.scope || null,
+      jti: payload.jti || null,
+      expiresAt: payload.expiresAt || null
+    };
   }
 }

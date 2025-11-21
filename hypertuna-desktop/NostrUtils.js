@@ -311,6 +311,17 @@ export class NostrUtils {
         return this.bytesToHex(hash);
     }
 
+    static async signSchnorr(hashHex, privateKey) {
+        const secp = nobleSecp256k1 || window.nobleSecp256k1;
+        if (!secp) {
+            throw new Error('Noble Secp256k1 library not available');
+        }
+        const hashBytes = typeof hashHex === 'string' ? secp.utils.hexToBytes(hashHex) : hashHex;
+        const privBytes = typeof privateKey === 'string' ? secp.utils.hexToBytes(privateKey) : privateKey;
+        const sig = await secp.schnorr.sign(hashBytes, privBytes);
+        return this.bytesToHex(sig);
+    }
+
     /**
      * Compute deterministic relay hash with namespace salt.
      * @param {string} identifier - Public relay identifier string.

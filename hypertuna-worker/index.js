@@ -19,7 +19,8 @@ import {
   updateRelayAuthToken, // <-- NEW IMPORT
   updateRelayMemberSets,
   calculateMembers,
-  calculateAuthorizedUsers
+  calculateAuthorizedUsers,
+  getRelayCapabilities
 } from './hypertuna-relay-profile-manager-bare.mjs'
 import { loadRelayKeyMappings, activeRelays, virtualRelayKeys, keyToPublic } from './hypertuna-relay-manager-adapter.mjs'
 import {
@@ -81,6 +82,13 @@ function buildGatewayWebsocketBase(config) {
   const protocol = getGatewayWebsocketProtocol(config)
   const host = config?.proxy_server_address || 'localhost'
   return `${protocol}://${host}`
+}
+
+function computeRelayHashSync(identifier) {
+  if (!identifier || typeof identifier !== 'string') return null
+  const normalized = identifier.trim().toLowerCase().replace(/\s+/g, ' ')
+  const salted = `hypertuna-relay-id:${normalized}`
+  return nodeCrypto.createHash('sha256').update(salted).digest('hex')
 }
 
 function deriveGatewayHostFromStatus(status) {
@@ -1483,6 +1491,49 @@ async function handleMessageObject(message) {
     case 'get-public-gateway-config': {
       await ensurePublicGatewaySettingsLoaded()
       sendMessage({ type: 'public-gateway-config', config: publicGatewaySettings })
+      break
+    }
+
+    case 'get-replication-capability': {
+      try {
+        const relayKey = message.relayKey
+        const pubkey = message.pubkey
+        if (!relayKey || !pubkey) {
+          throw new Error('relayKey and pubkey required')
+        }
+        const relayId = computeRelayHashSync(relayKey)
+        const capabilityId = relayId ? nodeCrypto.createHash('sha256').update(`replication-cap:${relayId}:${pubkey}`).digest('hex') : null
+        const capabilities = await getRelayCapabilities(relayKey)
+        let entry = capabilityId ? capabilities[capabilityId] : null
+        const now = Date.now()
+        const expiresAt = entry?.expiresAt || null
+        const needsRefresh = !entry || !Number.isFinite(expiresAt) || expiresAt < now + (7 * 24 * 60 * 60 * 1000)
+
+        if (needsRefresh && gatewayService?.issueCapabilityForRelayMember) {
+          try {
+            await gatewayService.issueCapabilityForRelayMember(relayKey, pubkey)
+            const updated = await getRelayCapabilities(relayKey)
+            entry = capabilityId ? updated[capabilityId] : null
+          } catch (err) {
+            console.warn('[Worker] Capability refresh via gateway failed', err?.message || err)
+          }
+        }
+
+        sendMessage({
+          type: 'replication-capability',
+          relayKey,
+          capability: {
+            capabilityId,
+            token: entry?.token || null,
+            commitment: entry?.commitment || null,
+            salt: entry?.salt || null,
+            relayId,
+            expiresAt: entry?.expiresAt || null
+          }
+        })
+      } catch (err) {
+        sendMessage({ type: 'error', message: `get-replication-capability failed: ${err.message}` })
+      }
       break
     }
 

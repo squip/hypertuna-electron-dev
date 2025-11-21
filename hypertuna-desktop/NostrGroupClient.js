@@ -3257,8 +3257,22 @@ async fetchMultipleProfiles(pubkeys) {
                 created_at: event.created_at,
                 fileKey: fileKey || undefined,
                 driveKey: driveKey || undefined,
-                eventData: ciphertext
+                eventData: ciphertext,
+                capabilityId: this._getRelayCapabilityId?.(relayId) || undefined,
+                capabilityToken: this._getRelayCapabilityToken?.(relayId) || undefined,
+                capabilitySig: null,
+                capabilityPubkey: this.user?.pubkey || undefined
             };
+
+            // Best-effort capability signature if available
+            try {
+                const capabilitySig = await this._signCapabilityEnvelope?.(replicationEvent);
+                if (capabilitySig) {
+                    replicationEvent.capabilitySig = capabilitySig;
+                }
+            } catch (sigErr) {
+                console.warn('[NostrGroupClient] capability signature failed', sigErr?.message || sigErr);
+            }
 
             await this.relayManager.publishToRelays(replicationEvent, [gatewayUrl]);
         } catch (err) {
@@ -3307,6 +3321,34 @@ async fetchMultipleProfiles(pubkeys) {
         const out = new Uint8Array(32);
         out.set(bytes);
         return out;
+    }
+
+    _getRelayCapabilityId(relayId) {
+        // Placeholder for capability lookup (to be wired to worker-managed cache).
+        return null;
+    }
+
+    _getRelayCapabilityToken(relayId) {
+        // Placeholder for capability token lookup (to be wired to worker-managed cache).
+        return null;
+    }
+
+    async _signCapabilityEnvelope(replicationEvent) {
+        if (!replicationEvent?.capabilityId || !replicationEvent?.capabilityToken) return null;
+        if (!this.user?.privateKey) return null;
+        try {
+            const msg = [
+                replicationEvent.id || '',
+                await NostrUtils.computeSha256(replicationEvent.eventData || ''),
+                replicationEvent.capabilityId || '',
+                replicationEvent.capabilityToken || ''
+            ].join(':');
+            const hash = await NostrUtils.computeSha256(msg);
+            return await NostrUtils.signSchnorr(hash, this.user.privateKey);
+        } catch (error) {
+            console.warn('[NostrGroupClient] Failed to sign capability envelope', error?.message || error);
+            return null;
+        }
     }
 
     async _publishSecretReplicationEnvelope(relayId, secretEvent) {

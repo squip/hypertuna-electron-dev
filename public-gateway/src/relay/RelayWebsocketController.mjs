@@ -8,7 +8,8 @@ export default class RelayWebsocketController {
     logger = console,
     featureFlags = {},
     metrics = {},
-    legacyForward
+    legacyForward,
+    capabilityValidator = null
   }) {
     if (!relayHost) throw new Error('RelayWebsocketController requires a relayHost');
     if (typeof legacyForward !== 'function') {
@@ -27,6 +28,7 @@ export default class RelayWebsocketController {
     };
     this.legacyForward = legacyForward;
     this.subscriptions = new Map();
+    this.capabilityValidator = typeof capabilityValidator === 'function' ? capabilityValidator : null;
   }
 
   getSubscriptionSnapshot(sessionKey) {
@@ -108,6 +110,14 @@ export default class RelayWebsocketController {
     }
 
     try {
+      if (event?.relayID && this.capabilityValidator) {
+        const ok = await this.capabilityValidator(session, event);
+        if (!ok) {
+          this.#incrementError('auth-required');
+          this.#sendOk(session, event?.id || null, false, 'replication-auth-failed');
+          return;
+        }
+      }
       const result = await this.relayHost.applyEvent(event);
       const success = result?.status === 'accepted';
       this.#incrementEvent(success ? 'accepted' : 'rejected');

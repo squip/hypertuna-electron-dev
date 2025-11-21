@@ -103,6 +103,20 @@ function ensureProfileSchema(profile) {
         profile.isOpen = false;
     }
 
+    // Capability tokens (per relay): map of capabilityId -> { token, commitment, relayId, salt, expiresAt, issuedAt }
+    if (!profile.capabilities) {
+        profile.capabilities = {};
+    } else if (Array.isArray(profile.capabilities)) {
+        // Migrate array entries to object keyed by capabilityId if present
+        const migrated = {};
+        for (const entry of profile.capabilities) {
+            if (entry?.capabilityId) {
+                migrated[entry.capabilityId] = entry;
+            }
+        }
+        profile.capabilities = migrated;
+    }
+
     return profile;
 }
 
@@ -328,6 +342,20 @@ export async function getRelayProfileByKey(relayKey) {
     }
 }
 
+export async function getRelayCapabilities(relayKey) {
+    const profile = await getRelayProfileByKey(relayKey);
+    if (!profile || !profile.capabilities) return {};
+    return profile.capabilities;
+}
+
+export async function setRelayCapabilities(relayKey, capabilities = {}) {
+    const profile = await getRelayProfileByKey(relayKey);
+    if (!profile) return null;
+    profile.capabilities = capabilities || {};
+    await saveRelayProfile(profile);
+    return profile.capabilities;
+}
+
 /**
  * Get a relay profile by its public identifier
  * @param {string} publicIdentifier - Public identifier string
@@ -410,6 +438,12 @@ async function _saveRelayProfile(relayProfile) {
                 mergedProfile.auth_tokens = {
                     ...profiles[existingIndex].auth_tokens,
                     ...relayProfile.auth_tokens
+                };
+            }
+            if (profiles[existingIndex].capabilities && relayProfile.capabilities) {
+                mergedProfile.capabilities = {
+                    ...profiles[existingIndex].capabilities,
+                    ...relayProfile.capabilities
                 };
             }
             profiles[existingIndex] = mergedProfile;

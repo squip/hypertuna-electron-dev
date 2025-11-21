@@ -16,7 +16,9 @@ import {
     removeRelayProfile,
 importLegacyRelayProfiles,
 updateRelayMemberSets,
-calculateMembers
+calculateMembers,
+getRelayCapabilities,
+setRelayCapabilities
 } from './hypertuna-relay-profile-manager-bare.mjs';
 
 import { ChallengeManager } from './challenge-manager.mjs';
@@ -31,6 +33,8 @@ const virtualRelayKeys = new Set();
 const relayMembers = new Map();
 const relayMemberAdds = new Map();
 const relayMemberRemoves = new Map();
+// Map of relayKey -> Map<capabilityId, memberPubkey>
+const relayCapabilities = new Map();
 
 // Mapping between public identifiers and internal relay keys
 const publicToKey = new Map();
@@ -115,6 +119,8 @@ export function setRelayMapping(relayKey, publicIdentifier) {
     if (publicIdentifier) {
         publicToKey.set(publicIdentifier, relayKey);
         keyToPublic.set(relayKey, publicIdentifier);
+        const members = relayMembers.get(relayKey) || relayMembers.get(publicIdentifier) || [];
+        rebuildCapabilities(publicIdentifier, members);
     } else {
         const existing = keyToPublic.get(relayKey);
         if (existing) publicToKey.delete(existing);
@@ -142,10 +148,41 @@ export async function loadRelayKeyMappings() {
     return { publicToKey, keyToPublic };
 }
 
+function computeRelayHashSync(identifier) {
+    if (!identifier || typeof identifier !== 'string') return null;
+    const normalized = identifier.trim().toLowerCase().replace(/\s+/g, ' ');
+    const salted = `hypertuna-relay-id:${normalized}`;
+    return crypto.createHash('sha256').update(salted).digest('hex');
+}
+
+function ensureCapabilityMap(relayKey) {
+    if (!relayCapabilities.has(relayKey)) {
+        relayCapabilities.set(relayKey, new Map());
+    }
+    return relayCapabilities.get(relayKey);
+}
+
+function rebuildCapabilities(relayKey, members = []) {
+    if (!relayKey) return;
+    const relayHash = computeRelayHashSync(relayKey);
+    const capMap = ensureCapabilityMap(relayKey);
+    capMap.clear();
+    if (!relayHash || !Array.isArray(members)) return;
+    for (const entry of members) {
+        const pubkey = typeof entry === 'string' ? entry : (entry?.pubkey || entry?.publicKey || null);
+        if (!pubkey || typeof pubkey !== 'string') continue;
+        const capabilityId = crypto.createHash('sha256')
+            .update(`replication-cap:${relayHash}:${pubkey}`)
+            .digest('hex');
+        capMap.set(capabilityId, pubkey);
+    }
+}
+
 export function setRelayMembers(relayKey, members = [], adds = null, removes = null) {
     relayMembers.set(relayKey, members);
     if (adds) relayMemberAdds.set(relayKey, adds);
     if (removes) relayMemberRemoves.set(relayKey, removes);
+    rebuildCapabilities(relayKey, members);
 }
 
 export function registerVirtualRelay(relayKey, manager, options = {}) {
@@ -1063,6 +1100,50 @@ export async function getRelayMembers(relayKey) {
     }
     return [];
 }
+
+export function getCapabilityMemberPubkey(relayKey, capabilityId) {
+    if (!relayKey || !capabilityId) return null;
+    const map = relayCapabilities.get(relayKey);
+    if (!map || !(map instanceof Map)) return null;
+    return map.get(capabilityId) || null;
+}
+
+export async function loadRelayCapabilities(relayKey) {
+    await ensureProfilesInitialized(globalUserKey);
+    const capsObj = await getRelayCapabilities(relayKey);
+    const capMap = ensureCapabilityMap(relayKey);
+    capMap.clear();
+    const relayHash = computeRelayHashSync(relayKey);
+    for (const [capId, entry] of Object.entries(capsObj || {})) {
+        if (capId && entry?.pubkey) {
+            capMap.set(capId, entry.pubkey);
+        } else if (capId && relayHash && entry?.derivedFrom) {
+            capMap.set(capId, entry.derivedFrom);
+        }
+    }
+    return capMap;
+}
+
+export async function persistRelayCapability(relayKey, capabilityId, info = {}) {
+    await ensureProfilesInitialized(globalUserKey);
+    const profile = await getRelayProfileByKey(relayKey);
+    if (!profile) return null;
+    profile.capabilities = profile.capabilities || {};
+    profile.capabilities[capabilityId] = {
+        ...profile.capabilities[capabilityId],
+        ...info,
+        updatedAt: Date.now()
+    };
+    await saveRelayProfile(profile);
+    // update in-memory map
+    const capMap = ensureCapabilityMap(relayKey);
+    if (info?.pubkey) {
+        capMap.set(capabilityId, info.pubkey);
+    }
+    return profile.capabilities[capabilityId];
+}
+
+export { computeRelayHashSync };
 
 /**
  * Get active relays information with full details

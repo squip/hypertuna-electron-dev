@@ -743,7 +743,8 @@ class PublicGatewayService {
         reqCounter: relayReqCounter,
         errorCounter: relayErrorCounter
       },
-      legacyForward: (session, message, preferredPeer, context = {}) => this.#forwardLegacyMessage(session, message, preferredPeer, context)
+      legacyForward: (session, message, preferredPeer, context = {}) => this.#forwardLegacyMessage(session, message, preferredPeer, context),
+      capabilityValidator: this.#validateReplicationCapability.bind(this)
     });
 
     await this.#ensureInternalRelayRegistration();
@@ -2797,6 +2798,240 @@ class PublicGatewayService {
     };
   }
 
+  async #handleGatewayControlRequest(peerKey, request) {
+    const method = typeof request?.method === 'string' ? request.method.toUpperCase() : 'GET';
+    if (method !== 'POST') {
+      return {
+        statusCode: 405,
+        headers: { 'content-type': 'application/json' },
+        body: Buffer.from(JSON.stringify({ error: 'method-not-allowed' }))
+      };
+    }
+
+    let payload = {};
+    if (request?.body && request.body.length) {
+      try {
+        payload = JSON.parse(Buffer.from(request.body).toString());
+      } catch (error) {
+        this.logger.warn?.('Failed to parse gateway control payload', {
+          peer: peerKey,
+          error: error?.message || error
+        });
+        return {
+          statusCode: 400,
+          headers: { 'content-type': 'application/json' },
+          body: Buffer.from(JSON.stringify({ error: 'invalid-json' }))
+        };
+      }
+    }
+
+    const type = payload?.type || null;
+    const requestId = payload?.requestId || null;
+    const relayKey = payload?.relayKey || null;
+    const capabilityId = payload?.capabilityId || null;
+
+    if (type === 'replication-capability/issue') {
+      try {
+        const result = await this.tokenService.issueCapability({
+          relayKey,
+          capabilityId,
+          scope: payload?.scope || 'replication-write',
+          ttlSeconds: payload?.ttlSeconds,
+          commitment: payload?.commitment || null,
+          relayId: payload?.relayId || null,
+          salt: payload?.salt || null
+        });
+        return {
+          statusCode: 200,
+          headers: { 'content-type': 'application/json' },
+          body: Buffer.from(JSON.stringify({
+            type: 'replication-capability/issue:result',
+            requestId,
+            ...result
+          }))
+        };
+      } catch (error) {
+        return {
+          statusCode: 400,
+          headers: { 'content-type': 'application/json' },
+          body: Buffer.from(JSON.stringify({
+            type: 'replication-capability/issue:error',
+            requestId,
+            error: error?.message || 'issue-failed'
+          }))
+        };
+      }
+    }
+
+    if (type === 'replication-capability/revoke') {
+      try {
+        const record = await this.tokenService.revokeCapability({
+          relayKey,
+          capabilityId,
+          reason: payload?.reason || null
+        });
+        return {
+          statusCode: 200,
+          headers: { 'content-type': 'application/json' },
+          body: Buffer.from(JSON.stringify({
+            type: 'replication-capability/revoke:result',
+            requestId,
+            revokedAt: record?.revokedAt || Date.now()
+          }))
+        };
+      } catch (error) {
+        return {
+          statusCode: 400,
+          headers: { 'content-type': 'application/json' },
+          body: Buffer.from(JSON.stringify({
+            type: 'replication-capability/revoke:error',
+            requestId,
+            error: error?.message || 'revoke-failed'
+          }))
+        };
+      }
+    }
+
+    return {
+      statusCode: 400,
+      headers: { 'content-type': 'application/json' },
+      body: Buffer.from(JSON.stringify({
+        type: 'replication-capability/error',
+        requestId,
+        error: 'unsupported-type'
+      }))
+    };
+  }
+
+  async #validateReplicationCapability(session, event) {
+    if (!event?.relayID || !this.tokenService) {
+      return true;
+    }
+    const relayKey = session?.relayKey || null;
+    if (!relayKey) return false;
+
+    const capabilityToken = event?.capabilityToken || null;
+    const capabilityId = event?.capabilityId || null;
+    const capabilitySig = event?.capabilitySig || null;
+    const capabilityPubkey = event?.capabilityPubkey || null;
+    const ciphertextHash = event?.eventData ? this.#hashString(event.eventData) : null;
+
+    if (!capabilityToken || !capabilityId || !capabilitySig) {
+      this.logger?.debug?.('[PublicGateway] Replication capability missing fields; allowing (compat)', {
+        relayKey,
+        eventId: event?.id || null
+      });
+      return true;
+    }
+
+    let tokenInfo = null;
+    let tokenPayload = null;
+    try {
+      tokenInfo = await this.tokenService.verifyCapability(
+        capabilityToken,
+        relayKey,
+        capabilityId,
+        { expectedScope: 'replication-write' }
+      );
+      tokenPayload = tokenInfo?.payload || null;
+    } catch (error) {
+      this.logger?.debug?.('[PublicGateway] Capability token invalid', {
+        relayKey,
+        eventId: event?.id || null,
+        error: error?.message || error
+      });
+      return false;
+    }
+
+    // If commitment info is present, perform local verification to support offline mode.
+    if (tokenPayload?.commitment) {
+      if (!capabilityPubkey) {
+        this.logger?.debug?.('[PublicGateway] Capability commitment present but pubkey missing', {
+          relayKey,
+          eventId: event?.id || null
+        });
+        return false;
+      }
+      const salt = tokenPayload?.salt || '';
+      const relayIdForCommit = tokenPayload?.relayId || event?.relayID || '';
+      const computedCommit = this.#hashString([relayIdForCommit, salt, capabilityPubkey].join(':'));
+      if (!computedCommit || computedCommit !== tokenPayload.commitment) {
+        this.logger?.debug?.('[PublicGateway] Capability commitment mismatch', {
+          relayKey,
+          eventId: event?.id || null
+        });
+        return false;
+      }
+      try {
+        const msg = [event?.id || '', ciphertextHash || '', capabilityId, tokenPayload?.jti || ''].join(':');
+        const msgHash = this.#hashString(msg);
+        let schnorr = null;
+        try {
+          ({ nobleSecp256k1: { schnorr } } = await import('../../hypertuna-worker/pure-secp256k1-bare.js'));
+        } catch (_) {
+          try {
+            ({ schnorr } = await import('noble-secp256k1'));
+          } catch (_) {
+            schnorr = null;
+          }
+        }
+        if (!schnorr) {
+          throw new Error('schnorr-lib-missing');
+        }
+        const ok = await schnorr.verify(capabilitySig, msgHash, capabilityPubkey);
+        if (ok) {
+          return true;
+        }
+      } catch (error) {
+        this.logger?.debug?.('[PublicGateway] Capability signature verification failed (local)', {
+          relayKey,
+          eventId: event?.id || null,
+          error: error?.message || error
+        });
+        return false;
+      }
+    }
+
+    const requestId = crypto.randomBytes(8).toString('hex');
+    try {
+      const response = await this.#sendGatewayControlForRelay(relayKey, {
+        type: 'replication-capability/verify',
+        requestId,
+        relayKey,
+        capabilityId,
+        capabilitySig,
+        eventId: event?.id || null,
+        ciphertextHash,
+        jti: tokenInfo?.jti || null
+      }, { timeoutMs: 5000 });
+
+      if (response?.type === 'replication-capability/verify:result' && response?.valid === true) {
+        return true;
+      }
+      this.logger?.debug?.('[PublicGateway] Capability verification rejected by worker', {
+        relayKey,
+        eventId: event?.id || null,
+        error: response?.error || 'invalid'
+      });
+      return false;
+    } catch (error) {
+      this.logger?.debug?.('[PublicGateway] Capability verification failed', {
+        relayKey,
+        eventId: event?.id || null,
+        error: error?.message || error
+      });
+      return false;
+    }
+  }
+
+  #hashString(value) {
+    try {
+      return crypto.createHash('sha256').update(String(value)).digest('hex');
+    } catch (_) {
+      return null;
+    }
+  }
+
   async #mergeRelayRegistration(relayKey, peerKey, relayPayload = {}, globalReplicaPayload = null, now = Date.now()) {
     if (!relayKey || !peerKey) return;
 
@@ -3210,6 +3445,22 @@ class PublicGatewayService {
       }
     });
 
+    protocol.handle('/gateway/control', async (request) => {
+      try {
+        return await this.#handleGatewayControlRequest(publicKey, request);
+      } catch (error) {
+        this.logger.error?.('Gateway control handler failed', {
+          peer: publicKey,
+          error: error?.message || error
+        });
+        return {
+          statusCode: 500,
+          headers: { 'content-type': 'application/json' },
+          body: Buffer.from(JSON.stringify({ error: 'control-failed' }))
+        };
+      }
+    });
+
     const cleanup = () => {
       this.peerMetadata.delete(publicKey);
       this.#detachHyperbeeReplication(publicKey);
@@ -3217,6 +3468,66 @@ class PublicGatewayService {
     };
     protocol.once('close', cleanup);
     protocol.once('destroy', cleanup);
+  }
+
+  async #sendGatewayControlRequest(peerKey, payload = {}, { timeoutMs = 5000 } = {}) {
+    if (!peerKey) {
+      throw new Error('peerKey required for control request');
+    }
+    const connection = await this.connectionPool.getConnection(peerKey);
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const response = await connection.sendRequest({
+        method: 'POST',
+        path: '/gateway/control',
+        headers: { 'content-type': 'application/json' },
+        body: Buffer.from(JSON.stringify(payload)),
+        signal: controller.signal
+      });
+      clearTimeout(timer);
+      if (response?.statusCode !== 200) {
+        const err = new Error(`control-status-${response?.statusCode || 'unknown'}`);
+        err.response = response;
+        throw err;
+      }
+      const body = response?.body ? response.body.toString() : '';
+      try {
+        return JSON.parse(body || '{}');
+      } catch (parseErr) {
+        const err = new Error('control-parse-error');
+        err.cause = parseErr;
+        throw err;
+      }
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  async #sendGatewayControlForRelay(relayKey, payload = {}, { timeoutMs = 5000 } = {}) {
+    const registration = await this.registrationStore.getRelay(relayKey);
+    if (!registration) {
+      throw new Error('relay-not-registered');
+    }
+    const peers = this.#getUsablePeersFromRegistration(registration);
+    if (!Array.isArray(peers) || !peers.length) {
+      throw new Error('no-peers-available');
+    }
+    let lastError = null;
+    for (const peerKey of peers) {
+      try {
+        return await this.#sendGatewayControlRequest(peerKey, payload, { timeoutMs });
+      } catch (error) {
+        lastError = error;
+        this.logger?.debug?.('[PublicGateway] Control request failed for peer, retrying', {
+          relayKey,
+          peerKey,
+          error: error?.message || error
+        });
+      }
+    }
+    if (lastError) throw lastError;
+    throw new Error('control-request-failed');
   }
 
   #buildHandshakePayload({ isServer }) {
