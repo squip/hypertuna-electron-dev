@@ -150,11 +150,10 @@ export default class RelayTokenService {
       throw new Error('token-revoked');
     }
 
-    if (metadata?.token && metadata.token !== token) {
-      throw new Error('token-mismatch');
-    }
-
-    if (metadata?.sequence && payload.sequence && payload.sequence < metadata.sequence) {
+    const currentSequence = metadata?.sequence || 0;
+    const incomingSequence = payload.sequence || currentSequence;
+    // Accept newer or equal sequence tokens even if the token value changed; reject older sequences
+    if (metadata?.token && metadata.token !== token && incomingSequence < currentSequence) {
       throw new Error('token-stale');
     }
 
@@ -163,7 +162,7 @@ export default class RelayTokenService {
       relayAuthToken: payload.relayAuthToken || metadata?.relayAuthToken || null,
       pubkey: payload.pubkey || metadata?.pubkey || null,
       scope: payload.scope || metadata?.scope || null,
-      sequence: payload.sequence || metadata?.sequence || 0,
+      sequence: Math.max(incomingSequence, currentSequence),
       issuedAt: metadata?.issuedAt || payload.issuedAt || Date.now(),
       expiresAt: payload.expiresAt || metadata?.expiresAt || Date.now(),
       refreshAfter: metadata?.refreshAfter || (payload.expiresAt ? Math.max(Date.now(), payload.expiresAt - this.refreshWindowMs) : null),

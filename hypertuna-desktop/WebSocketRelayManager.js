@@ -424,6 +424,10 @@ class WebSocketRelayManager {
     _applyRelevantSubscriptions(relayUrl) {
         const { cleanUrl } = this.parseRelayUrl(relayUrl);
         const relayType = this.relayTypes.get(cleanUrl) || 'discovery';
+        if (relayType === 'replication') {
+            // Replication sockets should not get normal subscriptions
+            return;
+        }
         
         this.globalSubscriptions.forEach((subData, subId) => {
             // Check if this subscription should be applied to this relay
@@ -438,6 +442,9 @@ class WebSocketRelayManager {
      * @private
      */
     _shouldApplySubscription(subData, relayUrl, relayType) {
+        if (relayType === 'replication') {
+            return false;
+        }
         // If subscription has specific target relays, only apply if this relay is one of them
         if (subData.targetRelays && subData.targetRelays.length > 0) {
             return subData.targetRelays.includes(relayUrl);
@@ -736,7 +743,13 @@ _validateEvent(event) {
             console.log(`Cannot subscribe to ${cleanUrl}, relay not connected`);
             return;
         }
-    
+
+        // Never apply non-replication subscriptions to mirror/replication relays
+        if (cleanUrl.includes('/mirror/')) {
+            console.log(`Skipping subscription ${subscriptionId} on replication relay ${cleanUrl}`);
+            return;
+        }
+
         // Get the unique short ID for this subscription
         const subData = this.globalSubscriptions.get(subscriptionId);
         if (!subData) {
@@ -840,6 +853,11 @@ _validateEvent(event) {
         const publishPromises = [];
     
         this.relays.forEach((relay, url) => {
+            const relayType = this.relayTypes.get(url) || this.relayTypes.get(this.parseRelayUrl(url).cleanUrl) || 'discovery';
+            // Skip replication relays for generic publishes; replication publishes should use publishToRelays with explicit targets
+            if (relayType === 'replication') {
+                return;
+            }
             console.log(`Attempting to publish to relay: ${url}`);
             
             const publishPromise = new Promise((resolve, reject) => {

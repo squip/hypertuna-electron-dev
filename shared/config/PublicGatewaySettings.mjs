@@ -310,20 +310,6 @@ function withDefaults(raw = {}) {
     merged.preferredBaseUrl = merged.baseUrl || merged.preferredBaseUrl || DEFAULT_SETTINGS.preferredBaseUrl;
   }
 
-  if (merged.selectionMode !== 'discovered') {
-    merged.resolvedGatewayId = null;
-    merged.resolvedSecretVersion = null;
-    merged.resolvedSharedSecretHash = null;
-    merged.resolvedDisplayName = null;
-    merged.resolvedRegion = null;
-    merged.resolvedWsUrl = null;
-    merged.resolvedAt = null;
-    merged.resolvedGatewayRelay = null;
-    merged.resolvedDefaultTokenTtl = null;
-    merged.resolvedTokenRefreshWindowSeconds = null;
-    merged.resolvedDispatcher = null;
-  }
-
   if (!merged.baseUrl) merged.baseUrl = DEFAULT_SETTINGS.baseUrl;
   if (!merged.sharedSecret) merged.sharedSecret = '';
   if (!Number.isFinite(merged.defaultTokenTtl) || merged.defaultTokenTtl <= 0) {

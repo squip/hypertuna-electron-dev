@@ -527,9 +527,11 @@ export class GatewayService extends EventEmitter {
       if (current) {
         const next = { ...current };
         delete next.token;
+        delete next.replicationToken;
         delete next.expiresAt;
         delete next.ttlSeconds;
         delete next.connectionUrl;
+        delete next.replicationConnectionUrl;
         delete next.tokenIssuedAt;
         this.publicGatewayRelayState.set(relayKey, next);
       }
@@ -546,9 +548,11 @@ export class GatewayService extends EventEmitter {
       if (!state) continue;
       const next = { ...state };
       delete next.token;
+      delete next.replicationToken;
       delete next.expiresAt;
       delete next.ttlSeconds;
       delete next.connectionUrl;
+      delete next.replicationConnectionUrl;
       delete next.tokenIssuedAt;
       this.publicGatewayRelayState.set(relayKey, next);
     }
@@ -634,7 +638,15 @@ export class GatewayService extends EventEmitter {
 
   #recordRelayToken(relayKey, info, { schedule = true } = {}) {
     if (!relayKey || !info) return;
+    const metadata = this.activeRelays.get(relayKey)?.metadata || {};
+    const urls = this.#buildRelayUrls(relayKey, metadata, info.token);
     const storedInfo = { ...info };
+    if (!storedInfo.connectionUrl && urls.connectionUrl) {
+      storedInfo.connectionUrl = urls.connectionUrl;
+    }
+    if (!storedInfo.replicationConnectionUrl && urls.replicationConnectionUrl) {
+      storedInfo.replicationConnectionUrl = urls.replicationConnectionUrl;
+    }
     this.publicGatewayRelayTokens.set(relayKey, storedInfo);
     if (schedule) {
       const targetTime = storedInfo.refreshAfter || storedInfo.expiresAt;
@@ -651,6 +663,7 @@ export class GatewayService extends EventEmitter {
         expiresAt: info.expiresAt,
         ttlSeconds: info.ttlSeconds,
         connectionUrl: info.connectionUrl,
+        replicationConnectionUrl: info.replicationConnectionUrl || current.replicationConnectionUrl || null,
         tokenIssuedAt: issuedAt
       };
       this.publicGatewayRelayState.set(relayKey, next);
@@ -705,6 +718,7 @@ export class GatewayService extends EventEmitter {
         expiresAt: existing.expiresAt,
         ttlSeconds: existing.ttlSeconds,
         connectionUrl: existing.connectionUrl,
+        replicationConnectionUrl: existing.replicationConnectionUrl || state.replicationConnectionUrl || null,
         tokenIssuedAt: existing.issuedAt || null
       };
       this.publicGatewayRelayState.set(relayKey, next);
@@ -727,20 +741,14 @@ export class GatewayService extends EventEmitter {
         const sequence = refreshed?.sequence || existing?.sequence || null;
 
         const metadata = this.activeRelays.get(relayKey)?.metadata || {};
-        let gatewayPath = metadata.gatewayPath || null;
-        if (!gatewayPath) {
-          gatewayPath = this._normalizeGatewayPath(relayKey, metadata.gatewayPath, metadata.connectionUrl);
-        }
-        if (!gatewayPath) {
-          gatewayPath = relayKey.includes(':') ? relayKey.replace(':', '/') : relayKey;
-        }
-        const connectionUrl = `${this.publicGatewayWsBase}/${gatewayPath}?token=${encodeURIComponent(refreshed.token)}`;
+        const { connectionUrl, replicationConnectionUrl } = this.#buildRelayUrls(relayKey, metadata, refreshed.token);
 
         this.#recordRelayToken(relayKey, {
           token: refreshed.token,
           expiresAt,
           ttlSeconds,
           connectionUrl,
+          replicationConnectionUrl,
           baseUrl: this.publicGatewaySettings.baseUrl,
           issuedForPubkey: requestingPubkey,
           issuedAt: now,
@@ -1075,6 +1083,19 @@ export class GatewayService extends EventEmitter {
     const peers = Array.from(relayData.peers || []);
     const metadata = relayData.metadata || {};
     const metadataCopy = metadata ? { ...metadata } : {};
+    // Ensure replication metadata defaults for all relays and persist back
+    if (metadataCopy.requiresAuthForReplication === undefined) {
+      metadataCopy.requiresAuthForReplication = true;
+    }
+    if (!metadataCopy.replicationEndpoint) {
+      const normalizedPath = this._normalizeGatewayPath(relayKey, metadataCopy.gatewayPath, metadataCopy.connectionUrl);
+      const gatewayPath = normalizedPath
+        ? normalizedPath.replace(/^\/+/, '')
+        : (relayKey.includes(':') ? relayKey.replace(':', '/') : relayKey);
+      metadataCopy.replicationEndpoint = gatewayPath ? `/mirror/${gatewayPath}` : null;
+    }
+    // write back to active relay so downstream token/url builders see it
+    relayData.metadata = { ...metadata, ...metadataCopy };
 
     if (this.#isPublicGatewayRelayKey(relayKey)) {
       metadataCopy.identifier = metadataCopy.identifier || relayKey;
@@ -1216,6 +1237,7 @@ export class GatewayService extends EventEmitter {
       const localConnectionUrl = this.#isPublicGatewayRelayKey(relayKey)
         ? `${localBase.replace(/\/$/, '')}/${this.#getPublicGatewayRelayPath()}`
         : null;
+      const computedUrls = this.#buildRelayUrls(relayKey, metadataCopy, tokenInfo?.token);
       this.publicGatewayRelayState.set(relayKey, {
         relayKey,
         status: 'registered',
@@ -1226,9 +1248,11 @@ export class GatewayService extends EventEmitter {
         peers,
         blindPeer: registrationResult.blindPeer || this.blindPeerSummary || null,
         token: tokenInfo?.token || null,
+        replicationToken: tokenInfo?.token || null,
         expiresAt: tokenInfo?.expiresAt || null,
         ttlSeconds: tokenInfo?.ttlSeconds || null,
-        connectionUrl: tokenInfo?.connectionUrl || null,
+        connectionUrl: tokenInfo?.connectionUrl || computedUrls.connectionUrl || null,
+        replicationConnectionUrl: tokenInfo?.replicationConnectionUrl || computedUrls.replicationConnectionUrl || null,
         tokenIssuedAt: tokenInfo?.issuedAt || null,
         defaultTokenTtl: registrationResult.hyperbee?.defaultTokenTtl ?? null,
         tokenRefreshWindowSeconds: registrationResult.hyperbee?.tokenRefreshWindowSeconds ?? null,
@@ -1243,7 +1267,8 @@ export class GatewayService extends EventEmitter {
           remoteUrl: tokenInfo?.connectionUrl || null
         });
       }
-      if (!(this.#isPublicGatewayRelayKey(relayKey) && metadataCopy.requiresAuth === false)) {
+      const needsToken = metadataCopy.requiresAuth !== false || metadataCopy.requiresAuthForReplication === true;
+      if (!(this.#isPublicGatewayRelayKey(relayKey) && !needsToken)) {
         await this.#refreshRelayToken(relayKey, {
           force: forceTokenRefresh || !tokenInfo
         });
@@ -1895,25 +1920,17 @@ export class GatewayService extends EventEmitter {
     const refreshAfter = Number(tokenResponse.refreshAfter) || null;
     const sequence = tokenResponse.sequence || null;
     const metadata = relayData.metadata || {};
-    let gatewayPath = metadata.gatewayPath || null;
-    if (!gatewayPath) {
-      gatewayPath = this._normalizeGatewayPath(relayKey, metadata.gatewayPath, metadata.connectionUrl);
-    }
-    if (!gatewayPath) {
-      gatewayPath = relayKey.includes(':') ? relayKey.replace(':', '/') : relayKey;
-    }
+    const { connectionUrl, replicationConnectionUrl } = this.#buildRelayUrls(relayKey, metadata, token);
 
-    if (!this.publicGatewayWsBase) {
+    if (!connectionUrl) {
       throw new Error('Invalid public gateway base URL');
     }
-
-    const connectionUrl = `${this.publicGatewayWsBase}/${gatewayPath}?token=${encodeURIComponent(token)}`;
 
     const logDetails = {
       relayKey,
       expiresAt,
       ttlSeconds,
-      gatewayPath,
+      gatewayPath: this._normalizeGatewayPath(relayKey, metadata.gatewayPath, metadata.connectionUrl) || null,
       pubkey: `${requestingPubkey.slice(0, 16)}...`
     };
     this.log('info', `[PublicGateway] Issued public token ${JSON.stringify(logDetails)}`);
@@ -1923,6 +1940,7 @@ export class GatewayService extends EventEmitter {
       expiresAt,
       ttlSeconds,
       connectionUrl,
+      replicationConnectionUrl,
       baseUrl: this.publicGatewaySettings.baseUrl,
       issuedForPubkey: requestingPubkey,
       issuedAt,
@@ -2714,6 +2732,31 @@ export class GatewayService extends EventEmitter {
     }
 
     return normalized;
+  }
+
+  #buildRelayUrls(relayKey, metadata = {}, token = null) {
+    if (!this.publicGatewayWsBase) {
+      return { connectionUrl: null, replicationConnectionUrl: null };
+    }
+
+    const gatewayPath = this._normalizeGatewayPath(relayKey, metadata.gatewayPath, metadata.connectionUrl)
+      || (relayKey && relayKey.includes(':') ? relayKey.replace(':', '/') : relayKey);
+    const replicationPath = metadata.replicationEndpoint
+      ? metadata.replicationEndpoint.replace(/^\/+/, '')
+      : (gatewayPath ? `mirror/${gatewayPath}` : null);
+
+    const buildUrl = (path) => {
+      if (!path) return null;
+      const base = `${this.publicGatewayWsBase}/${path}`;
+      if (!token) return base;
+      if (base.includes('token=')) return base;
+      return `${base}?token=${encodeURIComponent(token)}`;
+    };
+
+    return {
+      connectionUrl: buildUrl(gatewayPath),
+      replicationConnectionUrl: buildUrl(replicationPath)
+    };
   }
 
   #getPublicGatewayRelayKey() {

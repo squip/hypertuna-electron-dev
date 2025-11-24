@@ -1030,6 +1030,9 @@ async function addAuthInfoToRelays(relays) {
     const profiles = await getAllRelayProfiles(global.userConfig?.userKey)
     return relays.map(r => {
       const profile = profiles.find(p => p.relay_key === r.relayKey) || {}
+      const relayState = publicGatewayStatusCache?.relays?.[r.relayKey]
+        || (profile.public_identifier ? publicGatewayStatusCache?.relays?.[profile.public_identifier] : null)
+        || null
 
       let token = null
       if (profile.auth_config?.requiresAuth && config.nostr_pubkey_hex) {
@@ -1067,6 +1070,8 @@ async function addAuthInfoToRelays(relays) {
       const statusEntry = relayRegistrationStatus.get(r.relayKey)
         || (profile.public_identifier ? relayRegistrationStatus.get(profile.public_identifier) : null)
         || null
+      const replicationConnectionUrl = relayState?.replicationConnectionUrl || null
+      const replicationAuthToken = relayState?.token || relayState?.replicationToken || null
 
       return {
         ...r,
@@ -1075,7 +1080,9 @@ async function addAuthInfoToRelays(relays) {
         userAuthToken: token,
         requiresAuth: profile.auth_config?.requiresAuth || false,
         registrationStatus: statusEntry?.status || 'unknown',
-        registrationError: statusEntry?.error || null
+        registrationError: statusEntry?.error || null,
+        replicationConnectionUrl,
+        replicationAuthToken
       }
     })
   } catch (err) {

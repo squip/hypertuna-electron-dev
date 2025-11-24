@@ -60,26 +60,31 @@ export default class RelayWebsocketController {
     }
 
     const type = frame[0];
+    const replicationOnly = session?.replicationOnly === true;
+
     switch (type) {
       case 'EVENT':
-        await this.#handleEventFrame(session, frame);
+        await this.#handleEventFrame(session, frame, { replicationOnly });
         return true;
       case 'REQ':
-        await this.#handleReqFrame(session, frame, rawMessage);
+        await this.#handleReqFrame(session, frame, rawMessage, { replicationOnly });
         return true;
       case 'CLOSE':
         this.#removeSubscription(session.connectionKey, frame[1]);
-        await this.#forwardLegacy(session, rawMessage);
+        if (!replicationOnly) {
+          await this.#forwardLegacy(session, rawMessage);
+        }
         return true;
       case 'PING':
       case 'PONG':
       case 'AUTH':
-        // Pass through without modification for now
-        await this.#forwardLegacy(session, rawMessage);
+        if (!replicationOnly) {
+          await this.#forwardLegacy(session, rawMessage);
+        }
         return true;
       default:
-        // Unknown frame types fall back to legacy handling
-        return false;
+        // Unknown frame types fall back to legacy handling unless replication-only
+        return replicationOnly ? true : false;
     }
   }
 
@@ -93,7 +98,7 @@ export default class RelayWebsocketController {
     this.subscriptions.delete(sessionKey);
   }
 
-  async #handleEventFrame(session, frame) {
+  async #handleEventFrame(session, frame, { replicationOnly = false } = {}) {
     if (frame.length < 2 || typeof frame[1] !== 'object' || frame[1] === null) {
       this.#incrementError('event-format');
       this.#sendNotice(session, 'Invalid EVENT payload');
@@ -101,19 +106,59 @@ export default class RelayWebsocketController {
     }
 
     const event = frame[1];
-    if (event?.relayID && !session?.clientToken) {
-      this.#incrementError('auth-required');
-      this.#sendOk(session, event?.id || null, false, 'auth-required');
-      return;
+    if (replicationOnly) {
+      if (!session?.clientToken) {
+        this.#incrementEvent('replication-missing-token');
+        this.#incrementError('auth-required');
+        this.#sendOk(session, event?.id || null, false, 'auth-required');
+        this.logger.debug?.('[RelayWebsocketController] Replication EVENT rejected (missing token)', {
+          relayKey: session.relayKey,
+          connectionKey: session.connectionKey,
+          eventId: event?.id || null
+        });
+        return;
+      }
+      // Only accept replication events on this channel
+      if (!event?.relayID) {
+        this.#incrementEvent('replication-invalid');
+        this.#incrementError('replication-required');
+        this.#sendOk(session, event?.id || null, false, 'replication-required');
+        this.logger.debug?.('[RelayWebsocketController] Replication channel received non-replication EVENT', {
+          relayKey: session.relayKey,
+          connectionKey: session.connectionKey,
+          eventId: event?.id || null
+        });
+        return;
+      }
+    } else if (event?.relayID && !session?.clientToken) {
+      // For /relay path with requiresAuth:false, allow replication events without token but record reason
+      this.#incrementEvent('replication-unauth');
+      this.logger.debug?.('[RelayWebsocketController] Replication EVENT on open relay without token', {
+        relayKey: session.relayKey,
+        connectionKey: session.connectionKey,
+        eventId: event?.id || null
+      });
+      this.#sendNotice(session, 'replication token missing; event accepted on open relay');
     }
 
     try {
       const result = await this.relayHost.applyEvent(event);
       const success = result?.status === 'accepted';
-      this.#incrementEvent(success ? 'accepted' : 'rejected');
+      const label = replicationOnly
+        ? (success ? 'replication-accepted' : 'replication-rejected')
+        : (success ? 'accepted' : 'rejected');
+      this.#incrementEvent(label);
       this.#sendOk(session, event.id || null, success, success ? 'stored' : result?.reason || 'rejected');
+      this.logger.debug?.('[RelayWebsocketController] EVENT processed', {
+        relayKey: session.relayKey,
+        connectionKey: session.connectionKey,
+        replicationOnly,
+        eventId: event?.id || null,
+        result: label,
+        reason: result?.reason || null
+      });
     } catch (error) {
-      this.#incrementEvent('error');
+      this.#incrementEvent(replicationOnly ? 'replication-error' : 'error');
       this.logger.error?.('[RelayWebsocketController] Failed to persist event', {
         error: error?.message || error,
         eventId: event?.id || null
@@ -122,7 +167,7 @@ export default class RelayWebsocketController {
     }
   }
 
-  async #handleReqFrame(session, frame, rawMessage) {
+  async #handleReqFrame(session, frame, rawMessage, { replicationOnly = false } = {}) {
     if (frame.length < 2) {
       this.#incrementError('req-format');
       this.#sendNotice(session, 'REQ frame missing subscription id');
@@ -133,10 +178,38 @@ export default class RelayWebsocketController {
     const filters = frame.slice(2);
 
     const requestingReplication = Array.isArray(filters) && filters.some((f) => f && (f.relayID || f['#relay']));
-    if (requestingReplication && !session?.clientToken) {
-      this.#incrementError('auth-required');
-      this.#sendNotice(session, 'auth token required for replication');
-      return;
+    if (replicationOnly) {
+      if (!session?.clientToken) {
+        this.#incrementReq('replication-missing-token');
+        this.#incrementError('auth-required');
+        this.#sendNotice(session, 'auth token required for replication');
+        this.logger.debug?.('[RelayWebsocketController] Replication REQ rejected (missing token)', {
+          relayKey: session.relayKey,
+          connectionKey: session.connectionKey,
+          subscriptionId
+        });
+        return;
+      }
+      if (!requestingReplication) {
+        this.#incrementReq('replication-invalid');
+        this.#incrementError('replication-required');
+        this.#sendNotice(session, 'replication filters required on replication channel');
+        this.logger.debug?.('[RelayWebsocketController] Replication channel received non-replication REQ', {
+          relayKey: session.relayKey,
+          connectionKey: session.connectionKey,
+          subscriptionId
+        });
+        return;
+      }
+    } else if (requestingReplication && !session?.clientToken) {
+      // For /relay path with requiresAuth:false, allow but track unauth replication REQ
+      this.#incrementReq('replication-unauth');
+      this.logger.debug?.('[RelayWebsocketController] Replication REQ on open relay without token', {
+        relayKey: session.relayKey,
+        connectionKey: session.connectionKey,
+        subscriptionId
+      });
+      this.#sendNotice(session, 'replication token missing; REQ accepted on open relay');
     }
 
     this.#recordSubscription(session.connectionKey, subscriptionId, filters);

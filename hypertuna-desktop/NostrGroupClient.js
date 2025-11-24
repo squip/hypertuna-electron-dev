@@ -12,6 +12,7 @@ import { prepareFileAttachment } from './FileAttachmentHelper.js';
 import ReplicationSecretManager from './ReplicationSecretManager.js';
 import { getCachedPublicGatewaySettings } from '../shared/config/PublicGatewaySettings.mjs';
 import EncryptedReplicationStore from './EncryptedReplicationStore.js';
+import { HypertunaUtils } from './HypertunaUtils.js';
 
 const GROUP_METADATA_CACHE_KEY = 'hypertuna_group_metadata_cache_v1';
 
@@ -68,8 +69,11 @@ class NostrGroupClient {
         this.userRelayListEvent = null; // latest kind 10009 event
         this.userRelayIds = new Set(); // Set of hypertuna relay ids user belongs to
         this.relayListLoaded = false; // flag indicating relay list has been parsed
+        this.replicationRelayUrls = new Map(); // Map of groupId -> replication relay URL
+        this.replicationTokenSequences = new Map(); // Map of relayId -> last seen token sequence
         this.debugMode = debugMode;
         this.groupRelayUrls = new Map(); // Map of groupId -> relay URL
+        this.aliasToCanonicalMap = new Map(); // Map of alias identifier -> canonical relay key
         this.isInitialized = false;
         this.pendingRelayConnections = new Map(); // Track pending connections
         this.relayConnectionAttempts = new Map(); // Track retry attempts
@@ -131,6 +135,18 @@ class NostrGroupClient {
         this._loadMetadataCache();
     }
 
+    _extractTokenSequence(urlOrToken) {
+        try {
+            const token = urlOrToken.includes('.') ? urlOrToken : new URL(urlOrToken).searchParams.get('token');
+            if (!token || token.split('.').length !== 3) return null;
+            const payload = token.split('.')[1];
+            const decoded = JSON.parse(atob(payload));
+            return typeof decoded.sequence === 'number' ? decoded.sequence : null;
+        } catch (_) {
+            return null;
+        }
+    }
+
     _getBaseRelayUrl(url) {
         try {
             const u = new URL(url);
@@ -138,6 +154,48 @@ class NostrGroupClient {
             return u.toString().replace(/\?$/, '');
         } catch {
             return url.split('?')[0];
+        }
+    }
+
+    /**
+     * Prefer public identifier paths for replication mirror URLs when available.
+     * @param {Object} relay - relay record containing publicIdentifier/relayKey/pathAliases
+     * @param {string|null} replicationUrl - mirror URL as provided by the worker
+     * @returns {string|null}
+     */
+    _normalizeReplicationUrl(relay, replicationUrl) {
+        if (!replicationUrl || typeof replicationUrl !== 'string') {
+            return replicationUrl;
+        }
+        const publicIdentifier = relay?.publicIdentifier;
+        const relayKey = relay?.relayKey || relay?.identifier || null;
+        if (!publicIdentifier || !relayKey) {
+            return replicationUrl;
+        }
+
+        try {
+            const parsed = new URL(replicationUrl);
+            const token = parsed.searchParams.get('token');
+            const base = `${parsed.protocol}//${parsed.host}`;
+            const path = parsed.pathname || '';
+            const publicPath = publicIdentifier.replace(':', '/');
+            // Avoid rewriting when a token is present because tokens are bound to the relayKey
+            if (token) {
+                return replicationUrl;
+            }
+            // If the path currently uses the relayKey, rewrite to public identifier path
+            if (path.includes(`/mirror/${relayKey}`) && publicPath) {
+                const nextPath = `/mirror/${publicPath}`;
+                parsed.pathname = nextPath;
+                // ensure token remains
+                if (token) {
+                    parsed.searchParams.set('token', token);
+                }
+                return parsed.toString();
+            }
+            return replicationUrl;
+        } catch (_) {
+            return replicationUrl;
         }
     }
 
@@ -575,6 +633,38 @@ class NostrGroupClient {
     }
 
     /**
+     * Queue a replication-only relay connection (mirror socket)
+     * @param {string} internalId - internal identifier for tracking (e.g., `${relayId}::replication`)
+     * @param {string} relayUrl - replication mirror URL (wss://.../mirror/...)
+     * @param {string} relayId - logical relay identifier
+     */
+    queueReplicationConnection(internalId, relayUrl, relayId) {
+        if (this.shutdownRequested || this.cancelled) return;
+        if (!relayUrl || !internalId) return;
+        if (this.pendingRelayConnections.has(internalId)) return;
+
+        this.pendingRelayConnections.set(internalId, {
+            identifier: internalId,
+            relayUrl,
+            originalUrl: relayUrl,
+            attempts: 0,
+            status: 'pending',
+            isInitialized: true,
+            isRegistered: true,
+            requiresAuth: true,
+            isReplication: true
+        });
+        console.log(`[NostrGroupClient] Queued replication connection for ${relayId} using ${relayUrl}`);
+
+        // Attempt immediate connect; errors are logged and retried via relay manager logic
+        this.relayManager.addTypedRelay(relayUrl, 'replication', relayId).then(() => {
+            console.log(`[NostrGroupClient] Replication relay connected for ${relayId}`);
+        }).catch((err) => {
+            console.warn(`[NostrGroupClient] Replication relay connect failed for ${relayId}`, err?.message || err);
+        });
+    }
+
+    /**
      * Handle relay initialized signal from the app layer.
      * This means the worker has started the relay instance.
      */
@@ -648,6 +738,42 @@ class NostrGroupClient {
         }
 
         const state = this.relayReadyStates.get(identifier) || {};
+
+        // Special-case replication mirror sockets: keep them on the replication channel only
+        const isReplication = connection.isReplication === true || identifier.endsWith('::replication');
+        if (isReplication) {
+            const baseIdentifier = identifier.endsWith('::replication')
+                ? identifier.slice(0, -'::replication'.length)
+                : identifier;
+            const resolvedUrl = this.replicationRelayUrls.get(baseIdentifier) || connection.relayUrl || connection.originalUrl || state.relayUrl || null;
+            if (!resolvedUrl) {
+                console.log(`[NostrGroupClient] Replication relay URL unavailable for ${baseIdentifier}, retrying soon`);
+                this._scheduleRelayRetry(identifier, 'replication-url-unavailable', 2000);
+                return;
+            }
+            if (!resolvedUrl.includes('token=')) {
+                console.log(`[NostrGroupClient] Replication relay ${baseIdentifier} missing token, retrying`);
+                this._scheduleRelayRetry(identifier, 'replication-missing-token', 2000);
+                return;
+            }
+
+            try {
+                connection.status = 'connecting';
+                console.log(`[NostrGroupClient] Attempting replication connection for ${baseIdentifier} using ${resolvedUrl}`);
+                await this.relayManager.addTypedRelay(resolvedUrl, 'replication', baseIdentifier);
+                connection.status = 'connected';
+                connection.attempts = 0;
+                this.pendingRelayConnections.delete(identifier);
+                this._clearRetryTimer(identifier);
+                console.log(`[NostrGroupClient] Replication relay connected for ${baseIdentifier}`);
+            } catch (err) {
+                console.error(`[NostrGroupClient] Replication connection attempt failed for ${baseIdentifier}:`, err);
+                connection.status = 'pending';
+                connection.attempts = (connection.attempts || 0) + 1;
+                this._scheduleRelayRetry(identifier, 'replication-connection-error');
+            }
+            return;
+        }
 
         if (!connection.isInitialized && state.isInitialized) {
             connection.isInitialized = true;
@@ -912,6 +1038,9 @@ class NostrGroupClient {
             return;
         }
         for (const [identifier, connection] of this.pendingRelayConnections.entries()) {
+            const baseIdentifier = identifier.endsWith('::replication')
+                ? identifier.slice(0, -'::replication'.length)
+                : identifier;
             if (this.relayReadyStates.has(identifier)) {
                 const state = this.relayReadyStates.get(identifier);
                 if (state.isInitialized) {
@@ -927,6 +1056,11 @@ class NostrGroupClient {
                 if (state.requiresAuth != null) {
                     connection.requiresAuth = !!state.requiresAuth;
                 }
+            }
+
+            // Use the replication URL map for replication identifiers
+            if (identifier.endsWith('::replication') && this.replicationRelayUrls.has(baseIdentifier)) {
+                connection.relayUrl = this.replicationRelayUrls.get(baseIdentifier);
             }
 
             this._attemptConnectionIfReady(identifier);
@@ -1547,6 +1681,17 @@ async fetchMultipleProfiles(pubkeys) {
             if (!relay) continue;
             const identifier = relay.publicIdentifier || relay.relayKey;
             if (!identifier) continue;
+            const canonicalKey = relay.relayKey || relay.identifier || identifier;
+            const aliasList = Array.isArray(relay.metadata?.pathAliases)
+                ? relay.metadata.pathAliases
+                : (Array.isArray(relay.pathAliases) ? relay.pathAliases : []);
+            if (canonicalKey) {
+                aliasList.forEach((alias) => {
+                    if (alias && typeof alias === 'string') {
+                        this.aliasToCanonicalMap.set(alias, canonicalKey);
+                    }
+                });
+            }
 
             const isGatewayReplica = relay.isGatewayReplica === true
                 || (relay.metadata && relay.metadata.isGatewayReplica === true)
@@ -1560,14 +1705,37 @@ async fetchMultipleProfiles(pubkeys) {
             const baseUrl = connectionUrl ? this._getBaseRelayUrl(connectionUrl) : null;
             const relayName = relay.name || '';
             const authToken = relay.userAuthToken || relay.authToken || null;
+            const replicationUrl = this._normalizeReplicationUrl(relay, relay.replicationConnectionUrl || null);
+            const replicationAuthToken = relay.replicationAuthToken || null;
+            const targetReplicationKey = this.aliasToCanonicalMap.get(identifier) || identifier;
+            const incomingSeq = replicationUrl ? this._extractTokenSequence(replicationUrl) : null;
 
             this.userRelayIds.add(identifier);
             if (connectionUrl) {
                 this.groupRelayUrls.set(identifier, connectionUrl);
             }
+            if (replicationUrl) {
+                const existing = this.replicationRelayUrls.get(targetReplicationKey);
+                const existingSeq = this.replicationTokenSequences.get(targetReplicationKey) || null;
+                const isNewer = incomingSeq == null || existingSeq == null || incomingSeq >= existingSeq;
+                if ((!existing || !existing.includes('token=')) && isNewer) {
+                    this.replicationRelayUrls.set(targetReplicationKey, replicationUrl);
+                    if (incomingSeq != null) {
+                        this.replicationTokenSequences.set(targetReplicationKey, incomingSeq);
+                    }
+                } else {
+                    console.log(`[NostrGroupClient] Skipping duplicate or older replication URL for alias ${identifier}, canonical ${targetReplicationKey}`);
+                }
+            }
 
             if (authToken) {
                 this.relayAuthTokens.set(identifier, authToken);
+            }
+            if (replicationAuthToken && !this.relayAuthTokens.has(identifier)) {
+                if (!this.relayAuthTokens.has(targetReplicationKey)) {
+                    // Fallback: track replication token separately if no primary token stored yet
+                    this.relayAuthTokens.set(targetReplicationKey, replicationAuthToken);
+                }
             }
 
             const readiness = this.relayReadyStates.get(identifier) || {};
@@ -1585,6 +1753,34 @@ async fetchMultipleProfiles(pubkeys) {
                     this.queueRelayConnection(identifier, connectionUrl);
                 } else if (baseUrl) {
                     this.queueRelayConnection(identifier, baseUrl);
+                }
+            }
+
+            // Ensure replication mirror socket is connected for replication traffic
+            if (replicationUrl) {
+                const canonicalId = this.aliasToCanonicalMap.get(identifier) || identifier;
+                const replId = `${canonicalId}::replication`;
+                const pendingRepl = this.pendingRelayConnections.get(replId);
+                if (pendingRepl) {
+                    // Update existing replication connection with freshest URL/token
+                    if (replicationUrl && replicationUrl !== pendingRepl.relayUrl) {
+                        const incomingSeq = this._extractTokenSequence(replicationUrl);
+                        const existingSeq = this._extractTokenSequence(pendingRepl.relayUrl) || this.replicationTokenSequences.get(canonicalId) || null;
+                        if (incomingSeq != null && existingSeq != null && incomingSeq < existingSeq) {
+                            console.log(`[NostrGroupClient] Ignoring older replication URL for ${canonicalId} (seq ${incomingSeq} < ${existingSeq})`);
+                        } else {
+                        pendingRepl.relayUrl = replicationUrl;
+                        pendingRepl.originalUrl = replicationUrl;
+                        console.log(`[NostrGroupClient] Updated replication URL for ${canonicalId} to ${replicationUrl}`);
+                        this._clearRetryTimer(replId);
+                        this._attemptConnectionIfReady(replId);
+                            if (incomingSeq != null) {
+                                this.replicationTokenSequences.set(canonicalId, incomingSeq);
+                            }
+                        }
+                    }
+                } else {
+                    this.queueReplicationConnection(replId, replicationUrl, canonicalId);
                 }
             } else {
                 const connection = this.pendingRelayConnections.get(identifier);
@@ -3269,10 +3465,43 @@ async fetchMultipleProfiles(pubkeys) {
     _getGatewayRelayUrl(relayId) {
         try {
             const settings = getCachedPublicGatewaySettings();
-            const base = settings?.baseUrl || settings?.preferredBaseUrl || 'https://hypertuna.com';
-            const token = this.relayAuthTokens.get(relayId) || null;
-            const url = base.replace(/\/$/, '') + '/relay';
-            if (token) {
+            const state = HypertunaUtils.getPublicGatewayState?.() || null;
+            const relays = state?.relays || {};
+            const relayState = relays[relayId]
+                || relays[this.publicToInternalMap?.get?.(relayId)]
+                || relays['public-gateway:hyperbee']
+                || null;
+            const metadata = relayState?.metadata || {};
+
+            // Prefer gateway-provided replication URL/token if available
+            const stateUrl = relayState?.replicationConnectionUrl || null;
+            const stateToken = relayState?.replicationToken || relayState?.token || null;
+
+            const base = state?.wsBase
+                || settings?.baseUrl
+                || settings?.preferredBaseUrl
+                || 'https://hypertuna.com';
+
+            let replicationPath = metadata?.replicationEndpoint || null;
+            if (replicationPath && typeof replicationPath === 'string') {
+                replicationPath = replicationPath.trim();
+                if (replicationPath && !replicationPath.startsWith('/')) {
+                    replicationPath = `/${replicationPath}`;
+                }
+            }
+            if (!replicationPath) {
+                const gatewayPath = typeof metadata?.gatewayPath === 'string'
+                    ? metadata.gatewayPath.trim().replace(/^\/+/, '').replace(/\/+$/, '')
+                    : (relayId?.includes(':') ? relayId.replace(':', '/') : 'relay');
+                replicationPath = `/mirror/${gatewayPath || 'relay'}`;
+            }
+
+            const resolvedBase = base.replace(/\/$/, '');
+            const computedUrl = `${resolvedBase}${replicationPath}`;
+            const token = stateToken || this.relayAuthTokens.get(relayId) || null;
+            const url = stateUrl || computedUrl;
+
+            if (token && url && !url.includes('token=')) {
                 return this._appendTokenToUrl(url, token);
             }
             return url;

@@ -37,7 +37,8 @@ const state = {
     relayKey: '',
     relayAuthToken: '',
     lastIssued: null,
-    error: null
+    error: null,
+    replicationUrl: ''
   },
   connection: {
     discoveryUrl: '',
@@ -248,6 +249,7 @@ function render(app) {
           <div class="stack">
             <div id="token-status" class="status muted">No token issued yet.</div>
             <div class="pill">Signed relay URL: <span id="relay-url-display">${escapeHtml(tokenManager.getRelayUrl(state.tokens.relayKey) || '—')}</span></div>
+            <div class="pill">Replication URL: <span id="replication-url-display">${escapeHtml(getReplicationUrlDisplay() || '—')}</span></div>
           </div>
         </div>
       </section>
@@ -263,13 +265,13 @@ function render(app) {
             ${renderGroupDetail()}
           </div>
         </div>
-        <div class="stack">
-          <div class="pill">Replication mirrors: ${state.telemetry.replicationMirrors}</div>
-          <div class="pill">Replication mirror errors: ${state.telemetry.replicationMirrorErrors}</div>
-          <div class="pill">Secret snapshots: ${state.telemetry.secretSnapshots}</div>
-          <div class="pill">Secret snapshot errors: ${state.telemetry.secretSnapshotErrors}</div>
-          <div class="pill">Client ID: ${state.telemetry.clientId || '—'}</div>
-        </div>
+            <div class="stack">
+            <div class="pill">Replication mirrors: ${state.telemetry.replicationMirrors}</div>
+            <div class="pill">Replication mirror errors: ${state.telemetry.replicationMirrorErrors}</div>
+            <div class="pill">Secret snapshots: ${state.telemetry.secretSnapshots}</div>
+            <div class="pill">Secret snapshot errors: ${state.telemetry.secretSnapshotErrors}</div>
+            <div class="pill">Client ID: ${state.telemetry.clientId || '—'}</div>
+          </div>
       </section>
     </main>
   `;
@@ -346,6 +348,23 @@ async function hydrateSettings() {
 function computeDiscoveryRelayUrl() {
   return tokenManager.getRelayUrl(state.tokens.relayKey || null)
     || `${(state.settings.baseUrl || 'https://hypertuna.com').replace(/\/+$/, '')}/relay`;
+}
+
+function getReplicationUrlDisplay() {
+  try {
+    const base = (state.settings.baseUrl || state.settings.preferredBaseUrl || 'https://hypertuna.com').replace(/\/+$/, '');
+    const relayKey = state.tokens.relayKey || '';
+    if (!relayKey) return null;
+    const normalized = relayKey.includes(':')
+      ? relayKey.replace(':', '/')
+      : relayKey;
+    const token = state.tokens.relayAuthToken || '';
+    return token
+      ? `${base}/mirror/${normalized}?token=${encodeURIComponent(token)}`
+      : `${base}/mirror/${normalized}`;
+  } catch (err) {
+    return null;
+  }
 }
 
 async function onSaveSettings() {
@@ -448,6 +467,7 @@ async function onIssueToken() {
       pubkey: state.user.pubkey || null
     });
     state.tokens.lastIssued = result;
+    state.tokens.replicationUrl = getReplicationUrlDisplay() || '';
     if (statusEl) {
       statusEl.textContent = `Token issued. Expires ${formatTs(result.expiresAt)} (seq ${result.sequence || '?'})`;
       statusEl.className = 'status success';
@@ -482,6 +502,7 @@ async function onRefreshToken() {
   try {
     const result = await tokenManager.refreshToken(relayKey);
     state.tokens.lastIssued = result;
+    state.tokens.replicationUrl = getReplicationUrlDisplay() || '';
     if (statusEl) {
       statusEl.textContent = `Token refreshed. Expires ${formatTs(result.expiresAt)} (seq ${result.sequence || '?'})`;
       statusEl.className = 'status success';
@@ -500,9 +521,14 @@ async function onRefreshToken() {
 }
 
 function updateRelayUrlText() {
-  const target = document.querySelector('#relay-url-display');
-  if (!target) return;
-  target.textContent = tokenManager.getRelayUrl(state.tokens.relayKey) || '—';
+  const relayTarget = document.querySelector('#relay-url-display');
+  if (relayTarget) {
+    relayTarget.textContent = tokenManager.getRelayUrl(state.tokens.relayKey) || '—';
+  }
+  const replTarget = document.querySelector('#replication-url-display');
+  if (replTarget) {
+    replTarget.textContent = getReplicationUrlDisplay() || '—';
+  }
 }
 
 async function onSaveProfile() {

@@ -96,7 +96,8 @@ class PublicGatewayService {
       dispatcherEnabled: config?.features?.dispatcherEnabled === undefined
         ? true
         : !!config?.features?.dispatcherEnabled,
-      tokenEnforcementEnabled: !!config?.features?.tokenEnforcementEnabled
+      tokenEnforcementEnabled: !!config?.features?.tokenEnforcementEnabled,
+      replicationEndpointEnabled: config?.features?.replicationEndpointEnabled === false ? false : true
     };
     this.internalRelayKey = 'public-gateway:hyperbee';
     this.relayConfig = this.#normalizeRelayConfig(config?.relay);
@@ -767,6 +768,11 @@ class PublicGatewayService {
     const canonicalGatewayPath = this.#normalizePathValue(this.relayCanonicalPath)
       || this.#toGatewayPath(this.internalRelayKey)
       || this.internalRelayKey.replace(':', '/');
+    const replicationEndpoint = this.featureFlags.replicationEndpointEnabled
+      ? (canonicalGatewayPath
+        ? `/mirror/${canonicalGatewayPath}`
+        : '/mirror')
+      : null;
     const aliasSet = new Set(
       (this.relayPathAliases || [])
         .map((value) => this.#normalizePathValue(value))
@@ -786,6 +792,8 @@ class PublicGatewayService {
         name: 'Public Gateway Hyperbee',
         description: 'Authoritative public gateway relay dataset',
         requiresAuth: false,
+        requiresAuthForReplication: this.featureFlags.replicationEndpointEnabled,
+      replicationEndpoint,
         isPublic: true,
         isGatewayReplica: true,
         gatewayPath: canonicalGatewayPath,
@@ -899,7 +907,39 @@ class PublicGatewayService {
       return;
     }
 
-    const { relayKey, token } = this.#parseWebSocketRequest(req);
+    const { relayKey: rawRelayKey, token, isReplication } = this.#parseWebSocketRequest(req);
+    let preTokenPayload = null;
+    let relayKey = rawRelayKey;
+
+    // Attempt to derive canonical relay key from token payload before registration lookup
+    if (token) {
+      try {
+        const payload = verifyClientToken(token, this.sharedSecret);
+        preTokenPayload = payload || null;
+        const tokenRelayKey = payload?.relayKey || null;
+        if (tokenRelayKey) {
+          const candidate = this.#toColonIdentifier(tokenRelayKey) || tokenRelayKey;
+          if (candidate && candidate !== relayKey) {
+            this.logger.info?.('Resolved relay key from token payload', {
+              pathRelayKey: relayKey,
+              tokenRelayKey: candidate
+            });
+            relayKey = candidate;
+          }
+        }
+      } catch (err) {
+        this.logger.debug?.('Token pre-parse failed; will continue to registration lookup', {
+          error: err?.message || err
+        });
+      }
+    }
+
+    if (isReplication && !this.featureFlags.replicationEndpointEnabled) {
+      this.logger.warn?.('WebSocket rejected: replication endpoint disabled', { relayKey });
+      ws.close(4404, 'Replication endpoint disabled');
+      ws.terminate();
+      return;
+    }
 
     if (!relayKey) {
       this.logger.warn?.('WebSocket rejected: invalid relay key', {
@@ -910,7 +950,31 @@ class PublicGatewayService {
       return;
     }
 
-    const registration = await this.registrationStore.getRelay(relayKey);
+    // Try canonical resolution via path/gateway forms and token-derived key
+    const lookupCandidates = new Set();
+    lookupCandidates.add(relayKey);
+    lookupCandidates.add(this.#toGatewayPath(relayKey));
+    if (preTokenPayload?.relayKey) {
+      lookupCandidates.add(this.#toColonIdentifier(preTokenPayload.relayKey) || preTokenPayload.relayKey);
+      lookupCandidates.add(this.#toGatewayPath(preTokenPayload.relayKey));
+    }
+
+    let registration = null;
+    let resolvedRelayKey = relayKey;
+    for (const candidate of Array.from(lookupCandidates).filter(Boolean)) {
+      registration = await this.registrationStore.getRelay(candidate);
+      if (registration) {
+        resolvedRelayKey = candidate;
+        if (candidate !== rawRelayKey) {
+          this.logger.info?.('Resolved relay key via alias/canonical lookup', {
+            pathRelayKey: rawRelayKey,
+            resolvedRelayKey: candidate
+          });
+        }
+        break;
+      }
+    }
+
     if (!registration) {
       this.logger.warn?.('WebSocket rejected: relay not registered', { relayKey });
       ws.close(4404, 'Relay not registered');
@@ -918,12 +982,32 @@ class PublicGatewayService {
       return;
     }
 
-    const requiresAuth = registration?.metadata?.requiresAuth !== false;
+    // Backfill gatewayPath if missing to support token refresh/alias lookups
+    if (!registration.metadata?.gatewayPath && registration.relayKey) {
+      const patchedGatewayPath = this.#toGatewayPath(registration.relayKey);
+      if (patchedGatewayPath) {
+        const patched = {
+          ...registration,
+          metadata: {
+            ...registration.metadata,
+            gatewayPath: patchedGatewayPath
+          }
+        };
+        await this.registrationStore.upsertRelay(registration.relayKey, patched);
+        registration = patched;
+        this.logger.info?.('Patched missing gatewayPath for registration', {
+          relayKey: registration.relayKey,
+          gatewayPath: patchedGatewayPath
+        });
+      }
+    }
+
+    const requiresAuth = isReplication ? true : registration?.metadata?.requiresAuth !== false;
 
     let tokenValidation = null;
     if (requiresAuth) {
       if (!token) {
-        this.logger.warn?.('WebSocket rejected: token missing', { relayKey });
+        this.logger.warn?.('WebSocket rejected: token missing', { relayKey, isReplication });
         ws.close(4403, 'Token required');
         ws.terminate();
         return;
@@ -1014,7 +1098,8 @@ class PublicGatewayService {
       subscriptionPeers: new Map(),
       assignPeer: null,
       pendingDelegatedMessages: [],
-      delegationReady: delegateReqToPeers === true
+      delegationReady: delegateReqToPeers === true,
+      replicationOnly: isReplication === true
     };
     session.assignPeer = (assignedPeer, subscriptionId) => {
       if (session.localOnly) return;
@@ -1060,6 +1145,12 @@ class PublicGatewayService {
       if (useRelayController) {
         const handled = await this.relayWebsocketController.handleMessage(session, msg);
         if (handled) return;
+        if (session.replicationOnly) {
+          this.logger?.warn?.('[PublicGateway] Replication channel received unsupported frame', {
+            relayKey: session.relayKey
+          });
+          return;
+        }
       }
 
       await this.#forwardLegacyMessage(session, msg);
@@ -2873,6 +2964,18 @@ class PublicGatewayService {
       metadata.delegateReqToPeers = relayPayload.delegateReqToPeers;
     }
 
+    if (typeof relayPayload?.requiresAuthForReplication === 'boolean') {
+      metadata.requiresAuthForReplication = relayPayload.requiresAuthForReplication;
+    }
+
+    const replicationEndpoint = maybeString(relayPayload?.replicationEndpoint);
+    if (replicationEndpoint) {
+      const normalizedReplicationPath = this.#normalizePathValue(replicationEndpoint);
+      metadata.replicationEndpoint = normalizedReplicationPath
+        ? `/${normalizedReplicationPath}`
+        : null;
+    }
+
     const trustedInfo = this.blindPeerService?.getTrustedPeerInfo?.(peerKey) || null;
 
     metadata.blindPeerTrusted = !!trustedInfo;
@@ -3085,13 +3188,25 @@ class PublicGatewayService {
   #parseWebSocketRequest(req) {
     const base = this.config.publicBaseUrl || 'https://hypertuna.com';
     const parsed = new URL(req.url, base);
-    let relayKey = this.#resolveRelayKeyFromPath(parsed.pathname);
-    if (!relayKey) {
-      const parts = parsed.pathname.split('/').filter(Boolean);
-      relayKey = parts.length >= 2 ? `${parts[0]}:${parts[1]}` : parts[0] || null;
+    const normalizedPath = this.#normalizePathValue(parsed.pathname);
+
+    let isReplication = false;
+    let relayKey = null;
+
+    if (this.featureFlags.replicationEndpointEnabled && normalizedPath?.startsWith('mirror/')) {
+      isReplication = true;
+      const mirrorPath = normalizedPath.slice('mirror/'.length);
+      relayKey = this.#toColonIdentifier(mirrorPath);
+    } else {
+      relayKey = this.#resolveRelayKeyFromPath(parsed.pathname);
+      if (!relayKey) {
+        const parts = parsed.pathname.split('/').filter(Boolean);
+        relayKey = parts.length >= 2 ? `${parts[0]}:${parts[1]}` : parts[0] || null;
+      }
     }
+
     const token = parsed.searchParams.get('token');
-    return { relayKey, token };
+    return { relayKey, token, isReplication };
   }
 
   async #validateToken(token, relayKey) {
@@ -3099,10 +3214,29 @@ class PublicGatewayService {
       try {
         return await this.tokenService.verifyToken(token, relayKey);
       } catch (error) {
-        this.logger.warn?.('Token verification failed', {
-          relayKey,
-          error: error?.message || error
-        });
+        if (error?.message === 'relay-mismatch') {
+          // Attempt alias reconciliation for mirror/alias paths
+          const payload = verifyClientToken(token, this.sharedSecret);
+          const tokenRelayKey = payload?.relayKey || null;
+          const aliasMatch = await this.#isAliasMatch(relayKey, tokenRelayKey);
+          if (payload && aliasMatch) {
+            this.logger.info?.('Token relay mismatch reconciled via alias', {
+              relayKey,
+              tokenRelayKey
+            });
+            return {
+              payload,
+              relayAuthToken: payload.relayAuthToken || null,
+              pubkey: payload.pubkey || null,
+              scope: payload.scope || null
+            };
+          }
+        } else {
+          this.logger.warn?.('Token verification failed', {
+            relayKey,
+            error: error?.message || error
+          });
+        }
         return null;
       }
     }
@@ -3140,6 +3274,54 @@ class PublicGatewayService {
       pubkey: payload.pubkey || null,
       scope: payload.scope || null
     };
+  }
+
+  async #isAliasMatch(requestRelayKey, tokenRelayKey) {
+    if (!requestRelayKey || !tokenRelayKey) return false;
+
+    const normalizedRequest = this.#toColonIdentifier(requestRelayKey) || requestRelayKey;
+    const normalizedToken = this.#toColonIdentifier(tokenRelayKey) || tokenRelayKey;
+    if (normalizedRequest === normalizedToken) return true;
+
+    const requestRegistration = await this.registrationStore?.getRelay?.(normalizedRequest);
+    const tokenRegistration = await this.registrationStore?.getRelay?.(normalizedToken);
+
+    const requestAliases = this.#collectAliasForms(requestRegistration, normalizedRequest);
+    const tokenAliases = this.#collectAliasForms(tokenRegistration, normalizedToken);
+
+    return requestAliases.has(normalizedToken) || tokenAliases.has(normalizedRequest);
+  }
+
+  #collectAliasForms(registration, fallbackKey) {
+    const aliases = new Set();
+    if (fallbackKey) {
+      aliases.add(fallbackKey);
+      aliases.add(this.#toGatewayPath(fallbackKey));
+      aliases.add(this.#toColonIdentifier(fallbackKey));
+    }
+    const metadata = registration?.metadata || {};
+    const relayKey = registration?.relayKey || metadata?.identifier || null;
+    if (relayKey) {
+      aliases.add(relayKey);
+      aliases.add(this.#toGatewayPath(relayKey));
+      aliases.add(this.#toColonIdentifier(relayKey));
+    }
+    const gatewayPath = metadata.gatewayPath;
+    if (gatewayPath) {
+      aliases.add(this.#normalizePathValue(gatewayPath));
+      aliases.add(this.#toColonIdentifier(gatewayPath));
+    }
+    if (Array.isArray(metadata.pathAliases)) {
+      for (const alias of metadata.pathAliases) {
+        aliases.add(this.#normalizePathValue(alias));
+        aliases.add(this.#toColonIdentifier(alias));
+      }
+    }
+    // Remove falsy values
+    for (const val of Array.from(aliases)) {
+      if (!val) aliases.delete(val);
+    }
+    return aliases;
   }
 
   #normalizePeerRawKey(value) {
