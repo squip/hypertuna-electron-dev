@@ -1,0 +1,44 @@
+services:
+  fevela:
+    container_name: fevela-nginx
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        VITE_PROXY_SERVER: ${FEVELA_PROXY_SERVER_URL:-http://localhost:8090}
+    ports:
+      - '8089:80'
+    restart: unless-stopped
+    networks:
+      - fevela
+
+  proxy-server:
+    image: ghcr.io/danvergara/jumble-proxy-server:latest
+    environment:
+      - ALLOW_ORIGIN=${FEVELA_SOCIAL_URL:-http://localhost:8089}
+      - FEVELA_PROXY_GITHUB_TOKEN=${FEVELA_PROXY_GITHUB_TOKEN}
+      - ENABLE_PPROF=true
+      - PORT=8080
+    ports:
+      - '8090:8080'
+    networks:
+      - fevela
+
+  nostr-relay:
+    image: scsibug/nostr-rs-relay:latest
+    container_name: fevela-nostr-relay
+    ports:
+      - '7000:8080'
+    environment:
+      - RUST_LOG=warn,nostr_rs_relay=info
+    volumes:
+      - relay-data:/usr/src/app/db
+    networks:
+      - fevela
+    restart: unless-stopped
+
+volumes:
+  relay-data:
+
+networks:
+  fevela:

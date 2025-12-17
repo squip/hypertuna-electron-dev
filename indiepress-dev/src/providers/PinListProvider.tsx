@@ -1,0 +1,107 @@
+import { MAX_PINNED_NOTES } from '@/constants'
+import { buildETag, createPinListDraftEvent } from '@/lib/draft-event'
+import { Event } from '@nostr/tools/wasm'
+import * as kinds from '@nostr/tools/kinds'
+import { createContext, useContext } from 'react'
+import { useTranslation } from 'react-i18next'
+import { toast } from 'sonner'
+import { useNostr } from './NostrProvider'
+import { loadPins } from '@nostr/gadgets/lists'
+
+type TPinListContext = {
+  pinList: string[]
+  pin: (event: Event) => Promise<void>
+  unpin: (event: Event) => Promise<void>
+}
+
+const PinListContext = createContext<TPinListContext | undefined>(undefined)
+
+export const usePinList = () => {
+  const context = useContext(PinListContext)
+  if (!context) {
+    throw new Error('usePinList must be used within a PinListProvider')
+  }
+  return context
+}
+
+export function PinListProvider({ children }: { children: React.ReactNode }) {
+  const { t } = useTranslation()
+  const { pubkey: accountPubkey, pinList, publish, updatePinListEvent } = useNostr()
+
+  const pin = async (event: Event) => {
+    if (!accountPubkey) return
+
+    if (event.kind !== kinds.ShortTextNote || event.pubkey !== accountPubkey) return
+
+    const _pin = async () => {
+      const pins = await loadPins(accountPubkey)
+      const currentTags = pins.event?.tags || []
+
+      if (currentTags.some((tag) => tag[0] === 'e' && tag[1] === event.id)) {
+        return
+      }
+
+      let newTags = [...currentTags, buildETag(event.id, event.pubkey)]
+      const eTagCount = newTags.filter((tag) => tag[0] === 'e').length
+      if (eTagCount > MAX_PINNED_NOTES) {
+        let removed = 0
+        const needRemove = eTagCount - MAX_PINNED_NOTES
+        newTags = newTags.filter((tag) => {
+          if (tag[0] === 'e' && removed < needRemove) {
+            removed += 1
+            return false
+          }
+          return true
+        })
+      }
+
+      const newPinListDraftEvent = createPinListDraftEvent(newTags, pins.event?.content)
+      const newPinListEvent = await publish(newPinListDraftEvent)
+      await updatePinListEvent(newPinListEvent)
+    }
+
+    const { unwrap } = toast.promise(_pin, {
+      loading: t('Pinning...'),
+      success: t('Pinned!'),
+      error: (err) => t('Failed to pin: {{error}}', { error: err.message })
+    })
+    await unwrap()
+  }
+
+  const unpin = async (event: Event) => {
+    if (!accountPubkey) return
+
+    if (event.kind !== kinds.ShortTextNote || event.pubkey !== accountPubkey) return
+
+    const _unpin = async () => {
+      const pins = await loadPins(accountPubkey)
+      if (!pins.event) return
+
+      const newTags = pins.event.tags.filter((tag) => tag[0] !== 'e' || tag[1] !== event.id)
+      if (newTags.length === pins.event.tags.length) return
+
+      const newPinListDraftEvent = createPinListDraftEvent(newTags, pins.event?.content)
+      const newPinListEvent = await publish(newPinListDraftEvent)
+      await updatePinListEvent(newPinListEvent)
+    }
+
+    const { unwrap } = toast.promise(_unpin, {
+      loading: t('Unpinning...'),
+      success: t('Unpinned!'),
+      error: (err) => t('Failed to unpin: {{error}}', { error: err.message })
+    })
+    await unwrap()
+  }
+
+  return (
+    <PinListContext.Provider
+      value={{
+        pinList,
+        pin,
+        unpin
+      }}
+    >
+      {children}
+    </PinListContext.Provider>
+  )
+}

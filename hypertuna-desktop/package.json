@@ -8,8 +8,11 @@
   "scripts": {
     "start": "electron .",
     "dev": "electron .",
-    "build": "electron-builder",
-    "dist": "electron-builder --publish=never",
+    "dev:renderer": "cd ../indiepress-dev && npm run dev:web -- --host",
+    "dev:electron": "RENDERER_URL=http://localhost:5173 electron .",
+    "build:renderer": "cd ../indiepress-dev && npm run build:web",
+    "build": "npm run build:renderer && electron-builder",
+    "dist": "npm run build:renderer && electron-builder --publish=never",
     "test": "brittle test/*.test.js"
   },
   "devDependencies": {

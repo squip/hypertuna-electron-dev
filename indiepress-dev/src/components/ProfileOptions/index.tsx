@@ -1,0 +1,64 @@
+import { npubEncode } from '@nostr/tools/nip19'
+import { Button } from '@/components/ui/button'
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger
+} from '@/components/ui/dropdown-menu'
+import { useMuteList } from '@/providers/MuteListProvider'
+import { useNostr } from '@/providers/NostrProvider'
+import { Bell, BellOff, Copy, Ellipsis } from 'lucide-react'
+import { useMemo } from 'react'
+import { useTranslation } from 'react-i18next'
+
+export default function ProfileOptions({ pubkey }: { pubkey: string }) {
+  const { t } = useTranslation()
+  const { pubkey: accountPubkey } = useNostr()
+  const { mutePubkeySet, mutePrivately, mutePublicly, unmute } = useMuteList()
+  const isMuted = useMemo(() => mutePubkeySet.has(pubkey), [mutePubkeySet, pubkey])
+
+  if (pubkey === accountPubkey) return null
+
+  return (
+    <DropdownMenu>
+      <DropdownMenuTrigger asChild>
+        <Button variant="secondary" size="icon" className="rounded-full">
+          <Ellipsis />
+        </Button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent>
+        <DropdownMenuItem onClick={() => navigator.clipboard.writeText(npubEncode(pubkey))}>
+          <Copy />
+          {t('Copy user ID')}
+        </DropdownMenuItem>
+        {isMuted ? (
+          <DropdownMenuItem
+            onClick={() => unmute(pubkey)}
+            className="text-destructive focus:text-destructive"
+          >
+            <Bell />
+            {t('Unmute user')}
+          </DropdownMenuItem>
+        ) : (
+          <>
+            <DropdownMenuItem
+              onClick={() => mutePrivately(pubkey)}
+              className="text-destructive focus:text-destructive"
+            >
+              <BellOff />
+              {t('Mute user privately')}
+            </DropdownMenuItem>
+            <DropdownMenuItem
+              onClick={() => mutePublicly(pubkey)}
+              className="text-destructive focus:text-destructive"
+            >
+              <BellOff />
+              {t('Mute user publicly')}
+            </DropdownMenuItem>
+          </>
+        )}
+      </DropdownMenuContent>
+    </DropdownMenu>
+  )
+}

@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 980 260" role="img" aria-labelledby="title desc">
+  <title>indiepress.io — Horizontal Lockup</title>
+  <desc>Clean lockup: mark + divider + domain text. Good for nav bars.</desc>
+  <defs>
+    <style>
+      :root {
+        --ink: #111111;
+        --paper: #FFFFFF;
+        --accent: #FF2D55;
+      }
+      .label { fill: var(--ink); font: 800 88px/1 "Space Grotesk", "Inter", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; letter-spacing: 0.01em; }
+    </style>
+  </defs>
+  <!-- Left: the logomark (clean) -->
+  <g transform="translate(20,20)">
+    <g fill="none" stroke="var(--ink)" stroke-linecap="round" stroke-linejoin="round">
+      <g transform="translate(0,0) rotate(35 108 108)">
+        <circle cx="108" cy="108" r="80" stroke-width="24" vector-effect="non-scaling-stroke"
+                stroke-dasharray="450 52" stroke-dashoffset="14"/>
+      </g>
+      <line x1="72" y1="144" x2="144" y2="72" stroke="var(--ink)" stroke-width="16" vector-effect="non-scaling-stroke"/>
+      <circle cx="72" cy="144" r="12" fill="var(--ink)" stroke="none"/>
+      <circle cx="144" cy="72" r="9" fill="var(--ink)" stroke="none"/>
+    </g>
+  </g>
+
+  <!-- Divider -->
+  <rect x="240" y="36" width="2.5" height="188" fill="var(--ink)" />
+
+  <!-- Wordmark -->
+  <g transform="translate(274,158)">
+    <text class="label">indiepress.io</text>
+  </g>
+</svg>

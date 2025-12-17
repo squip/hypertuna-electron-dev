@@ -74,7 +74,23 @@ function createWindow() {
     mainWindow = null;
   });
 
-  mainWindow.loadFile(path.join(__dirname, 'index.html'));
+  const devUrl = process.env.RENDERER_URL;
+  if (devUrl) {
+    const loadDev = (url) => {
+      if (!mainWindow || mainWindow.isDestroyed()) return;
+      mainWindow.loadURL(url).catch((err) => {
+        console.warn('[Main] loadURL error:', err?.message || err);
+      });
+    };
+    mainWindow.webContents.on('did-fail-load', (_event, errorCode, errorDescription, validatedURL) => {
+      console.warn(`[Main] Renderer load failed (${errorCode}): ${errorDescription} ${validatedURL ? `(${validatedURL})` : ''}. Retrying...`);
+      setTimeout(() => loadDev(devUrl), 750);
+    });
+    loadDev(devUrl);
+  } else {
+    const rendererPath = path.join(__dirname, '..', 'indiepress-dev', 'dist', 'index.html');
+    mainWindow.loadFile(rendererPath);
+  }
 }
 
 async function startWorkerProcess() {

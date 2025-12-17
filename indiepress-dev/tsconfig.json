@@ -1,0 +1,23 @@
+{
+  "files": [],
+  "references": [
+    { "path": "./tsconfig.app.json" },
+    { "path": "./tsconfig.node.json" }
+  ],
+  "exclude": [
+    "x21",
+    "../x21",
+    "../indiepress-client-dev-2",
+    "../indiepress-client-dev-3",
+    "../indiepress-client-dev-4",
+    "**/indiepress-client-dev-2/**",
+    "**/indiepress-client-dev-3/**",
+    "**/indiepress-client-dev-4/**"
+  ],
+  "compilerOptions": {
+    "baseUrl": ".",
+    "paths": {
+      "@/*": ["./src/*"]
+    }
+  }
+}

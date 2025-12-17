@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>indiepress.io — Brand Kit Preview</title>
+<style>
+  :root {
+    --ink: #111111;
+    --paper: #FFFFFF;
+    --accent: #FF2D55;
+  }
+  html, body { background: var(--paper); color: var(--ink); font-family: system-ui, -apple-system, "Segoe UI", Inter, Roboto, "Helvetica Neue", Arial, sans-serif; }
+  .wrap { max-width: 1100px; margin: 40px auto; padding: 24px; }
+  h1 { font-size: 28px; margin: 0 0 8px; }
+  h2 { font-size: 20px; margin: 28px 0 12px; }
+  .grid { display: grid; grid-template-columns: repeat(12,1fr); gap: 20px; align-items: start; }
+  .card { border: 1px solid #ddd; border-radius: 10px; padding: 16px; }
+  .muted { color: #666; font-size: 14px; }
+  .row { display: flex; gap: 16px; align-items: center; flex-wrap: wrap; }
+  .swatch { display: inline-block; width: 60px; height: 40px; border-radius: 6px; border: 1px solid #ccc; }
+  .code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace; background: #f6f7f9; padding: 8px 10px; border-radius: 8px; }
+  footer { margin-top: 48px; font-size: 12px; color: #777; }
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>indiepress.io — Brand Kit Preview</h1>
+    <p class="muted">Simple & modern; zine-inspired. Clean vectors with an optional rough filter.</p>
+
+    <h2>Logomark (clean)</h2>
+    <div class="row">
+      <img src="./mark_clean.svg" alt="indiepress.io mark clean" width="196" height="196">
+      <img src="./favicon.svg" alt="indiepress.io favicon" width="64" height="64" style="border:1px solid #ddd;border-radius:8px;padding:6px;">
+    </div>
+
+    <h2>Logomark (rough / zine)</h2>
+    <div class="row">
+      <img src="./mark_rough.svg" alt="indiepress.io mark rough" width="196" height="196">
+    </div>
+
+    <h2>Wordmark — Two-Strip</h2>
+    <img src="./wordmark_strip.svg" alt="indiepress.io wordmark strip" style="max-width:100%;">
+
+    <h2>Horizontal Lockup</h2>
+    <img src="./lockup_horizontal.svg" alt="indiepress.io horizontal lockup" style="max-width:100%;">
+
+    <h2>Palette</h2>
+    <div class="row">
+      <div><div class="swatch" style="background:#111111"></div><div class="muted">Ink<br><span class="code">#111111</span></div></div>
+      <div><div class="swatch" style="background:#FFFFFF"></div><div class="muted">Paper<br><span class="code">#FFFFFF</span></div></div>
+      <div><div class="swatch" style="background:#FF2D55"></div><div class="muted">Accent<br><span class="code">#FF2D55</span></div></div>
+    </div>
+
+    <h2>Developer Notes</h2>
+    <pre class="code">/* Swap colors globally */
+:root {
+  --ink: #111111;
+  --paper: #FFFFFF;
+  --accent: #FF2D55;
+}
+
+/* Example inversion for dark UI */
+@media (prefers-color-scheme: dark) {
+  :root {
+    --ink: #F3F3F3;
+    --paper: #0B0B0B;
+  }
+}</pre>
+
+    <footer>© indiepress.io — generated vector assets. Fonts in wordmarks use common/open fonts; swap to your preferred family if needed.</footer>
+  </div>
+</body>
+</html>

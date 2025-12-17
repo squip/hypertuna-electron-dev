@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-labelledby="title desc">
+  <title>indiepress.io — Safety Link Mark (clean)</title>
+  <desc>Minimal circular mark with a deliberate gap and a diagonal safety-pin-like connector symbolizing P2P and censorship resistance.</desc>
+  <defs>
+    <style>
+      :root {
+        --ink: #111111;
+        --paper: #FFFFFF;
+        --accent: #FF2D55;
+      }
+    </style>
+  </defs>
+  <!-- Outer ring with a deliberate gap (stroke-dasharray) -->
+  <g fill="none" stroke="var(--ink)" stroke-linecap="round" stroke-linejoin="round">
+    <g transform="rotate(35 128 128)">
+      <circle cx="128" cy="128" r="96" stroke-width="28" vector-effect="non-scaling-stroke"
+              stroke-dasharray="540 63" stroke-dashoffset="18"/>
+    </g>
+    <!-- Diagonal 'pin' connecting two nodes -->
+    <line x1="90" y1="166" x2="166" y2="90" stroke="var(--ink)" stroke-width="18" vector-effect="non-scaling-stroke"/>
+    <circle cx="90" cy="166" r="14" fill="var(--ink)" stroke="none"/>
+    <circle cx="166" cy="90" r="10" fill="var(--ink)" stroke="none"/>
+  </g>
+</svg>

@@ -1,0 +1,477 @@
+import PrimaryPageLayout from '@/layouts/PrimaryPageLayout'
+import { useGroups } from '@/providers/GroupsProvider'
+import { TPageRef } from '@/types'
+import { Card, CardContent } from '@/components/ui/card'
+import { Button } from '@/components/ui/button'
+import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
+import { useTranslation } from 'react-i18next'
+import { forwardRef, useImperativeHandle, useRef, useState } from 'react'
+import { Heart, Loader2, Star } from 'lucide-react'
+import { Input } from '@/components/ui/input'
+import { useSecondaryPage } from '@/PageManager'
+import { toGroup } from '@/lib/link'
+import GroupCreateDialog from '@/components/GroupCreateDialog'
+import { isElectron } from '@/lib/platform'
+import { electronIpc } from '@/services/electron-ipc.service'
+import { toast } from 'sonner'
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle
+} from '@/components/ui/dialog'
+import { Label } from '@/components/ui/label'
+import { Textarea } from '@/components/ui/textarea'
+import { Switch } from '@/components/ui/switch'
+
+type TTab = 'discover' | 'my' | 'invites'
+
+const makeGroupKey = (groupId: string, relay?: string) => (relay ? `${relay}|${groupId}` : groupId)
+
+const GroupsPage = forwardRef<TPageRef>((_, ref) => {
+  const layoutRef = useRef<TPageRef>(null)
+  useImperativeHandle(ref, () => layoutRef.current!)
+  const { t } = useTranslation()
+  const {
+    discoveryGroups,
+    invites,
+    favoriteGroups,
+    myGroupList,
+    refreshDiscovery,
+    refreshInvites,
+    toggleFavorite,
+    isLoadingDiscovery,
+    discoveryError,
+    invitesError
+  } =
+    useGroups()
+  const [tab, setTab] = useState<TTab>('discover')
+  const [search, setSearch] = useState('')
+  const { push } = useSecondaryPage()
+  const [showCreate, setShowCreate] = useState(false)
+  const [showCreateActions, setShowCreateActions] = useState(false)
+  const [showRelayCreate, setShowRelayCreate] = useState(false)
+  const [showRelayJoin, setShowRelayJoin] = useState(false)
+  const [showRelayCta, setShowRelayCta] = useState(false)
+  const [relayName, setRelayName] = useState('')
+  const [relayDescription, setRelayDescription] = useState('')
+  const [relayPublic, setRelayPublic] = useState(true)
+  const [relayCreating, setRelayCreating] = useState(false)
+  const [joinIdentifier, setJoinIdentifier] = useState('')
+  const [joinToken, setJoinToken] = useState('')
+  const [joinBusy, setJoinBusy] = useState(false)
+  const desktopDownloadUrl =
+    import.meta.env.VITE_DESKTOP_DOWNLOAD_URL || 'https://hypertuna.com/download'
+  const isDesktop = isElectron()
+
+  const filteredDiscovery = discoveryGroups.filter((g) => {
+    if (!search.trim()) return true
+    const q = search.toLowerCase()
+    return g.name.toLowerCase().includes(q) || (g.about ?? '').toLowerCase().includes(q)
+  })
+
+  const renderGroupCard = (groupId: string, relay?: string) => {
+    const meta = discoveryGroups.find(
+      (g) => g.id === groupId && (relay ? g.relay === relay : true)
+    )
+    const name = meta?.name || groupId
+    const about = meta?.about
+    const membersText = meta?.tags?.length ? `${meta.tags.length} tags` : null
+    const key = makeGroupKey(groupId, relay)
+    const isFavorite = favoriteGroups.includes(key)
+
+    return (
+      <Card
+        key={key}
+        className="cursor-pointer transition-colors hover:bg-accent/50 overflow-hidden"
+        onClick={() => {
+          const targetId = relay ? `${relay}'${groupId}` : groupId
+          push(toGroup(targetId, relay))
+        }}
+      >
+        <CardContent className="p-4 flex gap-3 items-start">
+          <div className="flex-1 min-w-0 space-y-1">
+            <div className="flex items-center justify-between gap-2">
+              <div className="font-semibold text-lg truncate">{name}</div>
+              <div className="flex items-center gap-1">
+                {meta?.relay && (
+                  <span className="text-xs text-muted-foreground truncate max-w-[160px]">
+                    {meta.relay}
+                  </span>
+                )}
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  onClick={(e) => {
+                    e.stopPropagation()
+                    toggleFavorite(key)
+                  }}
+                  title={isFavorite ? t('Remove from favorites') : t('Add to favorites')}
+                >
+                  <Star className={`w-4 h-4 ${isFavorite ? 'fill-current text-yellow-500' : 'text-muted-foreground'}`} />
+                </Button>
+              </div>
+            </div>
+            {about && <div className="text-sm text-muted-foreground line-clamp-2">{about}</div>}
+            {membersText && <div className="text-xs text-muted-foreground">{membersText}</div>}
+          </div>
+        </CardContent>
+      </Card>
+    )
+  }
+
+  const renderDiscover = () => {
+    if (isLoadingDiscovery) {
+      return (
+        <div className="flex flex-col items-center gap-3 text-muted-foreground py-12">
+          <Loader2 className="w-6 h-6 animate-spin" />
+          <div>{t('Loading...')}</div>
+        </div>
+      )
+    }
+    if (discoveryError) {
+      return (
+        <div className="text-sm text-red-500">
+          {t('Failed to load groups')}: {discoveryError}
+        </div>
+      )
+    }
+    if (!discoveryGroups.length) {
+      return <div className="text-muted-foreground">{t('No groups found')}</div>
+    }
+    return (
+      <div className="space-y-3">
+        {filteredDiscovery.map((g) => renderGroupCard(g.id, g.relay))}
+      </div>
+    )
+  }
+
+  const renderMyGroups = () => {
+    if (!myGroupList.length) {
+      return <div className="text-muted-foreground">{t('No groups yet')}</div>
+    }
+    return (
+      <div className="space-y-3">
+        {myGroupList.map((entry) => renderGroupCard(entry.groupId, entry.relay))}
+      </div>
+    )
+  }
+
+  const renderInvites = () => {
+    return (
+      <div className="space-y-3">
+        <div className="flex items-center justify-between">
+          <div className="text-sm text-muted-foreground">
+            {invites.length ? t('Invites') : t('No invites')}
+          </div>
+          <Button variant="ghost" size="sm" onClick={() => refreshInvites()}>
+            <Loader2 className="w-4 h-4 mr-2" />
+            {t('Refresh')}
+          </Button>
+        </div>
+        {invitesError && <div className="text-sm text-red-500">{invitesError}</div>}
+        {invites.map((inv) => (
+          <Card key={inv.event.id} className="overflow-hidden">
+            <CardContent className="p-4 flex items-center justify-between gap-3">
+              <div>
+                <div className="font-semibold">{inv.groupId}</div>
+                {inv.relay && (
+                  <div className="text-xs text-muted-foreground truncate max-w-[200px]">
+                    {inv.relay}
+                  </div>
+                )}
+              </div>
+              <Button
+                size="sm"
+                onClick={() => {
+                  const targetId = inv.relay ? `${inv.relay}'${inv.groupId}` : inv.groupId
+                  push(toGroup(targetId, inv.relay))
+                }}
+              >
+                {t('Use invite')}
+              </Button>
+            </CardContent>
+          </Card>
+        ))}
+      </div>
+    )
+  }
+
+  return (
+    <PrimaryPageLayout
+      pageName="groups"
+      ref={layoutRef}
+      titlebar={<GroupsPageTitlebar />}
+      displayScrollToTopButton
+    >
+      <div className="space-y-4 p-4">
+        <div className="flex items-center gap-2">
+          <Input
+            placeholder={t('Search groups...') as string}
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+            className="flex-1"
+          />
+          <Button variant="ghost" size="icon" onClick={() => refreshDiscovery()}>
+            <Loader2 className="w-4 h-4" />
+          </Button>
+          <Button onClick={() => setShowCreateActions(true)}>{t('Create')}</Button>
+        </div>
+        <Tabs value={tab} onValueChange={(val) => setTab(val as TTab)}>
+          <TabsList className="grid grid-cols-3 w-full">
+            <TabsTrigger value="discover">{t('Discover')}</TabsTrigger>
+            <TabsTrigger value="my">{t('My Groups')}</TabsTrigger>
+            <TabsTrigger value="invites">{t('Invites')}</TabsTrigger>
+          </TabsList>
+          <TabsContent value="discover" className="mt-4">
+            {renderDiscover()}
+          </TabsContent>
+          <TabsContent value="my" className="mt-4">
+            {renderMyGroups()}
+          </TabsContent>
+          <TabsContent value="invites" className="mt-4">
+            {renderInvites()}
+          </TabsContent>
+        </Tabs>
+      </div>
+      <GroupCreateDialog open={showCreate} onOpenChange={setShowCreate} />
+      <Dialog open={showCreateActions} onOpenChange={setShowCreateActions}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>{t('Create or join')}</DialogTitle>
+            <DialogDescription>
+              {t('Start a new Nostr group or manage Hypertuna relays (desktop only).')}
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-3">
+            <Button
+              variant="outline"
+              className="w-full justify-between"
+              onClick={() => {
+                setShowCreateActions(false)
+                setShowCreate(true)
+              }}
+            >
+              <span>{t('Create Nostr group')}</span>
+              <span className="text-xs text-muted-foreground">{t('NIP-29')}</span>
+            </Button>
+            <Button
+              variant="outline"
+              className="w-full justify-between"
+              onClick={() => {
+                setShowCreateActions(false)
+                if (isDesktop) setShowRelayCreate(true)
+                else setShowRelayCta(true)
+              }}
+            >
+              <span>{t('Create Hypertuna relay')}</span>
+              <span className="text-xs text-muted-foreground">{isDesktop ? t('Desktop') : t('Desktop only')}</span>
+            </Button>
+            <Button
+              variant="outline"
+              className="w-full justify-between"
+              onClick={() => {
+                setShowCreateActions(false)
+                if (isDesktop) setShowRelayJoin(true)
+                else setShowRelayCta(true)
+              }}
+            >
+              <span>{t('Join Hypertuna relay')}</span>
+              <span className="text-xs text-muted-foreground">{isDesktop ? t('Desktop') : t('Desktop only')}</span>
+            </Button>
+          </div>
+          <DialogFooter>
+            <Button variant="secondary" onClick={() => setShowCreateActions(false)}>
+              {t('Close')}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+      <Dialog open={showRelayCreate} onOpenChange={setShowRelayCreate}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>{t('Create Hypertuna relay')}</DialogTitle>
+            <DialogDescription>
+              {t('Creates a new Hypertuna relay using the local worker (desktop only).')}
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-3">
+            <div className="space-y-1">
+              <Label htmlFor="relay-name">{t('Name')}</Label>
+              <Input
+                id="relay-name"
+                value={relayName}
+                onChange={(e) => setRelayName(e.target.value)}
+                placeholder={t('My Relay') as string}
+              />
+            </div>
+            <div className="space-y-1">
+              <Label htmlFor="relay-description">{t('Description')}</Label>
+              <Textarea
+                id="relay-description"
+                value={relayDescription}
+                onChange={(e) => setRelayDescription(e.target.value)}
+                placeholder={t('Optional description') as string}
+              />
+            </div>
+            <div className="flex items-center justify-between rounded-md border px-3 py-2">
+              <div>
+                <div className="font-medium text-sm">{t('Public')}</div>
+                <div className="text-xs text-muted-foreground">
+                  {t('Make this relay discoverable via gateway')}
+                </div>
+              </div>
+              <Switch checked={relayPublic} onCheckedChange={setRelayPublic} />
+            </div>
+            <DialogFooter className="gap-2">
+              <Button variant="outline" onClick={() => setShowRelayCreate(false)}>
+                {t('Cancel')}
+              </Button>
+              <Button
+                onClick={async () => {
+                  if (!relayName.trim()) {
+                    toast.error(t('Please enter a relay name'))
+                    return
+                  }
+                  setRelayCreating(true)
+                  try {
+                    const res = await electronIpc.sendToWorker({
+                      type: 'create-relay',
+                      data: {
+                        name: relayName.trim(),
+                        description: relayDescription.trim() || undefined,
+                        isPublic: relayPublic
+                      }
+                    })
+                    if (!res?.success) throw new Error(res?.error || 'Create failed')
+                    toast.success(t('Relay creation requested'))
+                    electronIpc.sendToWorker({ type: 'get-relays' }).catch(() => {})
+                    setShowRelayCreate(false)
+                    setRelayName('')
+                    setRelayDescription('')
+                  } catch (err: any) {
+                    toast.error(err?.message || t('Failed to create relay'))
+                  } finally {
+                    setRelayCreating(false)
+                  }
+                }}
+                disabled={relayCreating}
+              >
+                {relayCreating ? t('Creating...') : t('Create relay')}
+              </Button>
+            </DialogFooter>
+          </div>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={showRelayJoin} onOpenChange={setShowRelayJoin}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>{t('Join Hypertuna relay')}</DialogTitle>
+            <DialogDescription>
+              {t('Join an existing Hypertuna relay by key or public identifier.')}
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-3">
+            <div className="space-y-1">
+              <Label htmlFor="join-identifier">{t('Relay key or public identifier')}</Label>
+              <Input
+                id="join-identifier"
+                value={joinIdentifier}
+                onChange={(e) => setJoinIdentifier(e.target.value)}
+                placeholder="relay key or npub:relayName"
+              />
+            </div>
+            <div className="space-y-1">
+              <Label htmlFor="join-token">{t('Auth token')} ({t('optional')})</Label>
+              <Input
+                id="join-token"
+                value={joinToken}
+                onChange={(e) => setJoinToken(e.target.value)}
+                placeholder={t('Token if required') as string}
+              />
+            </div>
+            <DialogFooter className="gap-2">
+              <Button variant="outline" onClick={() => setShowRelayJoin(false)}>
+                {t('Cancel')}
+              </Button>
+              <Button
+                onClick={async () => {
+                  if (!joinIdentifier.trim()) {
+                    toast.error(t('Please enter a relay identifier'))
+                    return
+                  }
+                  setJoinBusy(true)
+                  try {
+                    const identifier = joinIdentifier.trim()
+                    const res = await electronIpc.sendToWorker({
+                      type: 'join-relay',
+                      data: {
+                        relayKey: identifier || undefined,
+                        publicIdentifier: identifier.includes(':') ? identifier : undefined,
+                        authToken: joinToken || undefined
+                      }
+                    })
+                    if (!res?.success) throw new Error(res?.error || 'Join failed')
+                    toast.success(t('Join requested'))
+                    electronIpc.sendToWorker({ type: 'get-relays' }).catch(() => {})
+                    setShowRelayJoin(false)
+                    setJoinIdentifier('')
+                    setJoinToken('')
+                  } catch (err: any) {
+                    toast.error(err?.message || t('Failed to join relay'))
+                  } finally {
+                    setJoinBusy(false)
+                  }
+                }}
+                disabled={joinBusy}
+              >
+                {joinBusy ? t('Joining...') : t('Join relay')}
+              </Button>
+            </DialogFooter>
+          </div>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={showRelayCta} onOpenChange={setShowRelayCta}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>{t('Hypertuna relays')}</DialogTitle>
+            <DialogDescription>
+              {t('Available in the desktop app. Download to create or join relays.')}
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter className="flex flex-col sm:flex-row sm:justify-end sm:space-x-2">
+            <Button variant="outline" onClick={() => setShowRelayCta(false)}>
+              {t('Close')}
+            </Button>
+            <Button asChild>
+              <a href={desktopDownloadUrl} target="_blank" rel="noreferrer">
+                {t('Download desktop app')}
+              </a>
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </PrimaryPageLayout>
+  )
+})
+
+GroupsPage.displayName = 'GroupsPage'
+
+export default GroupsPage
+
+function GroupsPageTitlebar() {
+  const { t } = useTranslation()
+
+  return (
+    <div className="flex gap-2 items-center h-full pl-3 [&_svg]:text-muted-foreground">
+      <Heart />
+      <div className="text-lg font-semibold" style={{ fontSize: 'var(--title-font-size, 18px)' }}>
+        {t('Groups')}
+      </div>
+    </div>
+  )
+}

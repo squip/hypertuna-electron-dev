@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-labelledby="title desc">
+  <title>indiepress.io — Safety Link Mark (rough zine)</title>
+  <desc>Same as the clean mark, with subtle edge roughness to evoke photocopied zines.</desc>
+  <defs>
+    <style>
+      :root {
+        --ink: #111111;
+        --paper: #FFFFFF;
+        --accent: #FF2D55;
+      }
+    </style>
+    <filter id="grit" x="-10%" y="-10%" width="120%" height="120%">
+      <feTurbulence type="fractalNoise" baseFrequency="0.05" numOctaves="3" seed="5" result="noise"/>
+      <feDisplacementMap in="SourceGraphic" in2="noise" scale="2.2" xChannelSelector="R" yChannelSelector="G"/>
+    </filter>
+  </defs>
+  <g fill="none" stroke="var(--ink)" stroke-linecap="round" stroke-linejoin="round" filter="url(#grit)">
+    <g transform="rotate(35 128 128)">
+      <circle cx="128" cy="128" r="96" stroke-width="28" vector-effect="non-scaling-stroke"
+              stroke-dasharray="540 63" stroke-dashoffset="18"/>
+    </g>
+    <line x1="90" y1="166" x2="166" y2="90" stroke="var(--ink)" stroke-width="18" vector-effect="non-scaling-stroke"/>
+    <circle cx="90" cy="166" r="14" fill="var(--ink)" stroke="none"/>
+    <circle cx="166" cy="90" r="10" fill="var(--ink)" stroke="none"/>
+  </g>
+</svg>
