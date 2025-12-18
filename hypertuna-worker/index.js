@@ -2075,13 +2075,50 @@ async function handleMessageObject(message) {
     case 'start-join-flow':
       console.log('[Worker] Start join flow requested:', message.data)
       if (relayServer) {
+        const data = (message && typeof message === 'object' ? message.data : null) || {}
+        const publicIdentifier = data.publicIdentifier
+        const fileSharing = data.fileSharing
         try {
-          await relayServer.startJoinAuthentication(message.data)
+          let hostPeers = Array.isArray(data.hostPeers) ? data.hostPeers : []
+          hostPeers = hostPeers
+            .map((key) => String(key || '').trim().toLowerCase())
+            .filter(Boolean)
+
+          if (!hostPeers.length) {
+            const status = getGatewayStatus()
+            const peerRelayMap = status?.peerRelayMap
+            const candidates = []
+            if (peerRelayMap && typeof peerRelayMap === 'object') {
+              candidates.push(publicIdentifier)
+              if (typeof publicIdentifier === 'string' && publicIdentifier.includes(':')) {
+                candidates.push(publicIdentifier.replace(':', '/'))
+              }
+            }
+
+            for (const identifier of candidates) {
+              if (!identifier) continue
+              const entry = peerRelayMap?.[identifier]
+              const peers = Array.isArray(entry?.peers) ? entry.peers : []
+              if (peers.length) {
+                hostPeers = peers
+                  .map((key) => String(key || '').trim().toLowerCase())
+                  .filter(Boolean)
+                if (hostPeers.length) break
+              }
+            }
+          }
+
+          await relayServer.startJoinAuthentication({
+            ...data,
+            publicIdentifier,
+            fileSharing,
+            hostPeers
+          })
         } catch (err) {
           sendMessage({
             type: 'join-auth-error',
             data: {
-              publicIdentifier: message.data.publicIdentifier,
+              publicIdentifier,
               error: `Failed to start join flow: ${err.message}`
             }
           })
@@ -2089,7 +2126,10 @@ async function handleMessageObject(message) {
       } else {
         sendMessage({
           type: 'join-auth-error',
-          data: { publicIdentifier: message.data.publicIdentifier, error: 'Relay server not initialized' }
+          data: {
+            publicIdentifier: message?.data?.publicIdentifier,
+            error: 'Relay server not initialized'
+          }
         })
       }
       break
