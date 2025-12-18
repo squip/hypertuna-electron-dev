@@ -8,6 +8,7 @@ import {
   useRef,
   useState
 } from 'react'
+import * as nip19 from '@nostr/tools/nip19'
 import {
   electronIpc,
   WorkerStartResult,
@@ -310,7 +311,17 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
     if (!isHex64(pubkeyHex) || !isHex64(nsecHex)) {
       throw new Error('Hypertuna worker requires a local nsec/ncryptsec account in Electron.')
     }
-    return { nostr_pubkey_hex: pubkeyHex.toLowerCase(), nostr_nsec_hex: nsecHex.toLowerCase() }
+    let nostr_npub: string | null = null
+    try {
+      nostr_npub = nip19.npubEncode(pubkeyHex.toLowerCase())
+    } catch (err) {
+      void err
+    }
+    return {
+      nostr_pubkey_hex: pubkeyHex.toLowerCase(),
+      nostr_nsec_hex: nsecHex.toLowerCase(),
+      nostr_npub: nostr_npub || undefined
+    }
   }, [pubkeyHex, nsecHex])
 
   const startWorkerInternal = useCallback(
