@@ -652,6 +652,16 @@ let publicGatewaySettings = null
 let publicGatewayStatusCache = null
 let pendingGatewayMetadataSync = false
 
+const WORKER_MESSAGE_VERSION = 1
+const WORKER_SESSION_ID =
+  typeof nodeCrypto.randomUUID === 'function'
+    ? nodeCrypto.randomUUID()
+    : nodeCrypto.randomBytes(16).toString('hex')
+
+const PROXY_DERIVATION_CONTEXT = 'hypertuna-relay-peer'
+const PROXY_DERIVATION_ITERATIONS = 100000
+const PROXY_DERIVATION_DKLEN_BYTES = 32
+
 async function appendFilekeyDbEntry (relayKey, fileHash) {
   if (!config?.driveKey || !config?.nostr_pubkey_hex) {
     console.warn(`[Worker] appendFilekeyDbEntry skipped: missing driveKey or nostr_pubkey_hex (driveKey=${!!config?.driveKey}, pub=${!!config?.nostr_pubkey_hex})`)
@@ -816,6 +826,95 @@ function deriveSwarmKeyPair(cfg = {}) {
   return null;
 }
 
+function deriveProxySeedHex(nostr_nsec_hex) {
+  if (typeof nostr_nsec_hex !== 'string' || !/^[a-fA-F0-9]{64}$/.test(nostr_nsec_hex)) {
+    throw new Error('Invalid nostr_nsec_hex for proxy seed derivation')
+  }
+
+  const seed = nodeCrypto.pbkdf2Sync(
+    Buffer.from(nostr_nsec_hex.toLowerCase(), 'hex'),
+    Buffer.from(PROXY_DERIVATION_CONTEXT, 'utf8'),
+    PROXY_DERIVATION_ITERATIONS,
+    PROXY_DERIVATION_DKLEN_BYTES,
+    'sha256'
+  )
+
+  return seed.toString('hex')
+}
+
+function ensureProxyIdentity(cfg = {}) {
+  if (!cfg || typeof cfg !== 'object') {
+    throw new Error('Missing config for proxy identity derivation')
+  }
+
+  if (!cfg.proxy_seed) {
+    cfg.proxy_seed = deriveProxySeedHex(cfg.nostr_nsec_hex)
+  }
+
+  try {
+    const keyPair = swarmCrypto.keyPair(b4a.from(cfg.proxy_seed, 'hex'))
+    if (keyPair?.publicKey) {
+      cfg.proxy_publicKey = keyPair.publicKey.toString('hex')
+      cfg.swarmPublicKey = cfg.swarmPublicKey || cfg.proxy_publicKey
+    }
+    if (keyPair?.secretKey) {
+      cfg.proxy_privateKey = keyPair.secretKey.toString('hex')
+    }
+  } catch (error) {
+    console.warn('[Worker] Failed to derive proxy keypair from proxy_seed:', error?.message || error)
+  }
+
+  return cfg
+}
+
+function sanitizeConfigForDisk(configData) {
+  if (!configData || typeof configData !== 'object') return configData
+  const sanitized = { ...configData }
+
+  // Never persist nostr private keys (memory-only).
+  delete sanitized.nostr_nsec
+  delete sanitized.nostr_nsec_hex
+  delete sanitized.nostr_nsec_bech32
+
+  // Never persist proxy key material (re-derived from nostr_nsec_hex at runtime).
+  delete sanitized.proxy_seed
+  delete sanitized.proxy_privateKey
+  delete sanitized.proxy_private_key
+  delete sanitized.proxySecretKey
+
+  return sanitized
+}
+
+function getUserKeyFromDiskConfig(configData) {
+  if (!configData || typeof configData !== 'object') return null
+  if (isHex64(configData.userKey)) return configData.userKey.toLowerCase()
+  if (typeof configData.storage === 'string') {
+    const match = configData.storage.match(/\/users\/([a-f0-9]{64})/i)
+    if (match) return match[1].toLowerCase()
+  }
+  if (isHex64(configData.nostr_nsec_hex)) {
+    return nodeCrypto.createHash('sha256').update(configData.nostr_nsec_hex).digest('hex')
+  }
+  return null
+}
+
+function doesDiskConfigMatchUser(configData, { userKey, pubkeyHex } = {}) {
+  if (!configData || typeof configData !== 'object') return false
+  const expectedUserKey = isHex64(userKey) ? userKey.toLowerCase() : null
+  const expectedPubkeyHex = isHex64(pubkeyHex) ? pubkeyHex.toLowerCase() : null
+
+  const diskUserKey = getUserKeyFromDiskConfig(configData)
+  const diskPubkeyHex = isHex64(configData.nostr_pubkey_hex) ? configData.nostr_pubkey_hex.toLowerCase() : null
+
+  if (expectedUserKey && diskUserKey && diskUserKey !== expectedUserKey) return false
+  if (expectedPubkeyHex && diskPubkeyHex && diskPubkeyHex !== expectedPubkeyHex) return false
+
+  // Require at least one verifiable identity signal to avoid cross-imports.
+  if (!diskUserKey && !diskPubkeyHex) return false
+
+  return true
+}
+
 // Load or create configuration
 async function loadOrCreateConfig(customDir = null) {
   const configDir = customDir || defaultStorageDir
@@ -839,12 +938,29 @@ async function loadOrCreateConfig(customDir = null) {
     driveKey: null,
     pfpDriveKey: null
   }
+  defaultConfig.storage = configDir
+  if (global.userConfig?.userKey) {
+    defaultConfig.userKey = global.userConfig.userKey
+  }
 
   try {
     const configData = await fs.readFile(configPath, 'utf8')
     console.log('[Worker] Loaded existing config from:', configPath)
     const loadedConfig = JSON.parse(configData)
     let needsPersist = false
+    for (const secretKey of [
+      'nostr_nsec_hex',
+      'nostr_nsec',
+      'nostr_nsec_bech32',
+      'proxy_seed',
+      'proxy_privateKey',
+      'proxy_private_key',
+      'proxySecretKey'
+    ]) {
+      if (secretKey in loadedConfig) {
+        needsPersist = true
+      }
+    }
     if (!('driveKey' in loadedConfig)) {
       loadedConfig.driveKey = null
       needsPersist = true
@@ -858,13 +974,47 @@ async function loadOrCreateConfig(customDir = null) {
       needsPersist = true
     }
     if (needsPersist) {
-      await fs.writeFile(configPath, JSON.stringify(loadedConfig, null, 2))
+      await fs.writeFile(configPath, JSON.stringify(sanitizeConfigForDisk(loadedConfig), null, 2))
     }
     return { ...defaultConfig, ...loadedConfig }
   } catch (err) {
+    const missingFile = err && typeof err === 'object' && err.code === 'ENOENT'
+    if (missingFile && customDir && /\/users\/[a-f0-9]{64}$/i.test(customDir)) {
+      const globalConfigPath = join(defaultStorageDir, 'relay-config.json')
+      try {
+        const globalConfigData = await fs.readFile(globalConfigPath, 'utf8')
+        const globalConfig = JSON.parse(globalConfigData)
+        const expectedUserKey = global.userConfig?.userKey || null
+        const expectedPubkeyHex = storedParentConfig?.nostr_pubkey_hex || null
+
+        if (doesDiskConfigMatchUser(globalConfig, { userKey: expectedUserKey, pubkeyHex: expectedPubkeyHex })) {
+          const migratedConfig = {
+            ...defaultConfig,
+            ...globalConfig,
+            storage: configDir,
+            userKey: expectedUserKey || globalConfig.userKey
+          }
+          await fs.writeFile(configPath, JSON.stringify(sanitizeConfigForDisk(migratedConfig), null, 2))
+          try {
+            await fs.writeFile(globalConfigPath, JSON.stringify(sanitizeConfigForDisk(globalConfig), null, 2))
+          } catch (scrubError) {
+            console.warn('[Worker] Failed to scrub secrets from legacy global config:', scrubError?.message || scrubError)
+          }
+          console.log('[Worker] Migrated legacy global config to user config:', {
+            from: globalConfigPath,
+            to: configPath
+          })
+          return migratedConfig
+        }
+      } catch (migrationError) {
+        if (migrationError && typeof migrationError === 'object' && migrationError.code !== 'ENOENT') {
+          console.warn('[Worker] Failed to migrate legacy global config:', migrationError?.message || migrationError)
+        }
+      }
+    }
+
     console.log('[Worker] Creating new config at:', configPath)
-    defaultConfig.storage = configDir
-    await fs.writeFile(configPath, JSON.stringify(defaultConfig, null, 2))
+    await fs.writeFile(configPath, JSON.stringify(sanitizeConfigForDisk(defaultConfig), null, 2))
     return defaultConfig
   }
 }
@@ -961,6 +1111,77 @@ const sendMessage = (message) => {
   }
 }
 
+let workerStatusState = {
+  user: null,
+  app: {
+    initialized: false,
+    mode: 'hyperswarm',
+    shuttingDown: false
+  },
+  gateway: {
+    ready: false,
+    running: false
+  },
+  relays: {
+    expected: 0,
+    active: 0
+  }
+}
+
+function mergeWorkerStatusState(patch = null) {
+  if (!patch || typeof patch !== 'object') return
+
+  if ('user' in patch) {
+    workerStatusState.user = patch.user ? { ...(workerStatusState.user || {}), ...patch.user } : null
+  }
+  if (patch.app) {
+    workerStatusState.app = { ...workerStatusState.app, ...patch.app }
+  }
+  if (patch.gateway) {
+    workerStatusState.gateway = { ...workerStatusState.gateway, ...patch.gateway }
+  }
+  if (patch.relays) {
+    workerStatusState.relays = { ...workerStatusState.relays, ...patch.relays }
+  }
+}
+
+function sendWorkerStatus(phase, message, { statePatch = null, legacy = null, error = null } = {}) {
+  mergeWorkerStatusState(statePatch)
+
+  const payload = {
+    type: 'status',
+    v: WORKER_MESSAGE_VERSION,
+    ts: Date.now(),
+    sessionId: WORKER_SESSION_ID,
+    phase,
+    message: message || '',
+    state: workerStatusState
+  }
+
+  if (legacy && typeof legacy === 'object') {
+    Object.assign(payload, legacy)
+  }
+
+  if (error) {
+    payload.error = {
+      message: error?.message || String(error),
+      stack: error?.stack || null
+    }
+  }
+
+  sendMessage(payload)
+}
+
+function sendConfigAppliedV1(data) {
+  sendMessage({
+    type: 'config-applied',
+    v: WORKER_MESSAGE_VERSION,
+    ts: Date.now(),
+    sessionId: WORKER_SESSION_ID,
+    data
+  })
+}
+
 const configWaiters = []
 
 function notifyConfigWaiters(configData) {
@@ -988,14 +1209,15 @@ function waitForParentConfig(timeoutMs = 3000) {
       resolve(configData)
     }
 
-    const timeout = setTimeout(() => {
-      if (settled) return
-      settled = true
-      const index = configWaiters.indexOf(resolver)
-      if (index !== -1) configWaiters.splice(index, 1)
-      console.log('[Worker] Config wait timeout - proceeding with defaults')
-      resolve(null)
-    }, timeoutMs)
+	    const timeout = setTimeout(() => {
+	      if (settled) return
+	      settled = true
+	      const index = configWaiters.indexOf(resolver)
+	      if (index !== -1) configWaiters.splice(index, 1)
+	      const requiresParentConfig = process.env.ELECTRON_RUN_AS_NODE === '1'
+	      console.log('[Worker] Config wait timeout' + (requiresParentConfig ? '' : ' - proceeding with defaults'))
+	      resolve(null)
+	    }, timeoutMs)
 
     configWaiters.push(resolver)
   })
@@ -1417,13 +1639,27 @@ async function handleMessageObject(message) {
     return
   }
 
-  console.log('[Worker] Received from parent:', message)
+  if (message.type === 'config') {
+    const pubkey = typeof message.data?.nostr_pubkey_hex === 'string' ? message.data.nostr_pubkey_hex : null
+    console.log('[Worker] Received from parent: config', {
+      pubkeyHex: pubkey ? `${pubkey.slice(0, 8)}...` : null,
+      hasNsecHex: typeof message.data?.nostr_nsec_hex === 'string',
+      hasStorage: typeof message.data?.storage === 'string'
+    })
+  } else {
+    console.log('[Worker] Received from parent:', { type: message.type })
+  }
 
   if (message.type === 'config') {
     storedParentConfig = message.data
     if (!configReceived) {
       configReceived = true
-      console.log('[Worker] Stored parent config:', storedParentConfig)
+      const pubkey = typeof storedParentConfig?.nostr_pubkey_hex === 'string' ? storedParentConfig.nostr_pubkey_hex : null
+      console.log('[Worker] Stored parent config (sanitized):', {
+        pubkeyHex: pubkey ? `${pubkey.slice(0, 8)}...` : null,
+        hasNsecHex: typeof storedParentConfig?.nostr_nsec_hex === 'string',
+        hasStorage: typeof storedParentConfig?.storage === 'string'
+      })
       notifyConfigWaiters(message.data)
       return
     }
@@ -1692,16 +1928,15 @@ async function handleMessageObject(message) {
     case 'shutdown':
       console.log('[Worker] Shutdown requested')
       isShuttingDown = true
-      sendMessage({
-        type: 'status',
-        message: 'Shutting down...'
+      sendWorkerStatus('stopping', 'Shutting down...', {
+        statePatch: { app: { shuttingDown: true } }
       })
       await cleanup()
       process.exit(0)
       break
 
     case 'config':
-      console.log('[Worker] Received configuration:', message.data)
+      console.log('[Worker] Received additional config message (ignored)')
       break
 
     case 'create-relay':
@@ -1977,10 +2212,7 @@ if (workerPipe) {
   console.log('[Worker] Connected to parent via pipe')
   
   // Test the pipe immediately
-  sendMessage({ 
-    type: 'status', 
-    message: 'Relay worker starting...' 
-  })
+  sendWorkerStatus('starting', 'Relay worker starting...')
   
   // Configuration may have been sent before initialization
   
@@ -2055,9 +2287,8 @@ if (pearRuntime?.teardown) {
 // Cleanup function
 async function cleanup() {
   if (!isShuttingDown) {
-    sendMessage({
-      type: 'status',
-      message: 'Worker shutting down...'
+    sendWorkerStatus('stopping', 'Worker shutting down...', {
+      statePatch: { app: { shuttingDown: true } }
     })
   }
 
@@ -2098,48 +2329,79 @@ async function cleanup() {
 async function main() {
     try {
       console.log('[Worker] Hypertuna Relay Worker starting...')
-      
-      // Load or create configuration
-      config = await loadOrCreateConfig()
+      sendWorkerStatus('starting', 'Hypertuna Relay Worker starting...', {
+        statePatch: {
+          app: { initialized: false, mode: 'hyperswarm', shuttingDown: false },
+          gateway: { ready: false, running: false },
+          relays: { expected: 0, active: 0 }
+        }
+      })
 
-      await initializeGatewayOptionsFromSettings()
-      
-      // Wait for config from parent if available
-      let parentConfig = storedParentConfig
-      if (!parentConfig && (workerPipe || typeof process.send === 'function')) {
+	      const hasParentIpc = !!(workerPipe || typeof process.send === 'function')
+	      const requiresParentConfig = process.env.ELECTRON_RUN_AS_NODE === '1'
+	      let expectedRelayCount = 0
+	      
+	      // Wait for config from parent if available
+	      let parentConfig = storedParentConfig
+	      if (!parentConfig && hasParentIpc) {
         console.log('[Worker] Waiting for parent config...')
+        sendWorkerStatus('waiting-config', 'Waiting for parent config…')
         parentConfig = await waitForParentConfig()
-      } else if (parentConfig) {
-        console.log('[Worker] Using previously received parent config')
-      }
+	      } else if (parentConfig) {
+	        console.log('[Worker] Using previously received parent config')
+	      }
 
-      if (parentConfig) {
-        storedParentConfig = parentConfig;
-        configReceived = true;
-        // Get user key from parent config
-        const userKey = getUserKey(parentConfig);
-        console.log('[Worker] User key:', userKey);
-        
-        // Create user-specific storage path in worker's directory
-        const workerBaseStorage = defaultStorageDir;
-        const userSpecificStorage = join(workerBaseStorage, 'users', userKey);
-        
-        // Ensure user directory exists
-        await fs.mkdir(userSpecificStorage, { recursive: true });
-        
-        // Merge parent config with loaded config
+	      if (requiresParentConfig) {
+	        if (!parentConfig) {
+	          const message = 'Missing required parent config (nostr keys). Worker cannot start.'
+	          console.error('[Worker] ' + message)
+	          sendWorkerStatus('error', message, { error: new Error(message) })
+	          sendMessage({ type: 'error', message })
+	          await new Promise(resolve => setTimeout(resolve, 25))
+	          process.exit(1)
+	        }
+
+	        if (!isHex64(parentConfig.nostr_pubkey_hex) || !isHex64(parentConfig.nostr_nsec_hex)) {
+	          const message = 'Invalid parent config (expected nostr_pubkey_hex + nostr_nsec_hex). Worker cannot start.'
+	          console.error('[Worker] ' + message)
+	          sendWorkerStatus('error', message, { error: new Error(message) })
+	          sendMessage({ type: 'error', message })
+	          await new Promise(resolve => setTimeout(resolve, 25))
+	          process.exit(1)
+	        }
+	      }
+
+	      if (parentConfig) {
+	        storedParentConfig = parentConfig
+	        configReceived = true
+
+	        // Get user key from parent config
+        const userKey = getUserKey(parentConfig)
+        console.log('[Worker] User key:', userKey)
+
+        const userSpecificStorage = join(defaultStorageDir, 'users', userKey)
+        await fs.mkdir(userSpecificStorage, { recursive: true })
+
+        // Set global user config for profile manager early (so downstream modules use correct scope)
+        global.userConfig = { userKey, storage: userSpecificStorage }
+
+        // Load or create configuration *within user-specific storage*
+        config = await loadOrCreateConfig(userSpecificStorage)
+
+        // Merge parent config with loaded config (parent values win for identity fields)
         config = {
           ...config,
           ...parentConfig,
-          storage: userSpecificStorage,  // Use user-specific path in worker's storage
-          userKey: userKey  // Store for reference
-        };
-        
-        console.log('[Worker] Merged config with user-specific storage:', {
-          ...config,
-          storage: config.storage,
-          userKey: config.userKey
-        });
+          storage: userSpecificStorage,
+          userKey
+        }
+
+        // Derive deterministic proxy identity in worker (matches legacy design intent)
+        try {
+          ensureProxyIdentity(config)
+        } catch (error) {
+          console.warn('[Worker] Failed to ensure proxy identity:', error?.message || error)
+        }
 
         const derivedSwarmKey = deriveSwarmPublicKey(config)
         if (derivedSwarmKey) {
@@ -2147,17 +2409,55 @@ async function main() {
           gatewayService?.setOwnPeerPublicKey(derivedSwarmKey)
         }
 
-        // Set global user config for profile manager
-        global.userConfig = {
-            userKey: config.userKey,
-            storage: config.storage
-        };
+        expectedRelayCount = Array.isArray(config.relays) ? config.relays.length : 0
 
-        console.log('[Worker] Set global user config for profile operations');
+        sendConfigAppliedV1({
+          user: {
+            pubkeyHex: config.nostr_pubkey_hex || null,
+            userKey
+          },
+          storage: {
+            baseDir: defaultStorageDir,
+            userDir: userSpecificStorage,
+            configPath
+          },
+          proxy: {
+            swarmPublicKey: config.swarmPublicKey || null,
+            derivation: {
+              scheme: 'pbkdf2-sha256-ed25519',
+              salt: PROXY_DERIVATION_CONTEXT,
+              iterations: PROXY_DERIVATION_ITERATIONS,
+              dkLen: PROXY_DERIVATION_DKLEN_BYTES
+            }
+          },
+          network: {
+            gatewayUrl: config.gatewayUrl,
+            proxyHost: config.proxy_server_address,
+            proxyWebsocketProtocol: config.proxy_websocket_protocol === 'ws' ? 'ws' : 'wss'
+          }
+        })
 
-        await loadRelayMembers();
-        await loadRelayKeyMappings();
+        sendWorkerStatus('config-applied', 'Config applied. Initializing…', {
+          statePatch: {
+            user: {
+              pubkeyHex: config.nostr_pubkey_hex || null,
+              userKey
+            },
+            relays: { expected: expectedRelayCount, active: 0 }
+          }
+        })
+
+        console.log('[Worker] Set global user config for profile operations')
+
+        await loadRelayMembers()
+        await loadRelayKeyMappings()
+      } else {
+        // Load or create configuration (no parent config provided)
+        config = await loadOrCreateConfig()
+        expectedRelayCount = Array.isArray(config.relays) ? config.relays.length : 0
       }
+
+    await initializeGatewayOptionsFromSettings()
 
     global.userConfig = global.userConfig || { storage: config.storage };
 
@@ -2176,13 +2476,13 @@ async function main() {
       })
     }
 
-    if ((!hadDriveKey && config.driveKey) || (!hadPfpDriveKey && config.pfpDriveKey)) {
-      try {
-        await fs.writeFile(configPath, JSON.stringify(config, null, 2));
-      } catch (err) {
-        console.error('[Worker] Failed to persist hyperdrive keys:', err);
-      }
-    }
+	    if ((!hadDriveKey && config.driveKey) || (!hadPfpDriveKey && config.pfpDriveKey)) {
+	      try {
+	        await fs.writeFile(configPath, JSON.stringify(sanitizeConfigForDisk(config), null, 2));
+	      } catch (err) {
+	        console.error('[Worker] Failed to persist hyperdrive keys:', err);
+	      }
+	    }
 
     if (config.driveKey) {
       sendMessage({ type: 'drive-key', driveKey: config.driveKey });
@@ -2214,19 +2514,25 @@ async function main() {
       console.warn('[Worker] Blind peering manager failed to start:', error?.message || error)
     }
 
-    sendMessage({
-      type: 'status',
-      message: 'Loading relay server...',
-      config: {
-        port: config.port,
-        proxy_server_address: config.proxy_server_address,
-        gatewayUrl: config.gatewayUrl,
-        registerWithGateway: config.registerWithGateway
-      }
-    })
-    
-    // Import and initialize the Hyperswarm-based relay server
-    try {
+	    sendMessage({
+	      type: 'status',
+	      message: 'Loading relay server...',
+	      config: {
+	        port: config.port,
+	        proxy_server_address: config.proxy_server_address,
+	        gatewayUrl: config.gatewayUrl,
+	        registerWithGateway: config.registerWithGateway
+	      }
+	    })
+	    sendWorkerStatus('initializing', 'Loading relay server…', {
+	      statePatch: {
+	        relays: { expected: expectedRelayCount },
+	        gateway: { ready: false, running: false }
+	      }
+	    })
+	    
+	    // Import and initialize the Hyperswarm-based relay server
+	    try {
       console.log('[Worker] Importing Hyperswarm relay server module...')
       relayServer = await import('./pear-relay-server.mjs')
       
@@ -2241,32 +2547,43 @@ async function main() {
         gatewayService?.setOwnPeerPublicKey(derivedSwarmKey)
       }
 
-      const gatewayReadyPromise = (async () => {
-        try {
-          console.log('[Worker] Starting gateway service before auto-connecting relays...')
-          await startGatewayService()
-          const ready = await waitForGatewayReady()
-          if (!ready) {
-            console.warn('[Worker] Gateway did not report ready status within timeout; proceeding cautiously')
-          }
-          return ready
-        } catch (gatewayError) {
-          console.error('[Worker] Failed to auto-start gateway:', gatewayError)
-          sendMessage({ type: 'gateway-error', message: gatewayError.message })
-          return false
-        }
-      })()
+	      const gatewayReadyPromise = (async () => {
+	        try {
+	          console.log('[Worker] Starting gateway service before auto-connecting relays...')
+	          sendWorkerStatus('gateway-starting', 'Starting gateway…')
+	          await startGatewayService()
+	          const ready = await waitForGatewayReady()
+	          if (!ready) {
+	            console.warn('[Worker] Gateway did not report ready status within timeout; proceeding cautiously')
+	          }
+	          sendWorkerStatus('gateway-ready', ready ? 'Gateway ready.' : 'Gateway not ready (timeout).', {
+	            statePatch: { gateway: { ready: !!ready, running: !!ready } }
+	          })
+	          return ready
+	        } catch (gatewayError) {
+	          console.error('[Worker] Failed to auto-start gateway:', gatewayError)
+	          sendMessage({ type: 'gateway-error', message: gatewayError.message })
+	          sendWorkerStatus('error', 'Gateway start failed', {
+	            error: gatewayError,
+	            statePatch: { gateway: { ready: false, running: false } }
+	          })
+	          return false
+	        }
+	      })()
 
       global.waitForGatewayReady = () => gatewayReadyPromise
 
-      const connectRelaysPromise = (async () => {
-        try {
-          return await relayServer.connectStoredRelays()
-        } catch (connectError) {
-          console.error('[Worker] Failed to auto-connect stored relays:', connectError)
-          return []
-        }
-      })()
+	      const connectRelaysPromise = (async () => {
+	        try {
+	          sendWorkerStatus('relays-loading', 'Loading relays…', {
+	            statePatch: { relays: { expected: expectedRelayCount, active: 0 } }
+	          })
+	          return await relayServer.connectStoredRelays()
+	        } catch (connectError) {
+	          console.error('[Worker] Failed to auto-connect stored relays:', connectError)
+	          return []
+	        }
+	      })()
 
       const [connectedRelaysRaw, gatewayReadyResult] = await Promise.all([connectRelaysPromise, gatewayReadyPromise])
       const connectedRelays = Array.isArray(connectedRelaysRaw) ? connectedRelaysRaw : []
@@ -2283,34 +2600,46 @@ async function main() {
         console.warn('[Worker] Gateway metadata sync failed (auto-connect-complete):', syncError?.message || syncError)
       }
 
-      if (!isShuttingDown) {
-        sendMessage({
-          type: 'status',
-          message: 'Relay server running with Hyperswarm',
-          initialized: true,
-          config: {
-            port: config.port,
-            proxy_server_address: config.proxy_server_address,
-            gatewayUrl: config.gatewayUrl,
-            registerWithGateway: config.registerWithGateway,
-            relayCount: Array.isArray(connectedRelays) ? connectedRelays.length : (config.relays?.length || 0),
-            mode: 'hyperswarm',
-            gatewayReady
-          }
-        })
+	      if (!isShuttingDown) {
+	        sendMessage({
+	          type: 'status',
+	          message: 'Relay server running with Hyperswarm',
+	          initialized: true,
+	          config: {
+	            port: config.port,
+	            proxy_server_address: config.proxy_server_address,
+	            gatewayUrl: config.gatewayUrl,
+	            registerWithGateway: config.registerWithGateway,
+	            relayCount: Array.isArray(connectedRelays) ? connectedRelays.length : (config.relays?.length || 0),
+	            mode: 'hyperswarm',
+	            gatewayReady
+	          }
+	        })
+	        sendWorkerStatus('ready', 'Relay server running with Hyperswarm', {
+	          legacy: { initialized: true },
+	          statePatch: {
+	            app: { initialized: true },
+	            gateway: { ready: gatewayReady, running: gatewayReady },
+	            relays: {
+	              expected: expectedRelayCount,
+	              active: Array.isArray(connectedRelays) ? connectedRelays.length : 0
+	            }
+	          }
+	        })
+	
+	        console.log('[Worker] Sent status message with initialized=true')
+	      }
 
-        console.log('[Worker] Sent status message with initialized=true')
-      }
-
-    } catch (error) {
-      console.error('[Worker] Failed to start relay server:', error)
-      console.log('[Worker] Make sure pear-relay-server.mjs is in the worker directory')
-      
-      sendMessage({ 
-        type: 'error', 
-        message: `Failed to start relay server: ${error.message}` 
-      })
-    }
+	    } catch (error) {
+	      console.error('[Worker] Failed to start relay server:', error)
+	      console.log('[Worker] Make sure pear-relay-server.mjs is in the worker directory')
+	      sendWorkerStatus('error', 'Failed to start relay server', { error })
+	      
+	      sendMessage({ 
+	        type: 'error', 
+	        message: `Failed to start relay server: ${error.message}` 
+	      })
+	    }
 
     setInterval(() => {
       if (!isShuttingDown) {
@@ -2349,14 +2678,15 @@ async function main() {
       })
     }, 5000)
     
-  } catch (error) {
-    console.error('[Worker] Error starting relay server:', error)
-    sendMessage({ 
-      type: 'error', 
-      message: error.message 
-    })
-    process.exit(1)
-  }
+	  } catch (error) {
+	    console.error('[Worker] Error starting relay server:', error)
+	    sendWorkerStatus('error', 'Worker failed to start', { error })
+	    sendMessage({ 
+	      type: 'error', 
+	      message: error.message 
+	    })
+	    process.exit(1)
+	  }
 }
 
 // Start the worker

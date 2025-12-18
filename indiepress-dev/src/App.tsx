@@ -33,14 +33,14 @@ import { WorkerBridgeProvider } from './providers/WorkerBridgeProvider'
 
 export default function App(): JSX.Element {
   return (
-    <WorkerBridgeProvider>
-      <ScreenSizeProvider>
-        <UserPreferencesProvider>
-          <LinkPreviewHoverProvider>
-            <ThemeProvider>
-              <ContentPolicyProvider>
-                <DeletedEventProvider>
-                  <NostrProvider>
+    <ScreenSizeProvider>
+      <UserPreferencesProvider>
+        <LinkPreviewHoverProvider>
+          <ThemeProvider>
+            <ContentPolicyProvider>
+              <DeletedEventProvider>
+                <NostrProvider>
+                  <WorkerBridgeProvider>
                     <ZapProvider>
                       <TranslationServiceProvider>
                         <FavoriteRelaysProvider>
@@ -80,13 +80,13 @@ export default function App(): JSX.Element {
                         </FavoriteRelaysProvider>
                       </TranslationServiceProvider>
                     </ZapProvider>
-                  </NostrProvider>
-                </DeletedEventProvider>
-              </ContentPolicyProvider>
-            </ThemeProvider>
-          </LinkPreviewHoverProvider>
-        </UserPreferencesProvider>
-      </ScreenSizeProvider>
-    </WorkerBridgeProvider>
+                  </WorkerBridgeProvider>
+                </NostrProvider>
+              </DeletedEventProvider>
+            </ContentPolicyProvider>
+          </ThemeProvider>
+        </LinkPreviewHoverProvider>
+      </UserPreferencesProvider>
+    </ScreenSizeProvider>
   )
 }

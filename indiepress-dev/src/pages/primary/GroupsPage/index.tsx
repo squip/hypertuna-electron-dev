@@ -12,7 +12,7 @@ import { useSecondaryPage } from '@/PageManager'
 import { toGroup } from '@/lib/link'
 import GroupCreateDialog from '@/components/GroupCreateDialog'
 import { isElectron } from '@/lib/platform'
-import { electronIpc } from '@/services/electron-ipc.service'
+import { useWorkerBridge } from '@/providers/WorkerBridgeProvider'
 import { toast } from 'sonner'
 import {
   Dialog,
@@ -65,6 +65,7 @@ const GroupsPage = forwardRef<TPageRef>((_, ref) => {
   const desktopDownloadUrl =
     import.meta.env.VITE_DESKTOP_DOWNLOAD_URL || 'https://hypertuna.com/download'
   const isDesktop = isElectron()
+  const { sendToWorker } = useWorkerBridge()
 
   const filteredDiscovery = discoveryGroups.filter((g) => {
     if (!search.trim()) return true
@@ -337,7 +338,7 @@ const GroupsPage = forwardRef<TPageRef>((_, ref) => {
                   }
                   setRelayCreating(true)
                   try {
-                    const res = await electronIpc.sendToWorker({
+                    await sendToWorker({
                       type: 'create-relay',
                       data: {
                         name: relayName.trim(),
@@ -345,9 +346,8 @@ const GroupsPage = forwardRef<TPageRef>((_, ref) => {
                         isPublic: relayPublic
                       }
                     })
-                    if (!res?.success) throw new Error(res?.error || 'Create failed')
                     toast.success(t('Relay creation requested'))
-                    electronIpc.sendToWorker({ type: 'get-relays' }).catch(() => {})
+                    sendToWorker({ type: 'get-relays' }).catch(() => {})
                     setShowRelayCreate(false)
                     setRelayName('')
                     setRelayDescription('')
@@ -406,7 +406,7 @@ const GroupsPage = forwardRef<TPageRef>((_, ref) => {
                   setJoinBusy(true)
                   try {
                     const identifier = joinIdentifier.trim()
-                    const res = await electronIpc.sendToWorker({
+                    await sendToWorker({
                       type: 'join-relay',
                       data: {
                         relayKey: identifier || undefined,
@@ -414,9 +414,8 @@ const GroupsPage = forwardRef<TPageRef>((_, ref) => {
                         authToken: joinToken || undefined
                       }
                     })
-                    if (!res?.success) throw new Error(res?.error || 'Join failed')
                     toast.success(t('Join requested'))
-                    electronIpc.sendToWorker({ type: 'get-relays' }).catch(() => {})
+                    sendToWorker({ type: 'get-relays' }).catch(() => {})
                     setShowRelayJoin(false)
                     setJoinIdentifier('')
                     setJoinToken('')

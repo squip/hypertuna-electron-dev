@@ -5,9 +5,10 @@ import SecondaryPageLayout from '@/layouts/SecondaryPageLayout'
 import { forwardRef, useEffect, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { isElectron } from '@/lib/platform'
-import RelayManagerPanel from '@/components/settings/RelayManagerPanel'
-import GatewaySettingsPanel from '@/components/settings/GatewaySettingsPanel'
-import PublicGatewayPanel from '@/components/settings/PublicGatewayPanel'
+import WorkerControlPanel from '@/components/Settings/WorkerControlPanel'
+import RelayManagerPanel from '@/components/Settings/RelayManagerPanel'
+import GatewaySettingsPanel from '@/components/Settings/GatewaySettingsPanel'
+import PublicGatewayPanel from '@/components/Settings/PublicGatewayPanel'
 
 const RelaySettingsPage = forwardRef(({ index }: { index?: number }, ref) => {
   const { t } = useTranslation()
@@ -44,6 +45,7 @@ const RelaySettingsPage = forwardRef(({ index }: { index?: number }, ref) => {
         </TabsContent>
         {hasDesktop && (
           <TabsContent value="hypertuna-desktop" className="space-y-4">
+            <WorkerControlPanel />
             <RelayManagerPanel />
             <GatewaySettingsPanel />
             <PublicGatewayPanel />

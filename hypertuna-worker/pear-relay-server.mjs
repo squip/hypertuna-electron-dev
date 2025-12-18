@@ -279,9 +279,27 @@ function generateHexKey() {
   return crypto.randomBytes(32).toString('hex');
 }
 
+function sanitizeConfigForDisk(configData) {
+  if (!configData || typeof configData !== 'object') return configData;
+  const sanitized = { ...configData };
+
+  // Never persist nostr private keys (memory-only).
+  delete sanitized.nostr_nsec;
+  delete sanitized.nostr_nsec_hex;
+  delete sanitized.nostr_nsec_bech32;
+
+  // Never persist proxy key material (re-derived from nostr_nsec_hex at runtime).
+  delete sanitized.proxy_seed;
+  delete sanitized.proxy_privateKey;
+  delete sanitized.proxy_private_key;
+  delete sanitized.proxySecretKey;
+
+  return sanitized;
+}
+
 async function saveConfig(configData) {
   const configPath = join(config.storage || '.', 'relay-config.json');
-  await fs.writeFile(configPath, JSON.stringify(configData, null, 2));
+  await fs.writeFile(configPath, JSON.stringify(sanitizeConfigForDisk(configData), null, 2));
   console.log('[RelayServer] Config saved to:', configPath);
 }
 
@@ -297,7 +315,7 @@ async function startHyperswarmServer() {
     // Persist the generated public key so it can be read on next start
     await saveConfig(config);
     
-    console.log('[RelayServer] Generated keypair from seed:', config.proxy_seed);
+    console.log('[RelayServer] Generated keypair from seed (redacted)');
     console.log('[RelayServer] Hyperswarm Peer Public key:', config.swarmPublicKey);
     
     // Initialize Hyperswarm

@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import { useWorkerBridge } from '@/providers/WorkerBridgeProvider'
-import { electronIpc, GatewayStatus } from '@/services/electron-ipc.service'
+import { electronIpc } from '@/services/electron-ipc.service'
 import { isElectron } from '@/lib/platform'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
@@ -8,8 +8,7 @@ import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 
 export default function GatewaySettingsPanel() {
-  const { gatewayStatus, gatewayLogs, lastError } = useWorkerBridge()
-  const [manualStatus, setManualStatus] = useState<GatewayStatus | null>(null)
+  const { gatewayStatus, gatewayLogs, lastError, sendToWorker } = useWorkerBridge()
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [gatewayUrl, setGatewayUrl] = useState('')
@@ -43,15 +42,14 @@ export default function GatewaySettingsPanel() {
     )
   }
 
-  const status = manualStatus || gatewayStatus
+  const status = gatewayStatus
 
   const refreshStatus = async () => {
     setBusy(true)
     setError(null)
     try {
-      const res = await electronIpc.getGatewayStatus()
-      if (res?.success) setManualStatus(res.status || null)
-      else setError(res?.status ? 'Gateway unavailable' : 'Failed to fetch status')
+      await sendToWorker({ type: 'get-gateway-status' })
+      await sendToWorker({ type: 'get-gateway-logs' })
     } catch (err: any) {
       setError(err?.message || 'Failed to fetch status')
     } finally {
@@ -63,9 +61,8 @@ export default function GatewaySettingsPanel() {
     setBusy(true)
     setError(null)
     try {
-      const res = await electronIpc.startGateway({})
-      if (!res?.success) throw new Error(res?.error || 'Start failed')
-      await refreshStatus()
+      await sendToWorker({ type: 'start-gateway', options: {} })
+      await refreshStatus().catch(() => {})
     } catch (err: any) {
       setError(err?.message || 'Failed to start gateway')
     } finally {
@@ -77,9 +74,8 @@ export default function GatewaySettingsPanel() {
     setBusy(true)
     setError(null)
     try {
-      const res = await electronIpc.stopGateway()
-      if (!res?.success) throw new Error(res?.error || 'Stop failed')
-      await refreshStatus()
+      await sendToWorker({ type: 'stop-gateway' })
+      await refreshStatus().catch(() => {})
     } catch (err: any) {
       setError(err?.message || 'Failed to stop gateway')
     } finally {

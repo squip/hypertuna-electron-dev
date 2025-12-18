@@ -23,7 +23,7 @@ import {
   TPublishOptions,
   TRelayList
 } from '@/types'
-import { hexToBytes } from '@noble/hashes/utils'
+import { bytesToHex, hexToBytes } from '@noble/hashes/utils'
 import dayjs from 'dayjs'
 import { Event, VerifiedEvent } from '@nostr/tools/wasm'
 import * as kinds from '@nostr/tools/kinds'
@@ -59,6 +59,7 @@ type TNostrContext = {
   isInitialized: boolean
   isReady: boolean
   pubkey: string | null
+  nsecHex: string | null
   profile: NostrUser | null
   relayList: TRelayList | null
   followList: string[]
@@ -122,6 +123,7 @@ export function NostrProvider({ children }: { children: React.ReactNode }) {
   const [account, setAccount] = useState<TAccountPointer | null>(null)
   const [nsec, setNsec] = useState<string | null>(null)
   const [ncryptsec, setNcryptsec] = useState<string | null>(null)
+  const [nsecHex, setNsecHex] = useState<string | null>(null)
   const [signer, setSigner] = useState<ISigner | null>(null)
   const [openLoginDialog, setOpenLoginDialog] = useState(false)
   const [profile, setProfile] = useState<NostrUser | null>(null)
@@ -172,19 +174,21 @@ export function NostrProvider({ children }: { children: React.ReactNode }) {
     }
   }, [])
 
-  useEffect(() => {
-    const globalSyncAbort = new AbortController()
+	  useEffect(() => {
+	    const globalSyncAbort = new AbortController()
 
-    // initialize current account
-    ;(async () => {
-      setRelayList(null)
-      setProfile(null)
-      setNsec(null)
-      setNotificationsSeenAt(-1)
+	    // initialize current account
+	    ;(async () => {
+	      setRelayList(null)
+	      setProfile(null)
+	      setNsec(null)
+	      setNcryptsec(null)
+	      setNotificationsSeenAt(-1)
 
-      if (!account) {
-        return
-      }
+	      if (!account) {
+	        setNsecHex(null)
+	        return
+	      }
 
       const storedNsec = storage.getAccountNsec(account.pubkey)
       if (storedNsec) {
@@ -341,7 +345,12 @@ export function NostrProvider({ children }: { children: React.ReactNode }) {
     }
   }
 
-  const login = async (signer: ISigner, act: TAccount, shouldWipeFollowedByIndexes: boolean) => {
+  const login = async (
+    signer: ISigner,
+    act: TAccount,
+    shouldWipeFollowedByIndexes: boolean,
+    { nsecHex }: { nsecHex: string | null }
+  ) => {
     setIsReady(false)
 
     if (shouldWipeFollowedByIndexes) {
@@ -355,6 +364,7 @@ export function NostrProvider({ children }: { children: React.ReactNode }) {
 
     setAccount({ pubkey: act.pubkey, signerType: act.signerType })
     setSigner(signer)
+    setNsecHex(nsecHex)
     return act.pubkey
   }
 
@@ -364,6 +374,7 @@ export function NostrProvider({ children }: { children: React.ReactNode }) {
     if (account?.pubkey === act.pubkey) {
       setAccount(null)
       setSigner(null)
+      setNsecHex(null)
     }
   }
 
@@ -372,6 +383,7 @@ export function NostrProvider({ children }: { children: React.ReactNode }) {
       storage.switchAccount(null)
       setAccount(null)
       setSigner(null)
+      setNsecHex(null)
       return
     }
     await loginWithAccountPointer(act, false)
@@ -392,11 +404,17 @@ export function NostrProvider({ children }: { children: React.ReactNode }) {
       throw new Error('invalid nsec or hex')
     }
     const pubkey = nsecSigner.login(privkey)!
+    const nsecHex = bytesToHex(privkey)
     if (password) {
       const ncryptsec = nip49.encrypt(privkey, password)
-      login(nsecSigner, { pubkey, signerType: 'ncryptsec', ncryptsec }, true)
+      await login(nsecSigner, { pubkey, signerType: 'ncryptsec', ncryptsec }, true, { nsecHex })
     } else {
-      login(nsecSigner, { pubkey, signerType: 'nsec', nsec: nip19.nsecEncode(privkey) }, true)
+      await login(
+        nsecSigner,
+        { pubkey, signerType: 'nsec', nsec: nip19.nsecEncode(privkey) },
+        true,
+        { nsecHex }
+      )
     }
     if (needSetup) {
       setupNewUser(nsecSigner)
@@ -410,15 +428,16 @@ export function NostrProvider({ children }: { children: React.ReactNode }) {
       throw new Error('Password is required')
     }
     const privkey = nip49.decrypt(ncryptsec, password)
+    const nsecHex = bytesToHex(privkey)
     const browserNsecSigner = new NsecSigner()
     const pubkey = browserNsecSigner.login(privkey)!
-    return login(browserNsecSigner, { pubkey, signerType: 'ncryptsec', ncryptsec }, true)
+    return login(browserNsecSigner, { pubkey, signerType: 'ncryptsec', ncryptsec }, true, { nsecHex })
   }
 
   const npubLogin = async (npub: string) => {
     const npubSigner = new NpubSigner()
     const pubkey = npubSigner.login(npub)
-    return login(npubSigner, { pubkey, signerType: 'npub', npub }, true)
+    return login(npubSigner, { pubkey, signerType: 'npub', npub }, true, { nsecHex: null })
   }
 
   const nip07Login = async () => {
@@ -429,7 +448,7 @@ export function NostrProvider({ children }: { children: React.ReactNode }) {
       if (!pubkey) {
         throw new Error('You did not allow to access your pubkey')
       }
-      return login(nip07Signer, { pubkey, signerType: 'nip-07' }, true)
+      return login(nip07Signer, { pubkey, signerType: 'nip-07' }, true, { nsecHex: null })
     } catch (err) {
       toast.error(t('Login failed') + ': ' + (err as Error).message)
       throw err
@@ -452,7 +471,8 @@ export function NostrProvider({ children }: { children: React.ReactNode }) {
         bunker: bunkerUrl.toString(),
         bunkerClientSecretKey: bunkerSigner.getClientSecretKey()
       },
-      true
+      true,
+      { nsecHex: null }
     )
   }
 
@@ -472,7 +492,8 @@ export function NostrProvider({ children }: { children: React.ReactNode }) {
         bunker: bunkerUrl.toString(),
         bunkerClientSecretKey: bunkerSigner.getClientSecretKey()
       },
-      true
+      true,
+      { nsecHex: null }
     )
   }
 
@@ -486,6 +507,8 @@ export function NostrProvider({ children }: { children: React.ReactNode }) {
     }
     if (account.signerType === 'nsec' || account.signerType === 'browser-nsec') {
       if (account.nsec) {
+        const { type, data } = nip19.decode(account.nsec)
+        const nsecHex = type === 'nsec' ? bytesToHex(data) : null
         const browserNsecSigner = new NsecSigner()
         browserNsecSigner.login(account.nsec)
         // Migrate to nsec
@@ -494,7 +517,7 @@ export function NostrProvider({ children }: { children: React.ReactNode }) {
           account = { ...account, signerType: 'nsec' }
           storage.addAccount(account)
         }
-        return login(browserNsecSigner, account, !wasCurrent)
+        return login(browserNsecSigner, account, !wasCurrent, { nsecHex })
       }
     } else if (account.signerType === 'ncryptsec') {
       if (account.ncryptsec) {
@@ -503,14 +526,15 @@ export function NostrProvider({ children }: { children: React.ReactNode }) {
           return null
         }
         const privkey = nip49.decrypt(account.ncryptsec, password)
+        const nsecHex = bytesToHex(privkey)
         const browserNsecSigner = new NsecSigner()
         browserNsecSigner.login(privkey)
-        return login(browserNsecSigner, account, !wasCurrent)
+        return login(browserNsecSigner, account, !wasCurrent, { nsecHex })
       }
     } else if (account.signerType === 'nip-07') {
       const nip07Signer = new Nip07Signer()
       await nip07Signer.init()
-      return login(nip07Signer, account, !wasCurrent)
+      return login(nip07Signer, account, !wasCurrent, { nsecHex: null })
     } else if (account.signerType === 'bunker') {
       if (account.bunker && account.bunkerClientSecretKey) {
         const bunkerSigner = new BunkerSigner(account.bunkerClientSecretKey)
@@ -524,7 +548,7 @@ export function NostrProvider({ children }: { children: React.ReactNode }) {
           account = { ...account, pubkey }
           storage.addAccount(account)
         }
-        return login(bunkerSigner, account, !wasCurrent)
+        return login(bunkerSigner, account, !wasCurrent, { nsecHex: null })
       }
     } else if (account.signerType === 'npub' && account.npub) {
       const npubSigner = new NpubSigner()
@@ -538,7 +562,7 @@ export function NostrProvider({ children }: { children: React.ReactNode }) {
         account = { ...account, pubkey }
         storage.addAccount(account)
       }
-      return login(npubSigner, account, !wasCurrent)
+      return login(npubSigner, account, !wasCurrent, { nsecHex: null })
     }
     storage.removeAccount(account)
     return null
@@ -710,16 +734,17 @@ export function NostrProvider({ children }: { children: React.ReactNode }) {
     }
   }
 
-  return (
-    <NostrContext.Provider
-      value={{
-        isInitialized,
-        isReady,
-        pubkey: account?.pubkey ?? null,
-        profile,
-        relayList,
-        followList,
-        muteList,
+	  return (
+	    <NostrContext.Provider
+	      value={{
+	        isInitialized,
+	        isReady,
+	        pubkey: account?.pubkey ?? null,
+	        nsecHex,
+	        profile,
+	        relayList,
+	        followList,
+	        muteList,
         bookmarkList,
         favoriteRelays,
         userEmojiList,

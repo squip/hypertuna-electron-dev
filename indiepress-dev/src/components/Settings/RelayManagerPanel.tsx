@@ -1,6 +1,5 @@
 import { FormEvent, useMemo, useState } from 'react'
 import { useWorkerBridge } from '@/providers/WorkerBridgeProvider'
-import { electronIpc } from '@/services/electron-ipc.service'
 import { isElectron } from '@/lib/platform'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
@@ -30,7 +29,7 @@ export default function RelayManagerPanel() {
   const [joinKey, setJoinKey] = useState('')
   const [joinToken, setJoinToken] = useState('')
   const [joinBusy, setJoinBusy] = useState(false)
-  const { relays, lastError } = useWorkerBridge()
+  const { relays, lastError, sendToWorker } = useWorkerBridge()
   const desktopDownloadUrl = useMemo(
     () => import.meta.env.VITE_DESKTOP_DOWNLOAD_URL || 'https://hypertuna.com/download',
     []
@@ -85,7 +84,7 @@ export default function RelayManagerPanel() {
     setBusy(true)
     setError(null)
     try {
-      await electronIpc.sendToWorker({ type: 'get-relays' })
+      await sendToWorker({ type: 'get-relays' })
     } catch (err: any) {
       setError(err?.message || 'Failed to refresh relays')
     } finally {
@@ -98,7 +97,7 @@ export default function RelayManagerPanel() {
     setCreateBusy(true)
     setError(null)
     try {
-      const res = await electronIpc.sendToWorker({
+      await sendToWorker({
         type: 'create-relay',
         data: {
           name: createName || undefined,
@@ -106,7 +105,6 @@ export default function RelayManagerPanel() {
           isPublic: createPublic
         }
       })
-      if (!res?.success) throw new Error(res?.error || 'Create failed')
       setCreateOpen(false)
       setCreateName('')
       setCreateDescription('')
@@ -124,7 +122,7 @@ export default function RelayManagerPanel() {
     setError(null)
     try {
       const identifier = joinKey.trim()
-      const res = await electronIpc.sendToWorker({
+      await sendToWorker({
         type: 'join-relay',
         data: {
           relayKey: identifier || undefined,
@@ -132,7 +130,6 @@ export default function RelayManagerPanel() {
           authToken: joinToken || undefined
         }
       })
-      if (!res?.success) throw new Error(res?.error || 'Join failed')
       setJoinOpen(false)
       setJoinKey('')
       setJoinToken('')

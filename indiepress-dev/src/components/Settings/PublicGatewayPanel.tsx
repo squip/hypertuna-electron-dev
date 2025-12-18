@@ -1,6 +1,5 @@
-import { useEffect, useState } from 'react'
+import { useState } from 'react'
 import { useWorkerBridge } from '@/providers/WorkerBridgeProvider'
-import { electronIpc, PublicGatewayStatus } from '@/services/electron-ipc.service'
 import { isElectron } from '@/lib/platform'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
@@ -8,13 +7,11 @@ import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 
 export default function PublicGatewayPanel() {
-  const { publicGatewayStatus, lastError } = useWorkerBridge()
-  const [manualStatus, setManualStatus] = useState<PublicGatewayStatus | null>(null)
+  const { publicGatewayStatus, publicGatewayToken, lastError, sendToWorker } = useWorkerBridge()
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [tokenRelayKey, setTokenRelayKey] = useState('')
   const [tokenTtl, setTokenTtl] = useState(3600)
-  const [tokenResult, setTokenResult] = useState<string | null>(null)
 
   if (!isElectron()) {
     return (
@@ -27,15 +24,22 @@ export default function PublicGatewayPanel() {
     )
   }
 
-  const status = manualStatus || publicGatewayStatus
+  const status = publicGatewayStatus
+  const tokenExpiresText = (() => {
+    const expiresAt = publicGatewayToken?.expiresAt
+    if (!expiresAt) return null
+    try {
+      return new Date(expiresAt).toLocaleString()
+    } catch (_) {
+      return String(expiresAt)
+    }
+  })()
 
   const refreshStatus = async () => {
     setBusy(true)
     setError(null)
     try {
-      const res = await electronIpc.getPublicGatewayStatus()
-      if (res?.success) setManualStatus(res.status || null)
-      else setError('Failed to fetch status')
+      await sendToWorker({ type: 'get-public-gateway-status' })
     } catch (err: any) {
       setError(err?.message || 'Failed to fetch status')
     } finally {
@@ -47,19 +51,14 @@ export default function PublicGatewayPanel() {
     setBusy(true)
     setError(null)
     try {
-      const res = await electronIpc.refreshPublicGatewayAll()
-      if (!res?.success) throw new Error(res?.error || 'Refresh failed')
-      await refreshStatus()
+      await sendToWorker({ type: 'refresh-public-gateway-all' })
+      await refreshStatus().catch(() => {})
     } catch (err: any) {
       setError(err?.message || 'Failed to refresh')
     } finally {
       setBusy(false)
     }
   }
-
-  useEffect(() => {
-    setTokenResult(null)
-  }, [manualStatus, publicGatewayStatus])
 
   return (
     <div className="rounded-lg border border-border/50 bg-muted/30 p-4 space-y-3">
@@ -135,14 +134,12 @@ export default function PublicGatewayPanel() {
             onClick={async () => {
               setBusy(true)
               setError(null)
-              setTokenResult(null)
               try {
-                const res = await electronIpc.generatePublicGatewayToken({
+                await sendToWorker({
+                  type: 'generate-public-gateway-token',
                   relayKey: tokenRelayKey || undefined,
                   ttlSeconds: tokenTtl || undefined
                 })
-                if (!res?.success) throw new Error(res?.error || 'Token generation failed')
-                setTokenResult('Token issued. Check worker messages for details.')
               } catch (err: any) {
                 setError(err?.message || 'Failed to issue token')
               } finally {
@@ -153,8 +150,36 @@ export default function PublicGatewayPanel() {
           >
             {busy ? 'Issuing…' : 'Generate token'}
           </Button>
-          {tokenResult && <div className="text-sm text-muted-foreground">{tokenResult}</div>}
         </div>
+        {publicGatewayToken && (
+          <div className="rounded-md border border-border/50 bg-background/60 p-3 space-y-2 text-xs">
+            <div className="flex items-center justify-between gap-2">
+              <div className="font-medium truncate">Token for {publicGatewayToken.relayKey}</div>
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={() => {
+                  const url = publicGatewayToken.connectionUrl
+                  if (!url) return
+                  navigator.clipboard?.writeText?.(url).catch(() => {})
+                }}
+              >
+                Copy URL
+              </Button>
+            </div>
+            {tokenExpiresText && (
+              <div className="text-muted-foreground">Expires: {tokenExpiresText}</div>
+            )}
+            <div className="break-all">
+              <span className="text-muted-foreground">URL: </span>
+              {publicGatewayToken.connectionUrl}
+            </div>
+            <div className="break-all">
+              <span className="text-muted-foreground">Token: </span>
+              {publicGatewayToken.token}
+            </div>
+          </div>
+        )}
       </div>
     </div>
   )

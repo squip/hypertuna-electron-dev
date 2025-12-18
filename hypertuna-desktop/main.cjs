@@ -11,6 +11,56 @@ let gatewayLogsCache = [];
 let publicGatewayConfigCache = null;
 let publicGatewayStatusCache = null;
 
+function isHex64(value) {
+  return typeof value === 'string' && /^[a-fA-F0-9]{64}$/.test(value);
+}
+
+function normalizeWorkerConfigPayload(payload) {
+  if (!payload || typeof payload !== 'object') return null;
+  const base = payload.type === 'config' && payload.data && typeof payload.data === 'object'
+    ? payload.data
+    : payload;
+  const normalized = { ...base };
+
+  // Allow camelCase keys from newer renderers, but keep snake_case as canonical for the worker.
+  if (!normalized.nostr_pubkey_hex && normalized.nostrPubkeyHex) {
+    normalized.nostr_pubkey_hex = normalized.nostrPubkeyHex;
+  }
+  if (!normalized.nostr_nsec_hex && normalized.nostrNsecHex) {
+    normalized.nostr_nsec_hex = normalized.nostrNsecHex;
+  }
+
+  return normalized;
+}
+
+function validateWorkerConfigPayload(payload) {
+  if (!payload) return null;
+  if (!isHex64(payload.nostr_pubkey_hex) || !isHex64(payload.nostr_nsec_hex)) {
+    return 'Invalid worker config: expected nostr_pubkey_hex and nostr_nsec_hex (64-char hex)';
+  }
+  return null;
+}
+
+function sendWorkerConfigToProcess(proc, payload) {
+  if (!proc || typeof proc.send !== 'function') {
+    return { success: false, error: 'Worker IPC channel unavailable' };
+  }
+  try {
+    proc.send({ type: 'config', data: payload });
+    // Safety resend (mirrors legacy renderer behavior) in case IPC ordering is delayed.
+    setTimeout(() => {
+      if (!workerProcess || workerProcess !== proc) return;
+      try {
+        proc.send({ type: 'config', data: payload });
+      } catch (_) {}
+    }, 1000);
+    return { success: true };
+  } catch (error) {
+    console.error('[Main] Failed to send config to worker', error);
+    return { success: false, error: error.message };
+  }
+}
+
 const userDataPath = app.getPath('userData');
 const storagePath = path.join(userDataPath, 'hypertuna-data');
 const logFilePath = path.join(storagePath, 'desktop-console.log');
@@ -93,9 +143,22 @@ function createWindow() {
   }
 }
 
-async function startWorkerProcess() {
+async function startWorkerProcess(workerConfig = null) {
+  const normalizedConfig = normalizeWorkerConfigPayload(workerConfig);
+  const validationError = validateWorkerConfigPayload(normalizedConfig);
+  if (validationError) {
+    return { success: false, error: validationError };
+  }
+
   if (workerProcess) {
-    return { success: false, error: 'Worker already running' };
+    if (normalizedConfig) {
+      const configResult = sendWorkerConfigToProcess(workerProcess, normalizedConfig);
+      if (!configResult.success) {
+        return { success: false, error: configResult.error || 'Failed to send config to running worker' };
+      }
+      return { success: true, alreadyRunning: true, configSent: true };
+    }
+    return { success: true, alreadyRunning: true, configSent: false };
   }
 
   const workerRoot = path.join(__dirname, '..', 'hypertuna-worker');
@@ -197,7 +260,20 @@ async function startWorkerProcess() {
       pendingWorkerMessages = [];
     }
 
-    return { success: true };
+    let configSent = false;
+    if (normalizedConfig) {
+      const configResult = sendWorkerConfigToProcess(workerProcess, normalizedConfig);
+      if (!configResult.success) {
+        try {
+          workerProcess.kill();
+        } catch (_) {}
+        workerProcess = null;
+        return { success: false, error: configResult.error || 'Failed to send config to worker' };
+      }
+      configSent = true;
+    }
+
+    return { success: true, configSent };
   } catch (error) {
     console.error('[Main] Failed to start worker', error);
     workerProcess = null;
@@ -236,8 +312,8 @@ function sendGatewayCommand(type, payload = {}) {
   }
 }
 
-ipcMain.handle('start-worker', async () => {
-  return startWorkerProcess();
+ipcMain.handle('start-worker', async (_event, config) => {
+  return startWorkerProcess(config);
 });
 
 ipcMain.handle('stop-worker', async () => {

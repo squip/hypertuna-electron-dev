@@ -28,7 +28,7 @@ function registerListener(channel) {
 }
 
 contextBridge.exposeInMainWorld('electronAPI', {
-  startWorker: () => ipcRenderer.invoke('start-worker'),
+  startWorker: (config) => ipcRenderer.invoke('start-worker', config),
   stopWorker: () => ipcRenderer.invoke('stop-worker'),
   sendToWorker: (message) => ipcRenderer.invoke('send-to-worker', message),
   onWorkerMessage: registerListener('worker-message'),

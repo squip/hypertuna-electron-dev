@@ -4,6 +4,7 @@
 import { isElectron } from '@/lib/platform'
 
 export type WorkerCommandResult = { success: boolean; error?: string }
+export type WorkerStartResult = WorkerCommandResult & { alreadyRunning?: boolean; configSent?: boolean }
 
 export type RelayEntry = {
   relayKey: string
@@ -59,7 +60,7 @@ export type PublicGatewayStatus = {
 }
 
 type ElectronAPI = {
-  startWorker: () => Promise<WorkerCommandResult>
+  startWorker: (config?: unknown) => Promise<WorkerStartResult>
   stopWorker: () => Promise<WorkerCommandResult>
   sendToWorker: (message: unknown) => Promise<WorkerCommandResult>
 
@@ -107,8 +108,8 @@ function unavailable<T = any>(): Promise<T> {
 export const electronIpc = {
   isElectron: () => isElectron(),
 
-  startWorker() {
-    return api()?.startWorker() ?? unavailable()
+  startWorker(config?: unknown) {
+    return api()?.startWorker(config) ?? unavailable()
   },
   stopWorker() {
     return api()?.stopWorker() ?? unavailable()
