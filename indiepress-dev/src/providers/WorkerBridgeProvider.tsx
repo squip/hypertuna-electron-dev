@@ -83,6 +83,55 @@ type PublicGatewayTokenResult = {
   sequence?: string | null
 }
 
+type JoinAuthProgress = 'request' | 'verify' | 'complete'
+
+type JoinFlowPhase =
+  | 'idle'
+  | 'starting'
+  | 'request'
+  | 'verify'
+  | 'complete'
+  | 'success'
+  | 'error'
+
+type JoinFlowState = {
+  publicIdentifier: string
+  phase: JoinFlowPhase
+  startedAt: number
+  updatedAt: number
+  hostPeers?: string[]
+  hostPeer?: string | null
+  relayKey?: string | null
+  authToken?: string | null
+  relayUrl?: string | null
+  error?: string | null
+}
+
+type RelayCreateRequest = {
+  name: string
+  description?: string
+  isPublic?: boolean
+  isOpen?: boolean
+  fileSharing?: boolean
+}
+
+type RelayCreatedPayload = {
+  success: boolean
+  relayKey?: string
+  publicIdentifier?: string
+  relayUrl?: string
+  authToken?: string
+  error?: string
+  name?: string
+  description?: string
+  isPublic?: boolean
+  isOpen?: boolean
+  fileSharing?: boolean
+  gatewayRegistration?: string
+  registrationError?: string
+  members?: string[]
+}
+
 type WorkerBridgeContextValue = {
   isElectron: boolean
   ready: boolean
@@ -97,6 +146,7 @@ type WorkerBridgeContextValue = {
   gatewayStatus: GatewayStatus | null
   publicGatewayStatus: PublicGatewayStatus | null
   publicGatewayToken: PublicGatewayTokenResult | null
+  joinFlows: Record<string, JoinFlowState>
   gatewayLogs: GatewayLogEntry[]
   workerStdout: string[]
   workerStderr: string[]
@@ -105,6 +155,9 @@ type WorkerBridgeContextValue = {
   stopWorker: () => Promise<void>
   restartWorker: () => Promise<void>
   sendToWorker: (message: unknown) => Promise<void>
+  createRelay: (data: RelayCreateRequest) => Promise<RelayCreatedPayload>
+  startJoinFlow: (publicIdentifier: string, opts?: { fileSharing?: boolean }) => Promise<void>
+  clearJoinFlow: (publicIdentifier: string) => void
 }
 
 const WorkerBridgeContext = createContext<WorkerBridgeContextValue | undefined>(undefined)
@@ -203,6 +256,7 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
   const [gatewayStatus, setGatewayStatus] = useState<GatewayStatus | null>(null)
   const [publicGatewayStatus, setPublicGatewayStatus] = useState<PublicGatewayStatus | null>(null)
   const [publicGatewayToken, setPublicGatewayToken] = useState<PublicGatewayTokenResult | null>(null)
+  const [joinFlows, setJoinFlows] = useState<Record<string, JoinFlowState>>({})
   const [gatewayLogs, setGatewayLogs] = useState<GatewayLogEntry[]>([])
   const [workerStdout, setWorkerStdout] = useState<string[]>([])
   const [workerStderr, setWorkerStderr] = useState<string[]>([])
@@ -216,6 +270,13 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
   const autostartEnabledRef = useRef(autostartEnabled)
   const sessionStopRequestedRef = useRef(sessionStopRequested)
   const identityReadyRef = useRef(identityReady)
+  const relayCreateResolversRef = useRef<
+    Array<{
+      resolve: (payload: RelayCreatedPayload) => void
+      reject: (err: Error) => void
+      timeoutId: number
+    }>
+  >([])
 
   useEffect(() => {
     autostartEnabledRef.current = autostartEnabled
@@ -252,6 +313,170 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
     return { nostr_pubkey_hex: pubkeyHex.toLowerCase(), nostr_nsec_hex: nsecHex.toLowerCase() }
   }, [pubkeyHex, nsecHex])
 
+  const startWorkerInternal = useCallback(
+    async ({ resetRestartAttempts }: { resetRestartAttempts: boolean }) => {
+      if (!isElectron()) throw new Error('Electron IPC unavailable')
+      if (!identityReady) throw new Error('Hypertuna worker requires nsec/ncryptsec login in Electron.')
+
+      if (inFlightStartRef.current) return
+      inFlightStartRef.current = true
+
+      clearRestartTimeout()
+      if (resetRestartAttempts) restartAttemptRef.current = 0
+      setLastError(null)
+      setLifecycle('starting')
+
+      try {
+        const config = buildWorkerConfig()
+        const res: WorkerStartResult = await electronIpc.startWorker(config)
+        if (!res?.success) {
+          throw new Error(res?.error || 'Failed to start worker')
+        }
+      } finally {
+        inFlightStartRef.current = false
+      }
+    },
+    [buildWorkerConfig, clearRestartTimeout, identityReady]
+  )
+
+  const clearJoinFlow = useCallback((publicIdentifier: string) => {
+    const key = String(publicIdentifier || '').trim()
+    if (!key) return
+    setJoinFlows((prev) => {
+      if (!prev[key]) return prev
+      const next = { ...prev }
+      delete next[key]
+      return next
+    })
+  }, [])
+
+  const startJoinFlowInternal = useCallback(
+    async (publicIdentifier: string, opts?: { fileSharing?: boolean }) => {
+      if (!isElectron()) throw new Error('Electron IPC unavailable')
+      const identifier = String(publicIdentifier || '').trim()
+      if (!identifier || !identifier.includes(':')) {
+        throw new Error('Expected a public identifier in the form npub:relayName')
+      }
+
+      setJoinFlows((prev) => ({
+        ...prev,
+        [identifier]: {
+          publicIdentifier: identifier,
+          phase: 'starting',
+          startedAt: Date.now(),
+          updatedAt: Date.now(),
+          error: null
+        }
+      }))
+
+      if (!statusV1) {
+        await startWorkerInternal({ resetRestartAttempts: false })
+      }
+
+      // The gateway is the source of truth for relay host peers. Ensure it's running.
+      if (!gatewayStatus?.running) {
+        await electronIpc.sendToWorker({ type: 'start-gateway', options: {} }).catch(() => {})
+      }
+
+      // Refresh gateway status so peerRelayMap is as current as possible.
+      await electronIpc.sendToWorker({ type: 'get-gateway-status' }).catch(() => {})
+
+      const fileSharing = opts?.fileSharing !== false
+
+      // Best-effort host peer discovery fast-path; worker has a fallback too.
+      let hostPeers: string[] | undefined
+      try {
+        const peerRelayMap = gatewayStatus?.peerRelayMap
+        const entry =
+          peerRelayMap?.[identifier] ||
+          (identifier.includes(':') ? peerRelayMap?.[identifier.replace(':', '/')] : null)
+        if (Array.isArray(entry?.peers) && entry.peers.length) {
+          hostPeers = entry.peers.map((p) => String(p || '').trim()).filter(Boolean)
+        }
+      } catch (err) {
+        void err
+      }
+
+      const data: any = { publicIdentifier: identifier, fileSharing }
+      if (hostPeers && hostPeers.length) data.hostPeers = hostPeers
+
+      await electronIpc.sendToWorker({ type: 'start-join-flow', data })
+
+      setJoinFlows((prev) => {
+        const current = prev[identifier]
+        if (!current) return prev
+        return {
+          ...prev,
+          [identifier]: {
+            ...current,
+            hostPeers,
+            updatedAt: Date.now()
+          }
+        }
+      })
+    },
+    [gatewayStatus, startWorkerInternal, statusV1]
+  )
+
+  const createRelayInternal = useCallback(
+    async (data: RelayCreateRequest): Promise<RelayCreatedPayload> => {
+      if (!isElectron()) throw new Error('Electron IPC unavailable')
+      if (!data?.name?.trim()) throw new Error('Relay name is required')
+
+      if (!statusV1) {
+        await startWorkerInternal({ resetRestartAttempts: false })
+      }
+
+      return await new Promise<RelayCreatedPayload>((resolve, reject) => {
+        const timeoutId = window.setTimeout(() => {
+          const pending = relayCreateResolversRef.current
+          const idx = pending.findIndex((r) => r.timeoutId === timeoutId)
+          if (idx >= 0) pending.splice(idx, 1)
+          reject(new Error('Timed out waiting for relay-created'))
+        }, 60_000)
+
+        relayCreateResolversRef.current.push({
+          timeoutId,
+          resolve: (payload) => {
+            window.clearTimeout(timeoutId)
+            resolve(payload)
+          },
+          reject: (err) => {
+            window.clearTimeout(timeoutId)
+            reject(err)
+          }
+        })
+
+        electronIpc
+          .sendToWorker({ type: 'create-relay', data })
+          .then((res) => {
+            if (res?.success) return
+            const pending = relayCreateResolversRef.current
+            const current = pending.find((r) => r.timeoutId === timeoutId)
+            if (current) {
+              pending.splice(pending.indexOf(current), 1)
+              window.clearTimeout(timeoutId)
+              current.reject(new Error(res?.error || 'Worker rejected create-relay'))
+            } else {
+              reject(new Error(res?.error || 'Worker rejected create-relay'))
+            }
+          })
+          .catch((err) => {
+            const pending = relayCreateResolversRef.current
+            const current = pending.find((r) => r.timeoutId === timeoutId)
+            if (current) {
+              pending.splice(pending.indexOf(current), 1)
+              window.clearTimeout(timeoutId)
+              current.reject(err instanceof Error ? err : new Error(String(err)))
+            } else {
+              reject(err instanceof Error ? err : new Error(String(err)))
+            }
+          })
+      })
+    },
+    [startWorkerInternal, statusV1]
+  )
+
   const warmWorkerState = useCallback(
     async (sessionId: string) => {
       if (warmSessionIdsRef.current.has(sessionId)) return
@@ -282,32 +507,6 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
     [setGatewayLogs, setGatewayStatus, setPublicGatewayStatus]
   )
 
-  const startWorkerInternal = useCallback(
-    async ({ resetRestartAttempts }: { resetRestartAttempts: boolean }) => {
-      if (!isElectron()) throw new Error('Electron IPC unavailable')
-      if (!identityReady) throw new Error('Hypertuna worker requires nsec/ncryptsec login in Electron.')
-
-      if (inFlightStartRef.current) return
-      inFlightStartRef.current = true
-
-      clearRestartTimeout()
-      if (resetRestartAttempts) restartAttemptRef.current = 0
-      setLastError(null)
-      setLifecycle('starting')
-
-      try {
-        const config = buildWorkerConfig()
-        const res: WorkerStartResult = await electronIpc.startWorker(config)
-        if (!res?.success) {
-          throw new Error(res?.error || 'Failed to start worker')
-        }
-      } finally {
-        inFlightStartRef.current = false
-      }
-    },
-    [buildWorkerConfig, clearRestartTimeout, identityReady]
-  )
-
   const stopWorkerInternal = useCallback(
     async ({ markSessionStopped }: { markSessionStopped: boolean }) => {
       if (!isElectron()) throw new Error('Electron IPC unavailable')
@@ -333,6 +532,12 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
       setGatewayStatus(null)
       setPublicGatewayStatus(null)
       setPublicGatewayToken(null)
+      setJoinFlows({})
+      relayCreateResolversRef.current.forEach(({ reject, timeoutId }) => {
+        window.clearTimeout(timeoutId)
+        reject(new Error('Worker stopped'))
+      })
+      relayCreateResolversRef.current = []
       setLifecycle('stopped')
     },
     [clearRestartTimeout]
@@ -391,6 +596,16 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
             if (Array.isArray(msg.relays)) setRelays(msg.relays)
             break
           case 'relay-created':
+            if (relayCreateResolversRef.current.length) {
+              const resolver = relayCreateResolversRef.current.shift()
+              if (resolver) {
+                const payload = (msg?.data || {}) as RelayCreatedPayload
+                if (payload?.success) resolver.resolve(payload)
+                else resolver.reject(new Error(payload?.error || 'Failed to create relay'))
+              }
+            }
+            // let relay-update events drive the main list; optionally merge here
+            break
           case 'relay-joined':
             // let relay-update events drive the main list; optionally merge here
             break
@@ -434,6 +649,86 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
           case 'public-gateway-token-error':
             setLastError(msg.error || 'Failed to issue public gateway token')
             break
+          case 'join-auth-progress': {
+            const identifier = msg?.data?.publicIdentifier
+            const progress: JoinAuthProgress | null =
+              msg?.data?.status === 'request' || msg?.data?.status === 'verify' || msg?.data?.status === 'complete'
+                ? msg.data.status
+                : null
+            if (!identifier || !progress) break
+            setJoinFlows((prev) => {
+              const current = prev[identifier]
+              const startedAt = current?.startedAt ?? Date.now()
+              return {
+                ...prev,
+                [identifier]: {
+                  publicIdentifier: identifier,
+                  phase: progress,
+                  startedAt,
+                  updatedAt: Date.now(),
+                  hostPeers: current?.hostPeers,
+                  hostPeer: current?.hostPeer ?? null,
+                  relayKey: current?.relayKey ?? null,
+                  authToken: current?.authToken ?? null,
+                  relayUrl: current?.relayUrl ?? null,
+                  error: null
+                }
+              }
+            })
+            break
+          }
+          case 'join-auth-success': {
+            const identifier = msg?.data?.publicIdentifier
+            if (!identifier) break
+            setJoinFlows((prev) => {
+              const current = prev[identifier]
+              const startedAt = current?.startedAt ?? Date.now()
+              return {
+                ...prev,
+                [identifier]: {
+                  publicIdentifier: identifier,
+                  phase: 'success',
+                  startedAt,
+                  updatedAt: Date.now(),
+                  hostPeers: current?.hostPeers,
+                  hostPeer: msg?.data?.hostPeer || null,
+                  relayKey: msg?.data?.relayKey || null,
+                  authToken: msg?.data?.authToken || null,
+                  relayUrl: msg?.data?.relayUrl || null,
+                  error: null
+                }
+              }
+            })
+            // Let relay-update events hydrate the full list, but trigger a refresh just in case.
+            electronIpc.sendToWorker({ type: 'get-relays' }).catch(() => {})
+            break
+          }
+          case 'join-auth-error': {
+            const identifier = msg?.data?.publicIdentifier
+            const errorText = msg?.data?.error || 'Join authentication failed'
+            if (!identifier) break
+            setJoinFlows((prev) => {
+              const current = prev[identifier]
+              const startedAt = current?.startedAt ?? Date.now()
+              return {
+                ...prev,
+                [identifier]: {
+                  publicIdentifier: identifier,
+                  phase: 'error',
+                  startedAt,
+                  updatedAt: Date.now(),
+                  hostPeers: current?.hostPeers,
+                  hostPeer: current?.hostPeer ?? null,
+                  relayKey: current?.relayKey ?? null,
+                  authToken: current?.authToken ?? null,
+                  relayUrl: current?.relayUrl ?? null,
+                  error: errorText
+                }
+              }
+            })
+            setLastError(errorText)
+            break
+          }
           case 'error':
           case 'gateway-error':
           case 'public-gateway-error':
@@ -460,6 +755,12 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
         setGatewayStatus(null)
         setPublicGatewayStatus(null)
         setPublicGatewayToken(null)
+        setJoinFlows({})
+        relayCreateResolversRef.current.forEach(({ reject, timeoutId }) => {
+          window.clearTimeout(timeoutId)
+          reject(new Error(`Worker exited (${code})`))
+        })
+        relayCreateResolversRef.current = []
         setLifecycle('stopped')
 
         const message = `Worker exited (${code})`
@@ -611,6 +912,7 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
       gatewayStatus,
       publicGatewayStatus,
       publicGatewayToken,
+      joinFlows,
       gatewayLogs,
       workerStdout,
       workerStderr,
@@ -634,15 +936,25 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
         }
         const res = await electronIpc.sendToWorker(message)
         if (!res?.success) throw new Error(res?.error || 'Worker rejected message')
-      }
+      },
+      createRelay: async (data: RelayCreateRequest) => {
+        return await createRelayInternal(data)
+      },
+      startJoinFlow: async (publicIdentifier: string, opts?: { fileSharing?: boolean }) => {
+        await startJoinFlowInternal(publicIdentifier, opts)
+      },
+      clearJoinFlow
     }),
     [
       autostartEnabled,
+      clearJoinFlow,
       configAppliedV1,
       gatewayLogs,
       gatewayStatus,
+      joinFlows,
       lastError,
       lifecycle,
+      createRelayInternal,
       publicGatewayStatus,
       publicGatewayToken,
       readinessMessage,
@@ -650,6 +962,7 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
       relays,
       sessionStopRequested,
       setAutostartEnabled,
+      startJoinFlowInternal,
       startWorkerInternal,
       statusV1,
       stopWorkerInternal,

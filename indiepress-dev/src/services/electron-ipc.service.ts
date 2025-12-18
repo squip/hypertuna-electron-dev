@@ -39,6 +39,29 @@ export type GatewayStatus = {
   relays?: RelayEntry[]
   publicGateway?: PublicGatewayStatus
   peers?: unknown
+  peerRelayMap?: Record<
+    string,
+    {
+      peers?: string[]
+      peerCount?: number
+      status?: string
+      lastActive?: number | string | null
+      createdAt?: number | string | null
+      metadata?: unknown
+    }
+  >
+  peerDetails?: Record<
+    string,
+    {
+      nostrPubkeyHex?: string | null
+      relays?: string[]
+      relayCount?: number
+      lastSeen?: number | string | null
+      status?: string
+      mode?: string | null
+      address?: string | null
+    }
+  >
   metrics?: unknown
 }
 

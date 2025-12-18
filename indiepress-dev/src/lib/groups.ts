@@ -69,12 +69,34 @@ export function parseGroupInviteEvent(event: Event, relay?: string): TGroupInvit
 }
 
 export function parseGroupListEvent(event: Event): TGroupListEntry[] {
-  return event.tags
-    .filter((t) => t[0] === 'g' && t[1])
-    .map((t) => {
-      const { groupId, relay } = parseGroupIdentifier(t[1])
-      return { groupId, relay }
-    })
+  const entries: TGroupListEntry[] = []
+
+  for (const tag of event.tags) {
+    if (!Array.isArray(tag) || !tag[0]) continue
+
+    // Indiepress format: ['g', "relay'groupId"] or ['g', "groupId"]
+    if (tag[0] === 'g' && tag[1]) {
+      const { groupId, relay } = parseGroupIdentifier(tag[1])
+      entries.push({ groupId, relay })
+      continue
+    }
+
+    // Legacy Hypertuna format: ['group', publicIdentifier, baseRelayUrl, groupName?, 'hypertuna:relay']
+    if (tag[0] === 'group' && tag[1]) {
+      const groupId = tag[1]
+      const relay = tag[2] || undefined
+      entries.push({ groupId, relay })
+      continue
+    }
+  }
+
+  const seen = new Set<string>()
+  return entries.filter((entry) => {
+    const key = `${entry.relay || ''}|${entry.groupId}`
+    if (seen.has(key)) return false
+    seen.add(key)
+    return true
+  })
 }
 
 export function deriveMembershipStatus(

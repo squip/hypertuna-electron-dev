@@ -16,6 +16,7 @@ import { parseGroupIdentifier } from '@/lib/groups'
 import { Input } from '@/components/ui/input'
 import { toast } from 'sonner'
 import { useNostr } from '@/providers/NostrProvider'
+import { isElectron } from '@/lib/platform'
 import PostEditor from '@/components/PostEditor'
 import GroupMetadataEditor, { TGroupMetadataForm } from '@/components/GroupMetadataEditor'
 import {
@@ -25,6 +26,7 @@ import {
   DialogTitle
 } from '@/components/ui/dialog'
 import { Label } from '@/components/ui/label'
+import { useWorkerBridge } from '@/providers/WorkerBridgeProvider'
 
 type TGroupPageProps = {
   index?: number
@@ -48,9 +50,11 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
     addUser,
     removeUser,
     deleteGroup,
-    deleteEvent
+    deleteEvent,
+    resolveRelayUrl
   } = useGroups()
   const { pubkey } = useNostr()
+  const { joinFlows, startJoinFlow } = useWorkerBridge()
   const [isLoading, setIsLoading] = useState(true)
   const [activeTab, setActiveTab] = useState<'notes' | 'members'>('notes')
   const [error, setError] = useState<string | null>(null)
@@ -97,9 +101,34 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
     return match?.token
   }, [invites, groupId, groupRelay])
 
+  const joinFlow = useMemo(() => {
+    const id = groupId || ''
+    return id ? joinFlows[id] : undefined
+  }, [groupId, joinFlows])
+
+  const resolvedGroupRelay = useMemo(() => {
+    return groupRelay ? resolveRelayUrl(groupRelay) : undefined
+  }, [groupRelay, resolveRelayUrl])
+
+  const isHypertunaGroup = useMemo(() => {
+    const tags = detail?.metadata?.event?.tags
+    return Array.isArray(tags) && tags.some((t) => t[0] === 'i' && t[1] === 'hypertuna:relay')
+  }, [detail?.metadata?.event?.tags])
+
+  useEffect(() => {
+    if (!groupId) return
+    if (joinFlow?.phase !== 'success') return
+    fetchGroupDetail(groupId, groupRelay).then(setDetail).catch(() => {})
+  }, [fetchGroupDetail, groupId, groupRelay, joinFlow?.phase])
+
   const handleJoin = async () => {
     if (!groupId) return
     try {
+      if (isElectron() && isHypertunaGroup && detail?.metadata?.isOpen !== false) {
+        await startJoinFlow(groupId, { fileSharing: true })
+        return
+      }
+
       await sendJoinRequest(groupId, groupRelay, inviteToken)
       setDetail((prev) =>
         prev
@@ -304,8 +333,10 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
                     {t('Removed')}
                   </Button>
                 ) : (
-                  <Button size="sm" onClick={handleJoin}>
-                    {t('Join')}
+                  <Button size="sm" onClick={handleJoin} disabled={joinFlow?.phase === 'starting' || joinFlow?.phase === 'request' || joinFlow?.phase === 'verify' || joinFlow?.phase === 'complete'}>
+                    {joinFlow?.phase && joinFlow.phase !== 'idle' && joinFlow.phase !== 'error'
+                      ? t('Joining…')
+                      : t('Join')}
                   </Button>
                 )}
                 <Button
@@ -322,6 +353,12 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
                   </Button>
                 )}
               </div>
+              {joinFlow && joinFlow.phase !== 'idle' && joinFlow.phase !== 'success' && (
+                <div className="text-xs text-muted-foreground">
+                  Hypertuna join flow: <span className="capitalize">{joinFlow.phase}</span>
+                  {joinFlow.error ? ` — ${joinFlow.error}` : ''}
+                </div>
+              )}
               {detail.admins && detail.admins.length > 0 && (
                 <div className="flex gap-2 flex-wrap text-sm text-muted-foreground">
                   {detail.admins.map((admin) => (
@@ -356,7 +393,7 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
                 subRequests={[
                   {
                     source: 'relays',
-                    urls: groupRelay ? [groupRelay] : BIG_RELAY_URLS,
+                    urls: resolvedGroupRelay ? [resolvedGroupRelay] : groupRelay ? [groupRelay] : BIG_RELAY_URLS,
                     filter: { '#h': [groupId] }
                   }
                 ]}
@@ -476,8 +513,8 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
         <PostEditor
           open={isComposerOpen}
           setOpen={setIsComposerOpen}
-          groupContext={{ groupId, relay: groupRelay }}
-          openFrom={groupRelay ? [groupRelay] : undefined}
+          groupContext={{ groupId, relay: resolvedGroupRelay || groupRelay }}
+          openFrom={resolvedGroupRelay ? [resolvedGroupRelay] : groupRelay ? [groupRelay] : undefined}
         />
       )}
       <Dialog open={isMetadataDialogOpen} onOpenChange={setIsMetadataDialogOpen}>

@@ -1,4 +1,4 @@
-import { FormEvent, useMemo, useState } from 'react'
+import { FormEvent, useEffect, useMemo, useState } from 'react'
 import { useWorkerBridge } from '@/providers/WorkerBridgeProvider'
 import { isElectron } from '@/lib/platform'
 import { Button } from '@/components/ui/button'
@@ -15,6 +15,7 @@ import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Textarea } from '@/components/ui/textarea'
 import { Switch } from '@/components/ui/switch'
+import { useGroups } from '@/providers/GroupsProvider'
 
 export default function RelayManagerPanel() {
   const [busy, setBusy] = useState(false)
@@ -25,15 +26,31 @@ export default function RelayManagerPanel() {
   const [createName, setCreateName] = useState('')
   const [createDescription, setCreateDescription] = useState('')
   const [createPublic, setCreatePublic] = useState(true)
+  const [createOpenMembership, setCreateOpenMembership] = useState(true)
   const [createBusy, setCreateBusy] = useState(false)
   const [joinKey, setJoinKey] = useState('')
   const [joinToken, setJoinToken] = useState('')
   const [joinBusy, setJoinBusy] = useState(false)
-  const { relays, lastError, sendToWorker } = useWorkerBridge()
+  const { createHypertunaRelayGroup } = useGroups()
+  const { relays, joinFlows, lastError, sendToWorker, startJoinFlow, clearJoinFlow } = useWorkerBridge()
   const desktopDownloadUrl = useMemo(
     () => import.meta.env.VITE_DESKTOP_DOWNLOAD_URL || 'https://hypertuna.com/download',
     []
   )
+
+  const joinIdentifier = joinKey.trim()
+  const joinFlow = joinIdentifier ? joinFlows[joinIdentifier] : undefined
+
+  useEffect(() => {
+    if (!joinOpen) return
+    if (!joinIdentifier.includes(':')) return
+    if (joinFlow?.phase === 'success') {
+      setJoinOpen(false)
+      setJoinKey('')
+      setJoinToken('')
+      clearJoinFlow(joinIdentifier)
+    }
+  }, [clearJoinFlow, joinFlow?.phase, joinIdentifier, joinOpen])
 
   if (!isElectron()) {
     return (
@@ -97,13 +114,12 @@ export default function RelayManagerPanel() {
     setCreateBusy(true)
     setError(null)
     try {
-      await sendToWorker({
-        type: 'create-relay',
-        data: {
-          name: createName || undefined,
-          description: createDescription || undefined,
-          isPublic: createPublic
-        }
+      await createHypertunaRelayGroup({
+        name: createName,
+        about: createDescription || undefined,
+        isPublic: createPublic,
+        isOpen: createOpenMembership,
+        fileSharing: true
       })
       setCreateOpen(false)
       setCreateName('')
@@ -116,24 +132,38 @@ export default function RelayManagerPanel() {
     }
   }
 
+  function isHex64(value: string) {
+    return /^[a-fA-F0-9]{64}$/.test(value)
+  }
+
   const handleJoin = async (e: FormEvent) => {
     e.preventDefault()
     setJoinBusy(true)
     setError(null)
     try {
       const identifier = joinKey.trim()
-      await sendToWorker({
-        type: 'join-relay',
-        data: {
-          relayKey: identifier || undefined,
-          publicIdentifier: identifier && identifier.includes(':') ? identifier : undefined,
-          authToken: joinToken || undefined
-        }
-      })
-      setJoinOpen(false)
-      setJoinKey('')
-      setJoinToken('')
-      await refreshRelays()
+      const token = joinToken.trim()
+
+      const relayKey = isHex64(identifier) ? identifier : undefined
+      const publicIdentifier = !relayKey && identifier.includes(':') ? identifier : undefined
+
+      if (publicIdentifier && !token) {
+        await startJoinFlow(publicIdentifier, { fileSharing: true })
+      } else {
+        await sendToWorker({
+          type: 'join-relay',
+          data: {
+            relayKey,
+            publicIdentifier,
+            authToken: token || undefined,
+            fileSharing: true
+          }
+        })
+        setJoinOpen(false)
+        setJoinKey('')
+        setJoinToken('')
+        await refreshRelays()
+      }
     } catch (err: any) {
       setError(err?.message || 'Failed to join relay')
     } finally {
@@ -227,6 +257,15 @@ export default function RelayManagerPanel() {
               </div>
               <Switch checked={createPublic} onCheckedChange={setCreatePublic} />
             </div>
+            <div className="flex items-center justify-between rounded-md border px-3 py-2">
+              <div className="space-y-0.5">
+                <div className="font-medium text-sm">Open membership</div>
+                <div className="text-xs text-muted-foreground">
+                  Anyone can join without approval (via Hypertuna join flow).
+                </div>
+              </div>
+              <Switch checked={createOpenMembership} onCheckedChange={setCreateOpenMembership} />
+            </div>
             <DialogFooter>
               <Button type="button" variant="outline" onClick={() => setCreateOpen(false)}>
                 Cancel
@@ -265,6 +304,13 @@ export default function RelayManagerPanel() {
                 placeholder="Token if required"
               />
             </div>
+            {joinFlow && (
+              <div className="rounded-md border border-border/50 bg-muted/30 p-2 text-xs space-y-1">
+                <div className="font-medium">Join flow</div>
+                <div className="text-muted-foreground capitalize">Phase: {joinFlow.phase}</div>
+                {joinFlow.error && <div className="text-red-500">{joinFlow.error}</div>}
+              </div>
+            )}
             <DialogFooter>
               <Button type="button" variant="outline" onClick={() => setJoinOpen(false)}>
                 Cancel

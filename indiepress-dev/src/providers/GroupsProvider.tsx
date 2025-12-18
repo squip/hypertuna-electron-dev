@@ -9,6 +9,15 @@ import {
   parseGroupMetadataEvent,
   buildGroupIdForCreation
 } from '@/lib/groups'
+import {
+  buildHypertunaAdminBootstrapDraftEvents,
+  buildHypertunaDiscoveryDraftEvents,
+  getBaseRelayUrl,
+  HYPERTUNA_IDENTIFIER_TAG,
+  isHypertunaTaggedEvent,
+  KIND_HYPERTUNA_RELAY,
+  parseHypertunaRelayEvent30166
+} from '@/lib/hypertuna-group-events'
 import { TDraftEvent } from '@/types'
 import {
   TGroupAdmin,
@@ -23,6 +32,7 @@ import { createContext, ReactNode, useCallback, useContext, useEffect, useMemo, 
 import { useNostr } from './NostrProvider'
 import { randomString } from '@/lib/random'
 import { useWorkerBridge } from './WorkerBridgeProvider'
+import type { TPublishOptions } from '@/types'
 
 type TGroupsContext = {
   discoveryGroups: TGroupMetadata[]
@@ -34,8 +44,9 @@ type TGroupsContext = {
   invitesError: string | null
   refreshDiscovery: () => Promise<void>
   refreshInvites: () => Promise<void>
+  resolveRelayUrl: (relay?: string) => string | undefined
   toggleFavorite: (groupKey: string) => void
-  saveMyGroupList: (entries: TGroupListEntry[]) => Promise<void>
+  saveMyGroupList: (entries: TGroupListEntry[], options?: TPublishOptions) => Promise<void>
   sendJoinRequest: (groupId: string, relay?: string, code?: string, reason?: string) => Promise<void>
   sendLeaveRequest: (groupId: string, relay?: string, reason?: string) => Promise<void>
   fetchGroupDetail: (groupId: string, relay?: string) => Promise<{
@@ -58,6 +69,13 @@ type TGroupsContext = {
     isOpen: boolean
     relays?: string[]
   }) => Promise<{ groupId: string; relay: string }>
+  createHypertunaRelayGroup: (data: {
+    name: string
+    about?: string
+    isPublic: boolean
+    isOpen: boolean
+    fileSharing?: boolean
+  }) => Promise<{ groupId: string; relay: string }>
 }
 
 const GroupsContext = createContext<TGroupsContext | undefined>(undefined)
@@ -76,7 +94,7 @@ const toGroupKey = (groupId: string, relay?: string) => (relay ? `${relay}|${gro
 
 export function GroupsProvider({ children }: { children: ReactNode }) {
   const { pubkey, publish, relayList, nip04Decrypt, nip04Encrypt } = useNostr()
-  const { relays: workerRelays } = useWorkerBridge()
+  const { relays: workerRelays, joinFlows, createRelay } = useWorkerBridge()
   const [discoveryGroups, setDiscoveryGroups] = useState<TGroupMetadata[]>([])
   const [invites, setInvites] = useState<TGroupInvite[]>([])
   const [favoriteGroups, setFavoriteGroups] = useState<string[]>([])
@@ -96,6 +114,10 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       if (r.publicIdentifier && r.connectionUrl) {
         map.set(r.publicIdentifier, r.connectionUrl)
         map.set(r.publicIdentifier.replace(':', '/'), r.connectionUrl)
+      }
+      if (r.connectionUrl) {
+        const base = getBaseRelayUrl(r.connectionUrl)
+        if (base) map.set(base, r.connectionUrl)
       }
     })
     return map
@@ -117,13 +139,35 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
     setIsLoadingDiscovery(true)
     setDiscoveryError(null)
     try {
-      const events = await client.fetchEvents(discoveryRelays, {
-        kinds: [ExtendedKind.GROUP_METADATA],
-        limit: 200
+      const [metadataEvents, relayEvents] = await Promise.all([
+        client.fetchEvents(discoveryRelays, {
+          kinds: [ExtendedKind.GROUP_METADATA],
+          limit: 200
+        }),
+        client.fetchEvents(discoveryRelays, {
+          kinds: [KIND_HYPERTUNA_RELAY],
+          '#i': [HYPERTUNA_IDENTIFIER_TAG],
+          limit: 300
+        })
+      ])
+
+      const hypertunaRelayUrlById = new Map<string, string>()
+      relayEvents.forEach((evt) => {
+        const parsed = parseHypertunaRelayEvent30166(evt)
+        if (!parsed) return
+        hypertunaRelayUrlById.set(parsed.publicIdentifier, getBaseRelayUrl(parsed.wsUrl))
       })
-      const parsed = events.map((evt) => {
+
+      const parsed = metadataEvents.map((evt) => {
         const parsedId = parseGroupIdentifier(evt.tags.find((t) => t[0] === 'd')?.[1] ?? '')
-        return parseGroupMetadataEvent(evt, parsedId.relay)
+        const meta = parseGroupMetadataEvent(evt, parsedId.relay)
+        if (isHypertunaTaggedEvent(evt)) {
+          const relayUrl = hypertunaRelayUrlById.get(meta.id)
+          if (relayUrl) {
+            return { ...meta, relay: relayUrl }
+          }
+        }
+        return meta
       })
 
       const seen = new Set<string>()
@@ -221,39 +265,71 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
   const fetchGroupDetail = useCallback(
     async (groupId: string, relay?: string) => {
       const resolved = relay ? resolveRelayUrl(relay) : null
-      const relays = resolved ? [resolved] : defaultDiscoveryRelays
-      const [metadataEvt] = await client.fetchEvents(relays, {
-        kinds: [ExtendedKind.GROUP_METADATA],
-        '#d': [groupId],
-        limit: 1
-      })
+      const groupRelays = resolved ? [resolved] : defaultDiscoveryRelays
+      const metadataRelays = resolved
+        ? Array.from(new Set([resolved, ...discoveryRelays]))
+        : discoveryRelays
 
-      const [adminsEvt] = await client.fetchEvents(relays, {
-        kinds: [39001],
-        '#d': [groupId],
-        limit: 1
-      })
+      let metadataEvt = null as any
+      try {
+        const events = await client.fetchEvents(metadataRelays, {
+          kinds: [ExtendedKind.GROUP_METADATA],
+          '#d': [groupId],
+          limit: 5
+        })
+        metadataEvt = events.sort((a, b) => b.created_at - a.created_at)[0] || null
+      } catch (error) {
+        console.warn('Failed to fetch group metadata', error)
+        metadataEvt = null
+      }
 
-      const [membersEvt] = await client.fetchEvents(relays, {
-        kinds: [39002],
-        '#d': [groupId],
-        limit: 1
-      })
+      let adminsEvt = null as any
+      let membersEvt = null as any
+      let membershipEvents: any[] = []
+      let joinRequests: any[] = []
 
-      const membershipEvents = await client.fetchEvents(relays, {
-        kinds: [9000, 9001],
-        '#h': [groupId],
-        limit: 50
-      })
+      try {
+        ;[adminsEvt] = await client.fetchEvents(groupRelays, {
+          kinds: [39001],
+          '#d': [groupId],
+          limit: 1
+        })
+      } catch (_) {
+        adminsEvt = null
+      }
 
-      const joinRequests = pubkey
-        ? await client.fetchEvents(relays, {
+      try {
+        ;[membersEvt] = await client.fetchEvents(groupRelays, {
+          kinds: [39002],
+          '#d': [groupId],
+          limit: 1
+        })
+      } catch (_) {
+        membersEvt = null
+      }
+
+      try {
+        membershipEvents = await client.fetchEvents(groupRelays, {
+          kinds: [9000, 9001],
+          '#h': [groupId],
+          limit: 50
+        })
+      } catch (_) {
+        membershipEvents = []
+      }
+
+      if (pubkey) {
+        try {
+          joinRequests = await client.fetchEvents(groupRelays, {
             kinds: [9021],
             authors: [pubkey],
             '#h': [groupId],
             limit: 10
           })
-        : []
+        } catch (_) {
+          joinRequests = []
+        }
+      }
 
       const membershipStatus = pubkey
         ? deriveMembershipStatus(pubkey, membershipEvents, joinRequests)
@@ -265,11 +341,11 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
 
       return { metadata, admins, members, membershipStatus }
     },
-    [pubkey, resolveRelayUrl]
+    [discoveryRelays, pubkey, resolveRelayUrl]
   )
 
   const saveMyGroupList = useCallback(
-    async (entries: TGroupListEntry[]) => {
+    async (entries: TGroupListEntry[], options?: TPublishOptions) => {
       if (!pubkey) throw new Error('Not logged in')
       const tags: string[][] = [['d', 'groups']]
       entries.forEach((entry) => {
@@ -284,10 +360,165 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
         content: ''
       }
 
-      await publish(draftEvent)
+      await publish(draftEvent, options)
       setMyGroupList(entries)
     },
     [pubkey, publish]
+  )
+
+  const processedJoinFlowsRef = useMemo(() => new Set<string>(), [])
+
+  useEffect(() => {
+    processedJoinFlowsRef.clear()
+  }, [processedJoinFlowsRef, pubkey])
+
+  useEffect(() => {
+    if (!pubkey) return
+
+    Object.values(joinFlows || {}).forEach((flow) => {
+      if (!flow || flow.phase !== 'success') return
+      const identifier = flow.publicIdentifier
+      if (!identifier) return
+      if (processedJoinFlowsRef.has(identifier)) return
+
+      const relayUrl = flow.relayUrl
+      if (typeof relayUrl !== 'string' || !relayUrl) return
+      const baseUrl = getBaseRelayUrl(relayUrl)
+      if (!baseUrl) return
+
+      const already = myGroupList.some((e) => e.groupId === identifier && e.relay === baseUrl)
+      if (already) {
+        processedJoinFlowsRef.add(identifier)
+        return
+      }
+
+      processedJoinFlowsRef.add(identifier)
+      const updated = [...myGroupList, { groupId: identifier, relay: baseUrl }]
+      saveMyGroupList(updated, { specifiedRelayUrls: BIG_RELAY_URLS }).catch(() => {})
+    })
+  }, [joinFlows, myGroupList, pubkey, saveMyGroupList, processedJoinFlowsRef])
+
+  useEffect(() => {
+    if (!pubkey) return
+    if (!workerRelays.length) return
+
+    const desired = new Map<string, string>()
+    workerRelays.forEach((relay) => {
+      const publicIdentifier = relay.publicIdentifier
+      const connectionUrl = relay.connectionUrl
+      if (!publicIdentifier || !connectionUrl) return
+      if (!publicIdentifier.includes(':')) return
+      const baseUrl = getBaseRelayUrl(connectionUrl)
+      if (!baseUrl) return
+      desired.set(publicIdentifier, baseUrl)
+    })
+
+    if (!desired.size) return
+
+    let changed = false
+    const next = myGroupList.map((entry) => {
+      const targetRelay = desired.get(entry.groupId)
+      if (!targetRelay) return entry
+      const currentRelay = entry.relay ? getBaseRelayUrl(entry.relay) : null
+      if (currentRelay === targetRelay) return entry
+      changed = true
+      return { ...entry, relay: targetRelay }
+    })
+
+    desired.forEach((relay, groupId) => {
+      const exists = next.some((e) => e.groupId === groupId && getBaseRelayUrl(e.relay || '') === relay)
+      if (!exists) {
+        changed = true
+        next.push({ groupId, relay })
+      }
+    })
+
+    if (!changed) return
+
+    // Don’t force BIG_RELAY_URLS here; use normal publish routing (privacy-preserving for token-joins).
+    saveMyGroupList(next).catch(() => {})
+  }, [myGroupList, pubkey, saveMyGroupList, workerRelays])
+
+  const createHypertunaRelayGroup = useCallback(
+    async ({
+      name,
+      about,
+      isPublic,
+      isOpen,
+      fileSharing
+    }: {
+      name: string
+      about?: string
+      isPublic: boolean
+      isOpen: boolean
+      fileSharing?: boolean
+    }) => {
+      if (!pubkey) throw new Error('Not logged in')
+      const result = await createRelay({
+        name,
+        description: about || undefined,
+        isPublic,
+        isOpen,
+        fileSharing
+      })
+      if (!result?.success) throw new Error(result?.error || 'Failed to create relay')
+
+      const publicIdentifier = result.publicIdentifier
+      const authenticatedRelayUrl = result.relayUrl
+      if (!publicIdentifier || !authenticatedRelayUrl) {
+        throw new Error('Worker did not return a publicIdentifier/relayUrl')
+      }
+
+      const relayWsUrl = getBaseRelayUrl(authenticatedRelayUrl)
+
+      const { groupCreateEvent, metadataEvent, hypertunaEvent } = buildHypertunaDiscoveryDraftEvents({
+        publicIdentifier,
+        name,
+        about,
+        isPublic,
+        isOpen,
+        fileSharing,
+        relayWsUrl
+      })
+
+      if (isPublic) {
+        await Promise.all([
+          publish(groupCreateEvent, { specifiedRelayUrls: BIG_RELAY_URLS }),
+          publish(metadataEvent, { specifiedRelayUrls: BIG_RELAY_URLS }),
+          publish(hypertunaEvent, { specifiedRelayUrls: BIG_RELAY_URLS })
+        ])
+      }
+
+      const updatedList = [
+        ...myGroupList.filter((entry) => entry.groupId !== publicIdentifier),
+        { groupId: publicIdentifier, relay: relayWsUrl }
+      ]
+      await saveMyGroupList(
+        updatedList,
+        isPublic ? { specifiedRelayUrls: BIG_RELAY_URLS } : undefined
+      )
+
+      // Publish the same discovery events to the group relay itself (authenticated URL).
+      await Promise.all([
+        publish(groupCreateEvent, { specifiedRelayUrls: [authenticatedRelayUrl] }),
+        publish(metadataEvent, { specifiedRelayUrls: [authenticatedRelayUrl] }),
+        publish(hypertunaEvent, { specifiedRelayUrls: [authenticatedRelayUrl] })
+      ])
+
+      // Bootstrap admin/member snapshots on the group relay.
+      const { adminListEvent, memberListEvent } = buildHypertunaAdminBootstrapDraftEvents({
+        publicIdentifier,
+        adminPubkeyHex: pubkey,
+        name
+      })
+      await Promise.all([
+        publish(adminListEvent, { specifiedRelayUrls: [authenticatedRelayUrl] }),
+        publish(memberListEvent, { specifiedRelayUrls: [authenticatedRelayUrl] })
+      ])
+
+      return { groupId: publicIdentifier, relay: relayWsUrl }
+    },
+    [createRelay, myGroupList, pubkey, publish, saveMyGroupList]
   )
 
   const sendJoinRequest = useCallback(
@@ -448,7 +679,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
     [pubkey, publish, resolveRelayUrl]
   )
 
-  const value = useMemo(
+  const value = useMemo<TGroupsContext>(
     () => ({
       discoveryGroups,
       invites,
@@ -459,6 +690,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       invitesError,
       refreshDiscovery,
       refreshInvites,
+      resolveRelayUrl,
       toggleFavorite,
       saveMyGroupList,
       sendJoinRequest,
@@ -470,14 +702,8 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       removeUser,
       deleteGroup,
       deleteEvent,
-      createGroup: async ({
-        name,
-        about,
-        picture,
-        isPublic,
-        isOpen,
-        relays
-      }) => {
+      createGroup: async (data) => {
+        const { name, about, picture, isPublic, isOpen, relays } = data
         if (!pubkey) throw new Error('Not logged in')
         const targetRelays = relays?.length ? relays : discoveryRelays
         const groupId = buildGroupIdForCreation(pubkey, name)
@@ -511,7 +737,8 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
         setMyGroupList(updatedList)
         await saveMyGroupList(updatedList)
         return { groupId, relay: targetRelays[0] }
-      }
+      },
+      createHypertunaRelayGroup
     }),
     [
       discoveryGroups,
@@ -536,7 +763,9 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       toggleFavorite,
       pubkey,
       discoveryRelays,
-      publish
+      publish,
+      resolveRelayUrl,
+      createHypertunaRelayGroup
     ]
   )
 

@@ -5,7 +5,7 @@ import { Card, CardContent } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { useTranslation } from 'react-i18next'
-import { forwardRef, useImperativeHandle, useRef, useState } from 'react'
+import { forwardRef, useEffect, useImperativeHandle, useRef, useState } from 'react'
 import { Heart, Loader2, Star } from 'lucide-react'
 import { Input } from '@/components/ui/input'
 import { useSecondaryPage } from '@/PageManager'
@@ -44,7 +44,8 @@ const GroupsPage = forwardRef<TPageRef>((_, ref) => {
     toggleFavorite,
     isLoadingDiscovery,
     discoveryError,
-    invitesError
+    invitesError,
+    createHypertunaRelayGroup
   } =
     useGroups()
   const [tab, setTab] = useState<TTab>('discover')
@@ -58,6 +59,7 @@ const GroupsPage = forwardRef<TPageRef>((_, ref) => {
   const [relayName, setRelayName] = useState('')
   const [relayDescription, setRelayDescription] = useState('')
   const [relayPublic, setRelayPublic] = useState(true)
+  const [relayOpenMembership, setRelayOpenMembership] = useState(true)
   const [relayCreating, setRelayCreating] = useState(false)
   const [joinIdentifier, setJoinIdentifier] = useState('')
   const [joinToken, setJoinToken] = useState('')
@@ -65,7 +67,21 @@ const GroupsPage = forwardRef<TPageRef>((_, ref) => {
   const desktopDownloadUrl =
     import.meta.env.VITE_DESKTOP_DOWNLOAD_URL || 'https://hypertuna.com/download'
   const isDesktop = isElectron()
-  const { sendToWorker } = useWorkerBridge()
+  const { sendToWorker, startJoinFlow, joinFlows, clearJoinFlow } = useWorkerBridge()
+
+  const joinId = joinIdentifier.trim()
+  const joinFlow = joinId ? joinFlows[joinId] : undefined
+
+  useEffect(() => {
+    if (!showRelayJoin) return
+    if (!joinId.includes(':')) return
+    if (joinFlow?.phase === 'success') {
+      setShowRelayJoin(false)
+      setJoinIdentifier('')
+      setJoinToken('')
+      clearJoinFlow(joinId)
+    }
+  }, [clearJoinFlow, joinFlow?.phase, joinId, showRelayJoin])
 
   const filteredDiscovery = discoveryGroups.filter((g) => {
     if (!search.trim()) return true
@@ -326,6 +342,15 @@ const GroupsPage = forwardRef<TPageRef>((_, ref) => {
               </div>
               <Switch checked={relayPublic} onCheckedChange={setRelayPublic} />
             </div>
+            <div className="flex items-center justify-between rounded-md border px-3 py-2">
+              <div>
+                <div className="font-medium text-sm">{t('Open membership')}</div>
+                <div className="text-xs text-muted-foreground">
+                  {t('Anyone can join without approval')}
+                </div>
+              </div>
+              <Switch checked={relayOpenMembership} onCheckedChange={setRelayOpenMembership} />
+            </div>
             <DialogFooter className="gap-2">
               <Button variant="outline" onClick={() => setShowRelayCreate(false)}>
                 {t('Cancel')}
@@ -338,16 +363,14 @@ const GroupsPage = forwardRef<TPageRef>((_, ref) => {
                   }
                   setRelayCreating(true)
                   try {
-                    await sendToWorker({
-                      type: 'create-relay',
-                      data: {
-                        name: relayName.trim(),
-                        description: relayDescription.trim() || undefined,
-                        isPublic: relayPublic
-                      }
+                    await createHypertunaRelayGroup({
+                      name: relayName.trim(),
+                      about: relayDescription.trim() || undefined,
+                      isPublic: relayPublic,
+                      isOpen: relayOpenMembership,
+                      fileSharing: true
                     })
-                    toast.success(t('Relay creation requested'))
-                    sendToWorker({ type: 'get-relays' }).catch(() => {})
+                    toast.success(t('Relay created'))
                     setShowRelayCreate(false)
                     setRelayName('')
                     setRelayDescription('')
@@ -406,19 +429,30 @@ const GroupsPage = forwardRef<TPageRef>((_, ref) => {
                   setJoinBusy(true)
                   try {
                     const identifier = joinIdentifier.trim()
-                    await sendToWorker({
-                      type: 'join-relay',
-                      data: {
-                        relayKey: identifier || undefined,
-                        publicIdentifier: identifier.includes(':') ? identifier : undefined,
-                        authToken: joinToken || undefined
-                      }
-                    })
-                    toast.success(t('Join requested'))
-                    sendToWorker({ type: 'get-relays' }).catch(() => {})
-                    setShowRelayJoin(false)
-                    setJoinIdentifier('')
-                    setJoinToken('')
+                    const token = joinToken.trim()
+                    const isHex = /^[a-fA-F0-9]{64}$/.test(identifier)
+                    const relayKey = isHex ? identifier : undefined
+                    const publicIdentifier = !relayKey && identifier.includes(':') ? identifier : undefined
+
+                    if (publicIdentifier && !token) {
+                      await startJoinFlow(publicIdentifier, { fileSharing: true })
+                      toast.message(t('Join flow started'))
+                    } else {
+                      await sendToWorker({
+                        type: 'join-relay',
+                        data: {
+                          relayKey,
+                          publicIdentifier,
+                          authToken: token || undefined,
+                          fileSharing: true
+                        }
+                      })
+                      toast.success(t('Join requested'))
+                      sendToWorker({ type: 'get-relays' }).catch(() => {})
+                      setShowRelayJoin(false)
+                      setJoinIdentifier('')
+                      setJoinToken('')
+                    }
                   } catch (err: any) {
                     toast.error(err?.message || t('Failed to join relay'))
                   } finally {
@@ -430,6 +464,13 @@ const GroupsPage = forwardRef<TPageRef>((_, ref) => {
                 {joinBusy ? t('Joining...') : t('Join relay')}
               </Button>
             </DialogFooter>
+            {joinFlow && (
+              <div className="rounded-md border border-border/50 bg-muted/30 p-2 text-xs space-y-1">
+                <div className="font-medium">{t('Join flow')}</div>
+                <div className="text-muted-foreground capitalize">{t('Phase')}: {joinFlow.phase}</div>
+                {joinFlow.error && <div className="text-red-500">{joinFlow.error}</div>}
+              </div>
+            )}
           </div>
         </DialogContent>
       </Dialog>
