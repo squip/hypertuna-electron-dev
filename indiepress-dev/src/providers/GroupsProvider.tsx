@@ -282,10 +282,9 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
   const fetchGroupDetail = useCallback(
     async (groupId: string, relay?: string) => {
       const resolved = relay ? resolveRelayUrl(relay) : null
+      // If we have an authenticated/tokenized relay, use it exclusively for detail fetches
       const groupRelays = resolved ? [resolved] : defaultDiscoveryRelays
-      const metadataRelays = resolved
-        ? Array.from(new Set([resolved, ...discoveryRelays]))
-        : discoveryRelays
+      const metadataRelays = resolved ? [resolved] : discoveryRelays
 
       let metadataEvt = null as any
       try {

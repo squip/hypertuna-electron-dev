@@ -4,7 +4,7 @@ import SecondaryPageLayout from '@/layouts/SecondaryPageLayout'
 import { useGroups } from '@/providers/GroupsProvider'
 import { TPageRef } from '@/types'
 import { useTranslation } from 'react-i18next'
-import { forwardRef, useEffect, useMemo, useState } from 'react'
+import { forwardRef, useEffect, useMemo, useRef, useState } from 'react'
 import { Heart, Loader2, LogOut, Send, Star } from 'lucide-react'
 import { Card, CardContent } from '@/components/ui/card'
 import UserAvatar from '@/components/UserAvatar'
@@ -69,6 +69,7 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
   const [memberInput, setMemberInput] = useState('')
   const [removePubkey, setRemovePubkey] = useState('')
   const [removeEventId, setRemoveEventId] = useState('')
+  const requestIdRef = useRef(0)
 
   useEffect(() => {
     const searchRelay =
@@ -82,10 +83,29 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
 
   useEffect(() => {
     if (!groupId) return
+    const requestId = ++requestIdRef.current
     setIsLoading(true)
     setError(null)
     fetchGroupDetail(groupId, groupRelay)
-      .then((d) => setDetail(d))
+      .then((d) => {
+        // Ignore stale responses
+        if (requestId !== requestIdRef.current) return
+        setDetail((prev) => {
+          const next = { ...d }
+          // Preserve previous data if new fetch is empty/undefined
+          if (!next.metadata && prev?.metadata) next.metadata = prev.metadata
+          if ((!next.admins || !next.admins.length) && prev?.admins?.length) {
+            next.admins = prev.admins
+          }
+          if ((!next.members || !next.members.length) && prev?.members?.length) {
+            next.members = prev.members
+          }
+          if (!next.membershipStatus && prev?.membershipStatus) {
+            next.membershipStatus = prev.membershipStatus
+          }
+          return next
+        })
+      })
       .catch((err) => setError((err as Error).message))
       .finally(() => setIsLoading(false))
   }, [fetchGroupDetail, groupId, groupRelay])
