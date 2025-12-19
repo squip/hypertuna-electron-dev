@@ -4,6 +4,7 @@
 import { promises as fs } from 'node:fs';
 import { join } from 'node:path';
 import crypto from 'node:crypto';
+import { NostrUtils } from './nostr-utils.js';
 
 // Import the legacy modules (adapted to run in a pure Node/Electron environment)
 import { RelayManager } from './hypertuna-relay-manager-bare.mjs';
