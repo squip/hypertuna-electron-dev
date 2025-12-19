@@ -104,8 +104,7 @@ const GroupsPage = forwardRef<TPageRef>((_, ref) => {
         key={key}
         className="cursor-pointer transition-colors hover:bg-accent/50 overflow-hidden"
         onClick={() => {
-          const targetId = relay ? `${relay}'${groupId}` : groupId
-          push(toGroup(targetId, relay))
+          push(toGroup(groupId, relay))
         }}
       >
         <CardContent className="p-4 flex gap-3 items-start">
@@ -203,8 +202,7 @@ const GroupsPage = forwardRef<TPageRef>((_, ref) => {
               <Button
                 size="sm"
                 onClick={() => {
-                  const targetId = inv.relay ? `${inv.relay}'${inv.groupId}` : inv.groupId
-                  push(toGroup(targetId, inv.relay))
+                  push(toGroup(inv.groupId, inv.relay))
                 }}
               >
                 {t('Use invite')}

@@ -110,6 +110,16 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
     return groupRelay ? resolveRelayUrl(groupRelay) : undefined
   }, [groupRelay, resolveRelayUrl])
 
+  useEffect(() => {
+    // Debug aid: confirm routing + relay resolution for hypertuna relays
+    console.info('[GroupPage] route params', {
+      rawId: id,
+      groupId,
+      groupRelay,
+      resolvedGroupRelay
+    })
+  }, [groupId, groupRelay, id, resolvedGroupRelay])
+
   const isHypertunaGroup = useMemo(() => {
     const tags = detail?.metadata?.event?.tags
     return Array.isArray(tags) && tags.some((t) => t[0] === 'i' && t[1] === 'hypertuna:relay')
