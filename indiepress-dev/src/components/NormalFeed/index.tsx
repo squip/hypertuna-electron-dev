@@ -33,6 +33,23 @@ export default function NormalFeed({
   const supportTouch = useMemo(() => isTouchDevice(), [])
   const noteListRef = useRef<TNoteListRef | TGroupedNoteListRef>(null)
 
+  // Deduplicate identical subRequests (same source, urls, filter) to avoid duplicate subscriptions
+  const uniqueSubRequests = useMemo(() => {
+    const seen = new Set<string>()
+    return subRequests.filter((req) => {
+      if (req.source === 'relays') {
+        const key = JSON.stringify({
+          src: req.source,
+          urls: [...req.urls].sort(),
+          filter: req.filter
+        })
+        if (seen.has(key)) return false
+        seen.add(key)
+      }
+      return true
+    })
+  }, [subRequests])
+
   const handleListModeChange = (mode: TNoteListMode) => {
     setListMode(mode)
     if (isMainFeed) {
@@ -120,7 +137,7 @@ export default function NormalFeed({
         <GroupedNoteList
           ref={noteListRef as React.Ref<TGroupedNoteListRef>}
           showKinds={temporaryShowKinds}
-          subRequests={subRequests}
+          subRequests={uniqueSubRequests}
           showRelayCloseReason={showRelayCloseReason}
           userFilter={userFilter}
         />
@@ -128,7 +145,7 @@ export default function NormalFeed({
         <NoteList
           ref={noteListRef as React.Ref<TNoteListRef>}
           showKinds={temporaryShowKinds}
-          subRequests={subRequests}
+          subRequests={uniqueSubRequests}
           hideReplies={effectiveListMode === 'posts'}
           hideUntrustedNotes={hideUntrustedNotes}
           showRelayCloseReason={showRelayCloseReason}

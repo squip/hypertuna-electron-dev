@@ -1,4 +1,14 @@
 import LoginDialog from '@/components/LoginDialog'
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle
+} from '@/components/ui/dialog'
+import { Input } from '@/components/ui/input'
+import { Button } from '@/components/ui/button'
 import { ApplicationDataKey, BIG_RELAY_URLS, MAX_PINNED_NOTES } from '@/constants'
 import {
   createDeletionRequestDraftEvent,
@@ -137,6 +147,11 @@ export function NostrProvider({ children }: { children: React.ReactNode }) {
   const [notificationsSeenAt, setNotificationsSeenAt] = useState(-1)
   const [isInitialized, setIsInitialized] = useState(false)
   const [isReady, setIsReady] = useState(false)
+  const [ncryptPrompt, setNcryptPrompt] = useState<{
+    token: string
+    resolve: (password: string | null) => void
+  } | null>(null)
+  const [ncryptPassword, setNcryptPassword] = useState('')
 
   useEffect(() => {
     const init = async () => {
@@ -147,12 +162,17 @@ export function NostrProvider({ children }: { children: React.ReactNode }) {
       const accounts = storage.getAccounts()
       const act = storage.getCurrentAccount()
       if (act) {
-        await loginWithAccountPointer(act, true)
+        const res = await loginWithAccountPointer(act, true)
+        if (res) return
+        // If automatic login failed (e.g., ncryptsec not unlocked), show login dialog
+        setOpenLoginDialog(true)
         return
       }
       if (accounts[0]) {
         // auto login the first account
-        await loginWithAccountPointer(accounts[0], false)
+        const res = await loginWithAccountPointer(accounts[0], false)
+        if (res) return
+        setOpenLoginDialog(true)
         return
       }
     }
@@ -386,7 +406,14 @@ export function NostrProvider({ children }: { children: React.ReactNode }) {
       setNsecHex(null)
       return
     }
-    await loginWithAccountPointer(act, false)
+    const res = await loginWithAccountPointer(act, false)
+    if (!res) {
+      // Failed to unlock (likely ncryptsec without password) — surface login dialog
+      setAccount(null)
+      setSigner(null)
+      setNsecHex(null)
+      setOpenLoginDialog(true)
+    }
   }
 
   const nsecLogin = async (nsecOrHex: string, password?: string, needSetup?: boolean) => {
@@ -423,11 +450,10 @@ export function NostrProvider({ children }: { children: React.ReactNode }) {
   }
 
   const ncryptsecLogin = async (ncryptsec: string) => {
-    const password = prompt(t('Enter the password to decrypt your ncryptsec'))
-    if (!password) {
+    const privkey = await promptDecryptNcryptsec(ncryptsec)
+    if (!privkey) {
       throw new Error('Password is required')
     }
-    const privkey = nip49.decrypt(ncryptsec, password)
     const nsecHex = bytesToHex(privkey)
     const browserNsecSigner = new NsecSigner()
     const pubkey = browserNsecSigner.login(privkey)!
@@ -521,11 +547,10 @@ export function NostrProvider({ children }: { children: React.ReactNode }) {
       }
     } else if (account.signerType === 'ncryptsec') {
       if (account.ncryptsec) {
-        const password = prompt(t('Enter the password to decrypt your ncryptsec'))
-        if (!password) {
+        const privkey = await promptDecryptNcryptsec(account.ncryptsec)
+        if (!privkey) {
           return null
         }
-        const privkey = nip49.decrypt(account.ncryptsec, password)
         const nsecHex = bytesToHex(privkey)
         const browserNsecSigner = new NsecSigner()
         browserNsecSigner.login(privkey)
@@ -675,6 +700,20 @@ export function NostrProvider({ children }: { children: React.ReactNode }) {
     return setOpenLoginDialog(true)
   }
 
+  const promptDecryptNcryptsec = async (ncrypt: string): Promise<Uint8Array | null> => {
+    const password = await new Promise<string | null>((resolve) => {
+      setNcryptPassword('')
+      setNcryptPrompt({ token: ncrypt, resolve })
+    })
+    if (!password) return null
+    try {
+      return nip49.decrypt(ncrypt, password)
+    } catch (err) {
+      toast.error(t('Failed to decrypt ncryptsec'))
+      return null
+    }
+  }
+
   const updateProfileEvent = async (profileEvent: Event) => {
     const profile = await client.fetchProfile(profileEvent.pubkey, profileEvent)
     setProfile(profile)
@@ -782,6 +821,52 @@ export function NostrProvider({ children }: { children: React.ReactNode }) {
     >
       {children}
       <LoginDialog open={openLoginDialog} setOpen={setOpenLoginDialog} />
+      <Dialog
+        open={!!ncryptPrompt}
+        onOpenChange={(open) => {
+          if (!open && ncryptPrompt) {
+            ncryptPrompt.resolve(null)
+            setNcryptPrompt(null)
+          }
+        }}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>{t('Unlock encrypted key')}</DialogTitle>
+            <DialogDescription>{t('Enter the password to decrypt your ncryptsec')}</DialogDescription>
+          </DialogHeader>
+          <Input
+            type="password"
+            value={ncryptPassword}
+            onChange={(e) => setNcryptPassword(e.target.value)}
+            placeholder={t('Password') as string}
+          />
+          <DialogFooter className="mt-3 flex justify-end gap-2">
+            <Button
+              variant="ghost"
+              onClick={() => {
+                if (ncryptPrompt) {
+                  ncryptPrompt.resolve(null)
+                  setNcryptPrompt(null)
+                }
+              }}
+            >
+              {t('Cancel')}
+            </Button>
+            <Button
+              onClick={() => {
+                if (ncryptPrompt) {
+                  ncryptPrompt.resolve(ncryptPassword || null)
+                  setNcryptPrompt(null)
+                }
+              }}
+              disabled={!ncryptPassword}
+            >
+              {t('Unlock')}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </NostrContext.Provider>
   )
 }

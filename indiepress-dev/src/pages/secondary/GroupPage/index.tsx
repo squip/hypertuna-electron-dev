@@ -110,6 +110,34 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
     return groupRelay ? resolveRelayUrl(groupRelay) : undefined
   }, [groupRelay, resolveRelayUrl])
 
+  const groupSubRequests = useMemo(
+    () =>
+      groupId
+        ? [
+            {
+              source: 'relays' as const,
+              urls: resolvedGroupRelay
+                ? [resolvedGroupRelay]
+                : groupRelay
+                  ? [groupRelay]
+                  : BIG_RELAY_URLS,
+              filter: {
+                '#h': [groupId],
+                kinds: [
+                  // Core group metadata / membership / admin
+                  39000, 39001, 39002, 39003,
+                  // Hypertuna/NIP-29 flows
+                  9000, 9001, 9002, 9005, 9007, 9008, 9009, 9021, 9022,
+                  // Timeline kinds (retain existing set)
+                  1, 6, 20, 21, 22, 1068, 1111, 1222, 1244, 9802, 30023, 31987, 39089
+                ]
+              }
+            }
+          ]
+        : [],
+    [groupId, groupRelay, resolvedGroupRelay]
+  )
+
   useEffect(() => {
     // Debug aid: confirm routing + relay resolution for hypertuna relays
     console.info('[GroupPage] route params', {
@@ -400,13 +428,7 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
             </TabsList>
             <TabsContent value="notes" className="mt-2">
               <NormalFeed
-                subRequests={[
-                  {
-                    source: 'relays',
-                    urls: resolvedGroupRelay ? [resolvedGroupRelay] : groupRelay ? [groupRelay] : BIG_RELAY_URLS,
-                    filter: { '#h': [groupId] }
-                  }
-                ]}
+                subRequests={groupSubRequests}
                 isMainFeed={false}
               />
             </TabsContent>
