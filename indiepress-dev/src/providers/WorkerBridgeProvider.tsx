@@ -604,7 +604,16 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
         }
         switch (msg.type) {
           case 'relay-update':
-            if (Array.isArray(msg.relays)) setRelays(msg.relays)
+            if (Array.isArray(msg.relays)) {
+              console.info('[WorkerBridge] relay-update received', msg.relays.map((r: any) => ({
+                relayKey: r.relayKey,
+                publicIdentifier: r.publicIdentifier,
+                connectionUrl: r.connectionUrl,
+                userAuthToken: r.userAuthToken,
+                requiresAuth: r.requiresAuth
+              })))
+              setRelays(msg.relays)
+            }
             break
           case 'relay-created':
             if (relayCreateResolversRef.current.length) {

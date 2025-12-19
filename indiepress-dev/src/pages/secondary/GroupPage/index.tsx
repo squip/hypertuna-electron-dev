@@ -146,7 +146,10 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
       groupRelay,
       resolvedGroupRelay
     })
-  }, [groupId, groupRelay, id, resolvedGroupRelay])
+    if (groupSubRequests.length) {
+      console.info('[GroupPage] subRequests', groupSubRequests)
+    }
+  }, [groupId, groupRelay, id, resolvedGroupRelay, groupSubRequests])
 
   const isHypertunaGroup = useMemo(() => {
     const tags = detail?.metadata?.event?.tags

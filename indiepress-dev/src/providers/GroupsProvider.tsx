@@ -109,17 +109,34 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
 
   const workerRelayUrlMap = useMemo(() => {
     const map = new Map<string, string>()
-    workerRelays.forEach((r) => {
-      if (r.relayKey && r.connectionUrl) map.set(r.relayKey, r.connectionUrl)
-      if (r.publicIdentifier && r.connectionUrl) {
-        map.set(r.publicIdentifier, r.connectionUrl)
-        map.set(r.publicIdentifier.replace(':', '/'), r.connectionUrl)
+    const withAuth = (url?: string, token?: string) => {
+      if (!url) return url
+      try {
+        const u = new URL(url)
+        if (token && !u.searchParams.has('token')) {
+          u.searchParams.set('token', token)
+          return u.toString()
+        }
+        return url
+      } catch (_err) {
+        return url
       }
-      if (r.connectionUrl) {
-        const base = getBaseRelayUrl(r.connectionUrl)
-        if (base) map.set(base, r.connectionUrl)
+    }
+    workerRelays.forEach((r) => {
+      const token = r.userAuthToken || (r as any)?.authToken
+      const authUrl = withAuth(r.connectionUrl, token)
+      if (r.relayKey && authUrl) map.set(r.relayKey, authUrl)
+      if (r.publicIdentifier && authUrl) {
+        map.set(r.publicIdentifier, authUrl)
+        map.set(r.publicIdentifier.replace(':', '/'), authUrl)
+      }
+      if (authUrl) {
+        const base = getBaseRelayUrl(authUrl)
+        if (base) map.set(base, authUrl)
       }
     })
+    console.info('[GroupsProvider] workerRelays', workerRelays)
+    console.info('[GroupsProvider] relayUrlMap', Array.from(map.entries()))
     return map
   }, [workerRelays])
 

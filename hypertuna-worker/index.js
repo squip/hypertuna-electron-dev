@@ -22,6 +22,7 @@ import {
   calculateAuthorizedUsers
 } from './hypertuna-relay-profile-manager-bare.mjs'
 import { loadRelayKeyMappings, activeRelays, virtualRelayKeys, keyToPublic } from './hypertuna-relay-manager-adapter.mjs'
+import { getRelayAuthStore } from './relay-auth-store.mjs'
 import {
   queuePendingAuthUpdate,
   applyPendingAuthUpdates
@@ -1250,6 +1251,7 @@ function addMembersToRelays(relays) {
 async function addAuthInfoToRelays(relays) {
   try {
     const profiles = await getAllRelayProfiles(global.userConfig?.userKey)
+    const authStore = getRelayAuthStore()
     return relays.map(r => {
       const profile = profiles.find(p => p.relay_key === r.relayKey) || {}
 
@@ -1279,12 +1281,47 @@ async function addAuthInfoToRelays(relays) {
         }
       }
 
+      // Fallback: pull token from auth store if available
+      let tokenFromStore = null
+      if (!token && config?.nostr_pubkey_hex && authStore) {
+        try {
+          // Some auth stores expose a getter; others rely on verifyAuth
+          if (typeof authStore.getAuthToken === 'function') {
+            tokenFromStore = authStore.getAuthToken(r.relayKey, config.nostr_pubkey_hex)
+            if (tokenFromStore) token = tokenFromStore
+          } else if (typeof authStore.verifyAuth === 'function') {
+            const auth = authStore.verifyAuth(r.relayKey, config.nostr_pubkey_hex)
+            if (auth && auth.token) {
+              tokenFromStore = auth.token
+              token = auth.token
+            }
+          }
+          if (token) {
+            console.log(`[Worker] Using auth token from auth store for relay ${r.relayKey}`)
+          }
+        } catch (err) {
+          console.warn('[Worker] Failed to read auth token from store:', err?.message || err)
+        }
+      }
+
       const identifierPath = profile.public_identifier
         ? profile.public_identifier.replace(':', '/')
         : r.relayKey
 
       const baseUrl = `${buildGatewayWebsocketBase(config)}/${identifierPath}`
       const connectionUrl = token ? `${baseUrl}?token=${token}` : baseUrl
+
+      console.log('[Worker][addAuthInfoToRelays]', {
+        relayKey: r.relayKey,
+        publicIdentifier: profile.public_identifier || null,
+        requiresAuth: !!profile.auth_config?.requiresAuth,
+        fromProfileToken: !!token, // token derived above (profile auth_adds/auth_tokens)
+        fromLegacyToken: !!(profile.auth_tokens && profile.auth_tokens[config.nostr_pubkey_hex]),
+        fromStoreToken: !!tokenFromStore,
+        tokenApplied: !!token,
+        connectionUrl,
+        userAuthToken: token
+      })
 
       const statusEntry = relayRegistrationStatus.get(r.relayKey)
         || (profile.public_identifier ? relayRegistrationStatus.get(profile.public_identifier) : null)
@@ -1968,6 +2005,13 @@ async function handleMessageObject(message) {
           const relays = await relayServer.getActiveRelays()
           await syncGatewayPeerMetadata('relay-created', { relays })
           const relaysAuth = await addAuthInfoToRelays(relays)
+          console.log('[Worker][relay-update][relay-created] sending', relaysAuth.map(r => ({
+            relayKey: r.relayKey,
+            publicIdentifier: r.publicIdentifier,
+            connectionUrl: r.connectionUrl,
+            userAuthToken: r.userAuthToken,
+            requiresAuth: r.requiresAuth
+          })))
           sendMessage({
             type: 'relay-update',
             relays: addMembersToRelays(relaysAuth)
@@ -2006,6 +2050,13 @@ async function handleMessageObject(message) {
           const relays = await relayServer.getActiveRelays()
           await syncGatewayPeerMetadata('relay-joined', { relays })
           const relaysAuth = await addAuthInfoToRelays(relays)
+          console.log('[Worker][relay-update][relay-joined] sending', relaysAuth.map(r => ({
+            relayKey: r.relayKey,
+            publicIdentifier: r.publicIdentifier,
+            connectionUrl: r.connectionUrl,
+            userAuthToken: r.userAuthToken,
+            requiresAuth: r.requiresAuth
+          })))
           sendMessage({
             type: 'relay-update',
             relays: addMembersToRelays(relaysAuth)
@@ -2199,6 +2250,13 @@ async function handleMessageObject(message) {
         try {
           const relays = await relayServer.getActiveRelays()
           const relaysAuth = await addAuthInfoToRelays(relays)
+          console.log('[Worker][relay-update][get-relays] sending', relaysAuth.map(r => ({
+            relayKey: r.relayKey,
+            publicIdentifier: r.publicIdentifier,
+            connectionUrl: r.connectionUrl,
+            userAuthToken: r.userAuthToken,
+            requiresAuth: r.requiresAuth
+          })))
           sendMessage({
             type: 'relay-update',
             relays: addMembersToRelays(relaysAuth)
@@ -2635,7 +2693,19 @@ async function main() {
 
       try {
         const relaysSnapshot = await relayServer.getActiveRelays()
+        const relaysAuth = await addAuthInfoToRelays(relaysSnapshot)
+        console.log('[Worker][relay-update][auto-connect-complete] sending', relaysAuth.map(r => ({
+          relayKey: r.relayKey,
+          publicIdentifier: r.publicIdentifier,
+          connectionUrl: r.connectionUrl,
+          userAuthToken: r.userAuthToken,
+          requiresAuth: r.requiresAuth
+        })))
         await syncGatewayPeerMetadata('auto-connect-complete', { relays: relaysSnapshot })
+        sendMessage({
+          type: 'relay-update',
+          relays: addMembersToRelays(relaysAuth)
+        })
       } catch (syncError) {
         console.warn('[Worker] Gateway metadata sync failed (auto-connect-complete):', syncError?.message || syncError)
       }
