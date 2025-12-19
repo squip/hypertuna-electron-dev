@@ -2,6 +2,7 @@ import './i18n'
 import './index.css'
 import './polyfill'
 import './services/lightning.service'
+import { installConsoleFileLogger } from './lib/console-file-logger'
 
 import { createRoot } from 'react-dom/client'
 import { initNostrWasm } from 'nostr-wasm/gzipped'
@@ -10,6 +11,8 @@ import { AbstractSimplePool } from '@nostr/tools/abstract-pool'
 import { pool, setPool } from '@nostr/gadgets/global'
 import App from './App.tsx'
 import { ErrorBoundary } from './components/ErrorBoundary.tsx'
+
+installConsoleFileLogger()
 
 window.addEventListener('resize', setVh)
 window.addEventListener('orientationchange', setVh)

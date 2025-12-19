@@ -799,6 +799,12 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
           const next = [...prev, ...lines]
           return next.length > MAX_OUTPUT_LINES ? next.slice(-MAX_OUTPUT_LINES) : next
         })
+        if (isElectron() && electronIpc.appendLogLine) {
+          const lines = String(data).split(/\r?\n/).filter(Boolean)
+          lines.forEach((line) => {
+            electronIpc.appendLogLine(`[${new Date().toISOString()}] [WORKER STDOUT] ${line}\n`).catch(() => {})
+          })
+        }
       })
     )
 
@@ -809,6 +815,12 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
           const next = [...prev, ...lines]
           return next.length > MAX_OUTPUT_LINES ? next.slice(-MAX_OUTPUT_LINES) : next
         })
+        if (isElectron() && electronIpc.appendLogLine) {
+          const lines = String(data).split(/\r?\n/).filter(Boolean)
+          lines.forEach((line) => {
+            electronIpc.appendLogLine(`[${new Date().toISOString()}] [WORKER STDERR] ${line}\n`).catch(() => {})
+          })
+        }
       })
     )
 
