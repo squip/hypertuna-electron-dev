@@ -101,8 +101,8 @@ async function ensureStorageDir() {
 
 function createWindow() {
   mainWindow = new BrowserWindow({
-    width: 765,
-    height: 1050,
+    width: 1600,
+    height: 1022,
     backgroundColor: '#1F2430',
     webPreferences: {
       preload: path.join(__dirname, 'preload.cjs'),
