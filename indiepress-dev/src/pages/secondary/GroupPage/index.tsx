@@ -1,4 +1,5 @@
 import { Button } from '@/components/ui/button'
+import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import SecondaryPageLayout from '@/layouts/SecondaryPageLayout'
 import { useGroups } from '@/providers/GroupsProvider'
@@ -39,6 +40,7 @@ const makeGroupKey = (groupId: string, relay?: string) => (relay ? `${relay}|${g
 const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, ref) => {
   const { t } = useTranslation()
   const {
+    discoveryGroups,
     fetchGroupDetail,
     sendJoinRequest,
     sendLeaveRequest,
@@ -93,14 +95,15 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
         setDetail((prev) => {
           const next = { ...d }
           // Preserve previous data if new fetch is empty/undefined
-          if (!next.metadata && prev?.metadata) next.metadata = prev.metadata
-          if ((!next.admins || !next.admins.length) && prev?.admins?.length) {
+          const isSameGroup = prev?.metadata?.id === groupId
+          if (!next.metadata && isSameGroup && prev?.metadata) next.metadata = prev.metadata
+          if ((!next.admins || !next.admins.length) && isSameGroup && prev?.admins?.length) {
             next.admins = prev.admins
           }
-          if ((!next.members || !next.members.length) && prev?.members?.length) {
+          if ((!next.members || !next.members.length) && isSameGroup && prev?.members?.length) {
             next.members = prev.members
           }
-          if (!next.membershipStatus && prev?.membershipStatus) {
+          if (!next.membershipStatus && isSameGroup && prev?.membershipStatus) {
             next.membershipStatus = prev.membershipStatus
           }
           return next
@@ -303,11 +306,28 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
   const isAdmin =
     !!pubkey && !!detail?.admins?.some((admin) => admin.pubkey === pubkey)
 
+  const fallbackMeta = discoveryGroups.find(
+    (g) => g.id === groupId && (!groupRelay || !g.relay || g.relay === groupRelay)
+  )
+  const groupDisplayName = detail?.metadata?.name || fallbackMeta?.name || groupId || t('Group')
+  const groupPicture = detail?.metadata?.picture || fallbackMeta?.picture
+  const groupTitle = (
+    <span className="inline-flex items-center gap-2 min-w-0">
+      <Avatar className="h-8 w-8 shrink-0">
+        {groupPicture && <AvatarImage src={groupPicture} alt={groupDisplayName} />}
+        <AvatarFallback className="text-sm font-semibold">
+          {(groupDisplayName || 'GR').slice(0, 2).toUpperCase()}
+        </AvatarFallback>
+      </Avatar>
+      <span className="truncate">{groupDisplayName}</span>
+    </span>
+  )
+
   const content = (
     <SecondaryPageLayout
       ref={ref}
       index={index}
-      title={detail?.metadata?.name || groupId || t('Group')}
+      title={groupTitle}
       controls={
         <div className="flex items-center gap-1">
           <Button
@@ -568,7 +588,12 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
         <PostEditor
           open={isComposerOpen}
           setOpen={setIsComposerOpen}
-          groupContext={{ groupId, relay: resolvedGroupRelay || groupRelay }}
+          groupContext={{
+            groupId,
+            relay: resolvedGroupRelay || groupRelay,
+            name: detail?.metadata?.name,
+            picture: groupPicture
+          }}
           openFrom={resolvedGroupRelay ? [resolvedGroupRelay] : groupRelay ? [groupRelay] : undefined}
         />
       )}

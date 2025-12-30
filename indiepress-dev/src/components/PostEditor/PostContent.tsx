@@ -1,5 +1,6 @@
 import Note from '@/components/Note'
 import { Button } from '@/components/ui/button'
+import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar'
 import { cn } from '@/lib/utils'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import {
@@ -43,6 +44,8 @@ export default function PostContent({
   groupContext?: {
     groupId: string
     relay?: string
+    name?: string
+    picture?: string
   }
   renderSections: (sections: {
     header: React.ReactNode | null
@@ -212,6 +215,9 @@ export default function PostContent({
     setUploadProgresses((prev) => prev.filter((item) => item.file !== file))
   }
 
+  const groupDisplayName = groupContext?.name || groupContext?.groupId
+  const groupInitials = (groupDisplayName || 'GR').slice(0, 2).toUpperCase()
+
   const header = parentEvent ? null : (
     <div className="flex items-center justify-between gap-2">
       <Tabs value={view} onValueChange={(v) => setView(v as 'edit' | 'preview')}>
@@ -221,9 +227,17 @@ export default function PostContent({
         </TabsList>
       </Tabs>
       {groupContext?.groupId && (
-        <div className="text-xs text-muted-foreground truncate">
-          {t('Posting to')} <span className="font-semibold">{groupContext.groupId}</span>
-          {groupContext.relay ? ` • ${groupContext.relay}` : ''}
+        <div className="flex items-center gap-2 text-xs text-muted-foreground min-w-0">
+          <span className="shrink-0">{t('Posting to group relay for')}</span>
+          <div className="flex items-center gap-2 min-w-0">
+            <Avatar className="h-6 w-6 shrink-0">
+              {groupContext.picture && (
+                <AvatarImage src={groupContext.picture} alt={groupDisplayName} />
+              )}
+              <AvatarFallback className="text-[10px] font-semibold">{groupInitials}</AvatarFallback>
+            </Avatar>
+            <span className="truncate font-semibold text-foreground">{groupDisplayName}</span>
+          </div>
         </div>
       )}
     </div>

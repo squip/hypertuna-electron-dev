@@ -47,6 +47,8 @@ export type PostEditorProps = {
   groupContext?: {
     groupId: string
     relay?: string
+    name?: string
+    picture?: string
   }
 }
 
