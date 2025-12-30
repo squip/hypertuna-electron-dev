@@ -14,6 +14,7 @@ import GroupCreateDialog from '@/components/GroupCreateDialog'
 import { isElectron } from '@/lib/platform'
 import { useWorkerBridge } from '@/providers/WorkerBridgeProvider'
 import { toast } from 'sonner'
+import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar'
 import {
   Dialog,
   DialogContent,
@@ -96,6 +97,8 @@ const GroupsPage = forwardRef<TPageRef>((_, ref) => {
     const name = meta?.name || groupId
     const about = meta?.about
     const membersText = meta?.tags?.length ? `${meta.tags.length} tags` : null
+    const picture = meta?.picture
+    const initials = (name || 'GR').slice(0, 2).toUpperCase()
     const key = makeGroupKey(groupId, relay)
     const isFavorite = favoriteGroups.includes(key)
 
@@ -108,6 +111,10 @@ const GroupsPage = forwardRef<TPageRef>((_, ref) => {
         }}
       >
         <CardContent className="p-4 flex gap-3 items-start">
+          <Avatar className="h-11 w-11 shrink-0">
+            {picture && <AvatarImage src={picture} alt={name} />}
+            <AvatarFallback className="text-sm font-semibold">{initials}</AvatarFallback>
+          </Avatar>
           <div className="flex-1 min-w-0 space-y-1">
             <div className="flex items-center justify-between gap-2">
               <div className="font-semibold text-lg truncate">{name}</div>
