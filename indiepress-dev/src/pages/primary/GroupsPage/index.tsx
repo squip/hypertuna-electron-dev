@@ -6,7 +6,7 @@ import { Button } from '@/components/ui/button'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { useTranslation } from 'react-i18next'
 import { forwardRef, useEffect, useImperativeHandle, useRef, useState } from 'react'
-import { Heart, Loader2, Star } from 'lucide-react'
+import { Heart, Loader2 } from 'lucide-react'
 import { Input } from '@/components/ui/input'
 import { useSecondaryPage } from '@/PageManager'
 import { toGroup } from '@/lib/link'
@@ -38,11 +38,9 @@ const GroupsPage = forwardRef<TPageRef>((_, ref) => {
   const {
     discoveryGroups,
     invites,
-    favoriteGroups,
     myGroupList,
     refreshDiscovery,
     refreshInvites,
-    toggleFavorite,
     isLoadingDiscovery,
     discoveryError,
     invitesError,
@@ -100,7 +98,6 @@ const GroupsPage = forwardRef<TPageRef>((_, ref) => {
     const picture = meta?.picture
     const initials = (name || 'GR').slice(0, 2).toUpperCase()
     const key = makeGroupKey(groupId, relay)
-    const isFavorite = favoriteGroups.includes(key)
 
     return (
       <Card
@@ -118,24 +115,6 @@ const GroupsPage = forwardRef<TPageRef>((_, ref) => {
           <div className="flex-1 min-w-0 space-y-1">
             <div className="flex items-center justify-between gap-2">
               <div className="font-semibold text-lg truncate">{name}</div>
-              <div className="flex items-center gap-1">
-                {meta?.relay && (
-                  <span className="text-xs text-muted-foreground truncate max-w-[160px]">
-                    {meta.relay}
-                  </span>
-                )}
-                <Button
-                  variant="ghost"
-                  size="icon"
-                  onClick={(e) => {
-                    e.stopPropagation()
-                    toggleFavorite(key)
-                  }}
-                  title={isFavorite ? t('Remove from favorites') : t('Add to favorites')}
-                >
-                  <Star className={`w-4 h-4 ${isFavorite ? 'fill-current text-yellow-500' : 'text-muted-foreground'}`} />
-                </Button>
-              </div>
             </div>
             {about && <div className="text-sm text-muted-foreground line-clamp-2">{about}</div>}
             {membersText && <div className="text-xs text-muted-foreground">{membersText}</div>}
