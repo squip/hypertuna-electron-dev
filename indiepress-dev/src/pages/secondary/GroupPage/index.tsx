@@ -302,15 +302,19 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
     }
   }
 
-  const membershipStatus = detail?.membershipStatus ?? 'not-member'
-  const isAdmin =
-    !!pubkey && !!detail?.admins?.some((admin) => admin.pubkey === pubkey)
-
   const fallbackMeta = discoveryGroups.find(
     (g) => g.id === groupId && (!groupRelay || !g.relay || g.relay === groupRelay)
   )
-  const groupDisplayName = detail?.metadata?.name || fallbackMeta?.name || groupId || t('Group')
-  const groupPicture = detail?.metadata?.picture || fallbackMeta?.picture
+  const effectiveDetail =
+    detail || (fallbackMeta ? { metadata: fallbackMeta, admins: [], members: [], membershipStatus: 'not-member' as const } : null)
+
+  const membershipStatus = effectiveDetail?.membershipStatus ?? 'not-member'
+  const isAdmin =
+    !!pubkey && !!effectiveDetail?.admins?.some((admin) => admin.pubkey === pubkey)
+
+  const groupDisplayName =
+    effectiveDetail?.metadata?.name || fallbackMeta?.name || groupId || t('Group')
+  const groupPicture = effectiveDetail?.metadata?.picture || fallbackMeta?.picture
   const groupTitle = (
     <span className="inline-flex items-center gap-2 min-w-0">
       <Avatar className="h-8 w-8 shrink-0">
@@ -348,7 +352,7 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
         </div>
       ) : error ? (
         <div className="text-red-500 px-4 py-3">{error}</div>
-      ) : !detail || !groupId ? (
+      ) : (!effectiveDetail || !groupId) ? (
         <div className="flex flex-col items-center justify-center h-64 gap-2 text-muted-foreground">
           <Heart className="w-6 h-6" />
           {t('Group not found')}
@@ -358,31 +362,31 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
           <Card className="overflow-hidden border">
             <CardContent className="p-4 space-y-3">
               <div className="flex gap-3 items-start">
-                {detail.metadata?.picture && (
+                {effectiveDetail.metadata?.picture && (
                   <img
-                    src={detail.metadata.picture}
-                    alt={detail.metadata.name}
+                    src={effectiveDetail.metadata.picture}
+                    alt={effectiveDetail.metadata.name}
                     className="w-16 h-16 rounded-lg object-cover"
                   />
                 )}
                 <div className="flex-1 min-w-0 space-y-1">
                   <div className="flex items-center justify-between gap-2">
                     <div className="text-2xl font-semibold truncate">
-                      {detail.metadata?.name || groupId}
+                      {effectiveDetail.metadata?.name || groupId}
                     </div>
                   </div>
-                  {detail.metadata?.about && (
+                  {effectiveDetail.metadata?.about && (
                     <div className="text-sm text-muted-foreground whitespace-pre-line">
-                      {detail.metadata.about}
+                      {effectiveDetail.metadata.about}
                     </div>
                   )}
                   <div className="flex items-center gap-2 text-sm text-muted-foreground">
-                    {detail.metadata?.isPublic === false && <span>{t('Private')}</span>}
-                    {detail.metadata?.isOpen === false && <span>{t('Closed')}</span>}
-                    {detail.members && (
+                    {effectiveDetail.metadata?.isPublic === false && <span>{t('Private')}</span>}
+                    {effectiveDetail.metadata?.isOpen === false && <span>{t('Closed')}</span>}
+                    {effectiveDetail.members && effectiveDetail.members.length > 0 && (
                       <span>
-                        {detail.members.length}{' '}
-                        {detail.members.length === 1 ? t('member') : t('members')}
+                        {effectiveDetail.members.length}{' '}
+                        {effectiveDetail.members.length === 1 ? t('member') : t('members')}
                       </span>
                     )}
                     {groupRelay && (
@@ -440,9 +444,9 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
                   {joinFlow.error ? ` — ${joinFlow.error}` : ''}
                 </div>
               )}
-              {detail.admins && detail.admins.length > 0 && (
+              {effectiveDetail.admins && effectiveDetail.admins.length > 0 && (
                 <div className="flex gap-2 flex-wrap text-sm text-muted-foreground">
-                  {detail.admins.map((admin) => (
+                  {effectiveDetail.admins.map((admin) => (
                     <div
                       key={admin.pubkey}
                       className="inline-flex items-center gap-1 rounded-full bg-muted px-2 py-1"
@@ -466,7 +470,7 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
               <TabsTrigger value="notes">{t('Notes')}</TabsTrigger>
               <TabsTrigger value="members">
                 {t('Members')}
-                {detail.members ? ` (${detail.members.length})` : ''}
+                {effectiveDetail.members ? ` (${effectiveDetail.members.length})` : ''}
               </TabsTrigger>
             </TabsList>
             <TabsContent value="notes" className="mt-2">
@@ -489,9 +493,9 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
                     </Button>
                   </div>
                 )}
-                {detail.members && detail.members.length > 0 ? (
+                {effectiveDetail.members && effectiveDetail.members.length > 0 ? (
                   <div className="space-y-2">
-                    <ProfileList pubkeys={detail.members} />
+                    <ProfileList pubkeys={effectiveDetail.members} />
                     {isAdmin && (
                       <div className="space-y-1">
                         <div className="text-xs text-muted-foreground">{t('Remove member')}</div>
@@ -591,7 +595,7 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
           groupContext={{
             groupId,
             relay: resolvedGroupRelay || groupRelay,
-            name: detail?.metadata?.name,
+            name: effectiveDetail?.metadata?.name,
             picture: groupPicture
           }}
           openFrom={resolvedGroupRelay ? [resolvedGroupRelay] : groupRelay ? [groupRelay] : undefined}
