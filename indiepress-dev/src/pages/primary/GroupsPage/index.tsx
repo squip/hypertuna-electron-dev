@@ -33,6 +33,8 @@ type TTab = 'discover' | 'my' | 'invites'
 
 const makeGroupKey = (groupId: string, relay?: string) => (relay ? `${relay}|${groupId}` : groupId)
 
+const facepileCache = new Map<string, string[]>() // persists across page mounts within the session
+
 function GroupFacepile({ groupId, relay }: { groupId: string; relay?: string }) {
   const { t } = useTranslation()
   const { followList } = useNostr()
@@ -41,13 +43,21 @@ function GroupFacepile({ groupId, relay }: { groupId: string; relay?: string }) 
 
   useEffect(() => {
     let cancelled = false
+    const cacheKey = makeGroupKey(groupId, relay)
+    if (facepileCache.has(cacheKey)) {
+      setMembers(facepileCache.get(cacheKey) || [])
+      return
+    }
     fetchGroupDetail(groupId, relay)
       .then((d) => {
         if (cancelled) return
-        setMembers(d.members || [])
+        const memberList = d.members || []
+        facepileCache.set(cacheKey, memberList)
+        setMembers(memberList)
       })
       .catch(() => {
         if (cancelled) return
+        facepileCache.set(cacheKey, [])
         setMembers([])
       })
     return () => {
