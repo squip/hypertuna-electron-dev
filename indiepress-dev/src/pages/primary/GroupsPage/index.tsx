@@ -5,7 +5,7 @@ import { Card, CardContent } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { useTranslation } from 'react-i18next'
-import { forwardRef, useEffect, useImperativeHandle, useRef, useState } from 'react'
+import { forwardRef, useEffect, useImperativeHandle, useMemo, useRef, useState } from 'react'
 import { Heart, Loader2 } from 'lucide-react'
 import { Input } from '@/components/ui/input'
 import { useSecondaryPage } from '@/PageManager'
@@ -15,6 +15,8 @@ import { isElectron } from '@/lib/platform'
 import { useWorkerBridge } from '@/providers/WorkerBridgeProvider'
 import { toast } from 'sonner'
 import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar'
+import { SimpleUserAvatar } from '@/components/UserAvatar'
+import { useNostr } from '@/providers/NostrProvider'
 import {
   Dialog,
   DialogContent,
@@ -30,6 +32,63 @@ import { Switch } from '@/components/ui/switch'
 type TTab = 'discover' | 'my' | 'invites'
 
 const makeGroupKey = (groupId: string, relay?: string) => (relay ? `${relay}|${groupId}` : groupId)
+
+function GroupFacepile({ groupId, relay }: { groupId: string; relay?: string }) {
+  const { t } = useTranslation()
+  const { followList } = useNostr()
+  const { fetchGroupDetail } = useGroups()
+  const [members, setMembers] = useState<string[] | null>(null)
+
+  useEffect(() => {
+    let cancelled = false
+    fetchGroupDetail(groupId, relay)
+      .then((d) => {
+        if (cancelled) return
+        setMembers(d.members || [])
+      })
+      .catch(() => {
+        if (cancelled) return
+        setMembers([])
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [fetchGroupDetail, groupId, relay])
+
+  const sortedMembers = useMemo(() => {
+    if (!members || !members.length) return []
+    const list = [...members]
+    list.sort((a, b) => {
+      const aFollow = followList.includes(a)
+      const bFollow = followList.includes(b)
+      if (aFollow !== bFollow) return aFollow ? -1 : 1
+      return 0
+    })
+    return list.slice(0, 5)
+  }, [members, followList])
+
+  if (!members || members.length === 0 || sortedMembers.length === 0) return null
+
+  const countLabel = `${new Intl.NumberFormat(undefined, { notation: 'compact' }).format(
+    members.length
+  )} ${t('Members')}`
+
+  return (
+    <div className="flex items-center gap-2">
+      <div className="flex -space-x-2">
+        {sortedMembers.map((pubkey) => (
+          <div
+            key={pubkey}
+            className="h-5 w-5 rounded-full ring-2 ring-background overflow-hidden bg-muted"
+          >
+            <SimpleUserAvatar userId={pubkey} size="small" className="h-full w-full rounded-full" />
+          </div>
+        ))}
+      </div>
+      <div className="text-xs text-muted-foreground font-medium whitespace-nowrap">{countLabel}</div>
+    </div>
+  )
+}
 
 const GroupsPage = forwardRef<TPageRef>((_, ref) => {
   const layoutRef = useRef<TPageRef>(null)
@@ -97,11 +156,10 @@ const GroupsPage = forwardRef<TPageRef>((_, ref) => {
     const membersText = meta?.tags?.length ? `${meta.tags.length} tags` : null
     const picture = meta?.picture
     const initials = (name || 'GR').slice(0, 2).toUpperCase()
-    const key = makeGroupKey(groupId, relay)
 
     return (
       <Card
-        key={key}
+        key={makeGroupKey(groupId, relay)}
         className="cursor-pointer transition-colors hover:bg-accent/50 overflow-hidden"
         onClick={() => {
           push(toGroup(groupId, relay))
@@ -115,6 +173,7 @@ const GroupsPage = forwardRef<TPageRef>((_, ref) => {
           <div className="flex-1 min-w-0 space-y-1">
             <div className="flex items-center justify-between gap-2">
               <div className="font-semibold text-lg truncate">{name}</div>
+              <GroupFacepile groupId={groupId} relay={relay} />
             </div>
             {about && <div className="text-sm text-muted-foreground line-clamp-2">{about}</div>}
             {membersText && <div className="text-xs text-muted-foreground">{membersText}</div>}
