@@ -39,7 +39,7 @@ import { Event, VerifiedEvent } from '@nostr/tools/wasm'
 import * as kinds from '@nostr/tools/kinds'
 import * as nip19 from '@nostr/tools/nip19'
 import * as nip49 from '@nostr/tools/nip49'
-import { createContext, useContext, useEffect, useState } from 'react'
+import { createContext, useContext, useEffect, useState, FormEvent, MouseEvent } from 'react'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
 import { useDeletedEvent } from '../DeletedEventProvider'
@@ -773,17 +773,24 @@ export function NostrProvider({ children }: { children: React.ReactNode }) {
     }
   }
 
-	  return (
-	    <NostrContext.Provider
-	      value={{
-	        isInitialized,
-	        isReady,
-	        pubkey: account?.pubkey ?? null,
-	        nsecHex,
-	        profile,
-	        relayList,
-	        followList,
-	        muteList,
+  const handleNcryptUnlock = (e?: FormEvent<HTMLFormElement> | MouseEvent<HTMLButtonElement>) => {
+    e?.preventDefault()
+    if (!ncryptPrompt || !ncryptPassword) return
+    ncryptPrompt.resolve(ncryptPassword)
+    setNcryptPrompt(null)
+  }
+
+  return (
+    <NostrContext.Provider
+      value={{
+        isInitialized,
+        isReady,
+        pubkey: account?.pubkey ?? null,
+        nsecHex,
+        profile,
+        relayList,
+        followList,
+        muteList,
         bookmarkList,
         favoriteRelays,
         userEmojiList,
@@ -831,40 +838,37 @@ export function NostrProvider({ children }: { children: React.ReactNode }) {
         }}
       >
         <DialogContent>
-          <DialogHeader>
-            <DialogTitle>{t('Unlock encrypted key')}</DialogTitle>
-            <DialogDescription>{t('Enter the password to decrypt your ncryptsec')}</DialogDescription>
-          </DialogHeader>
-          <Input
-            type="password"
-            value={ncryptPassword}
-            onChange={(e) => setNcryptPassword(e.target.value)}
-            placeholder={t('Password') as string}
-          />
-          <DialogFooter className="mt-3 flex justify-end gap-2">
-            <Button
-              variant="ghost"
-              onClick={() => {
-                if (ncryptPrompt) {
-                  ncryptPrompt.resolve(null)
-                  setNcryptPrompt(null)
-                }
-              }}
-            >
-              {t('Cancel')}
-            </Button>
-            <Button
-              onClick={() => {
-                if (ncryptPrompt) {
-                  ncryptPrompt.resolve(ncryptPassword || null)
-                  setNcryptPrompt(null)
-                }
-              }}
-              disabled={!ncryptPassword}
-            >
-              {t('Unlock')}
-            </Button>
-          </DialogFooter>
+          <form className="grid gap-4" onSubmit={handleNcryptUnlock}>
+            <DialogHeader>
+              <DialogTitle>{t('Unlock encrypted key')}</DialogTitle>
+              <DialogDescription>
+                {t('Enter the password to decrypt your ncryptsec')}
+              </DialogDescription>
+            </DialogHeader>
+            <Input
+              type="password"
+              value={ncryptPassword}
+              onChange={(e) => setNcryptPassword(e.target.value)}
+              placeholder={t('Password') as string}
+            />
+            <DialogFooter className="mt-3 flex justify-end gap-2">
+              <Button
+                type="button"
+                variant="ghost"
+                onClick={() => {
+                  if (ncryptPrompt) {
+                    ncryptPrompt.resolve(null)
+                    setNcryptPrompt(null)
+                  }
+                }}
+              >
+                {t('Cancel')}
+              </Button>
+              <Button type="submit" disabled={!ncryptPassword}>
+                {t('Unlock')}
+              </Button>
+            </DialogFooter>
+          </form>
         </DialogContent>
       </Dialog>
     </NostrContext.Provider>
