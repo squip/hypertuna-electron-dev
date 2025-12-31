@@ -6,7 +6,7 @@ import { useGroups } from '@/providers/GroupsProvider'
 import { TPageRef } from '@/types'
 import { useTranslation } from 'react-i18next'
 import { forwardRef, useEffect, useMemo, useRef, useState } from 'react'
-import { Heart, Loader2, LogOut, Send, Star } from 'lucide-react'
+import { Users, Loader2, LogOut, Send, Star } from 'lucide-react'
 import { Card, CardContent } from '@/components/ui/card'
 import UserAvatar from '@/components/UserAvatar'
 import Username from '@/components/Username'
@@ -354,7 +354,7 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
         <div className="text-red-500 px-4 py-3">{error}</div>
       ) : (!effectiveDetail || !groupId) ? (
         <div className="flex flex-col items-center justify-center h-64 gap-2 text-muted-foreground">
-          <Heart className="w-6 h-6" />
+          <Users className="w-6 h-6" />
           {t('Group not found')}
         </div>
       ) : (
@@ -389,12 +389,7 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
                         {effectiveDetail.members.length === 1 ? t('member') : t('members')}
                       </span>
                     )}
-                    {groupRelay && (
-                      <>
-                        <span>•</span>
-                        <span className="truncate max-w-[200px]">{groupRelay}</span>
-                      </>
-                    )}
+                    
                   </div>
                 </div>
               </div>
@@ -424,14 +419,7 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
                       : t('Join')}
                   </Button>
                 )}
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  onClick={() => toggleFavorite(groupKey)}
-                  title={isFavorite ? t('Remove from favorites') : t('Add to favorites')}
-                >
-                  <Star className={`w-4 h-4 ${isFavorite ? 'fill-current text-yellow-500' : ''}`} />
-                </Button>
+                
                 {inviteToken && membershipStatus !== 'member' && (
                   <Button size="sm" variant="secondary" onClick={handleJoin}>
                     {t('Use invite')}

@@ -6,7 +6,7 @@ import { Button } from '@/components/ui/button'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { useTranslation } from 'react-i18next'
 import { forwardRef, useEffect, useImperativeHandle, useMemo, useRef, useState } from 'react'
-import { Heart, Loader2 } from 'lucide-react'
+import { Loader2, Users } from 'lucide-react'
 import { Input } from '@/components/ui/input'
 import { useSecondaryPage } from '@/PageManager'
 import { toGroup } from '@/lib/link'
@@ -617,7 +617,7 @@ function GroupsPageTitlebar() {
 
   return (
     <div className="flex gap-2 items-center h-full pl-3 [&_svg]:text-muted-foreground">
-      <Heart />
+      <Users />
       <div className="text-lg font-semibold" style={{ fontSize: 'var(--title-font-size, 18px)' }}>
         {t('Groups')}
       </div>
