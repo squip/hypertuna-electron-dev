@@ -88,7 +88,7 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
     const requestId = ++requestIdRef.current
     setIsLoading(true)
     setError(null)
-    fetchGroupDetail(groupId, groupRelay)
+    fetchGroupDetail(groupId, groupRelay, { preferRelay: true })
       .then((d) => {
         // Ignore stale responses
         if (requestId !== requestIdRef.current) return
@@ -182,7 +182,7 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
   useEffect(() => {
     if (!groupId) return
     if (joinFlow?.phase !== 'success') return
-    fetchGroupDetail(groupId, groupRelay).then(setDetail).catch(() => {})
+    fetchGroupDetail(groupId, groupRelay, { preferRelay: true }).then(setDetail).catch(() => {})
   }, [fetchGroupDetail, groupId, groupRelay, joinFlow?.phase])
 
   const handleJoin = async () => {
@@ -232,7 +232,7 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
       toast.success(t('Metadata updated'))
       setIsMetadataDialogOpen(false)
       // Refresh detail
-      fetchGroupDetail(groupId, groupRelay).then(setDetail)
+        fetchGroupDetail(groupId, groupRelay, { preferRelay: true }).then(setDetail)
     } catch (err) {
       toast.error(t('Failed to update metadata'))
       setError((err as Error).message)

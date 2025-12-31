@@ -152,6 +152,9 @@ type WorkerBridgeContextValue = {
   workerStdout: string[]
   workerStderr: string[]
   lastError: string | null
+  getRelayPeerCount: (identifier?: string | null) => number
+  getRelayPeerSet: (identifier?: string | null) => Set<string>
+  isMemberOnline: (pubkey: string, identifier?: string | null) => boolean
   startWorker: () => Promise<void>
   stopWorker: () => Promise<void>
   restartWorker: () => Promise<void>
@@ -262,6 +265,33 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
   const [workerStdout, setWorkerStdout] = useState<string[]>([])
   const [workerStderr, setWorkerStderr] = useState<string[]>([])
   const [lastError, setLastError] = useState<string | null>(null)
+  const [peerRelayMap, setPeerRelayMap] = useState<
+    Map<
+      string,
+      {
+        peers: Set<string>
+        peerCount: number
+        status?: string
+        lastActive?: number | string | null
+        createdAt?: number | string | null
+        metadata?: unknown
+      }
+    >
+  >(new Map())
+  const [peerDetails, setPeerDetails] = useState<
+    Map<
+      string,
+      {
+        nostrPubkeyHex?: string | null
+        relays?: string[]
+        relayCount?: number
+        lastSeen?: number | string | null
+        status?: string
+        mode?: string | null
+        address?: string | null
+      }
+    >
+  >(new Map())
 
   const restartAttemptRef = useRef(0)
   const restartTimeoutRef = useRef<number | null>(null)
@@ -295,6 +325,75 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
     if (restartTimeoutRef.current == null) return
     window.clearTimeout(restartTimeoutRef.current)
     restartTimeoutRef.current = null
+  }, [])
+
+  const applyPeerTelemetry = useCallback((status: GatewayStatus | null | undefined) => {
+    if (!status) {
+      setPeerRelayMap(new Map())
+      setPeerDetails(new Map())
+      return
+    }
+    if (status.peerRelayMap) {
+      const next = new Map<
+        string,
+        {
+          peers: Set<string>
+          peerCount: number
+          status?: string
+          lastActive?: number | string | null
+          createdAt?: number | string | null
+          metadata?: unknown
+        }
+      >()
+      Object.entries(status.peerRelayMap).forEach(([identifier, info]) => {
+        if (!identifier) return
+        const peerArr = Array.isArray(info?.peers) ? info.peers : []
+        next.set(identifier, {
+          peers: new Set(peerArr.filter(Boolean).map((p) => String(p))),
+          peerCount:
+            typeof info?.peerCount === 'number'
+              ? info.peerCount
+              : peerArr.filter(Boolean).length,
+          status: info?.status,
+          lastActive: info?.lastActive ?? null,
+          createdAt: info?.createdAt ?? null,
+          metadata: info?.metadata
+        })
+      })
+      console.info('[WorkerBridge] peerRelayMap keys', Array.from(next.keys()))
+      setPeerRelayMap(next)
+    }
+    if (status.peerDetails) {
+      const nextDetails = new Map<
+        string,
+        {
+          nostrPubkeyHex?: string | null
+          relays?: string[]
+          relayCount?: number
+          lastSeen?: number | string | null
+          status?: string
+          mode?: string | null
+          address?: string | null
+        }
+      >()
+      Object.entries(status.peerDetails).forEach(([key, info]) => {
+        if (!key) return
+        nextDetails.set(key, {
+          nostrPubkeyHex: info?.nostrPubkeyHex || null,
+          relays: Array.isArray(info?.relays) ? info.relays : [],
+          relayCount:
+            typeof info?.relayCount === 'number'
+              ? info.relays?.length ?? 0
+              : info?.relayCount,
+          lastSeen: info?.lastSeen ?? null,
+          status: info?.status,
+          mode: info?.mode ?? null,
+          address: info?.address ?? null
+        })
+      })
+      console.info('[WorkerBridge] peerDetails keys', Array.from(nextDetails.keys()))
+      setPeerDetails(nextDetails)
+    }
   }, [])
 
   const setAutostartEnabled = useCallback((enabled: boolean) => {
@@ -501,7 +600,9 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
         ])
 
         if (gwStatus.status === 'fulfilled' && gwStatus.value?.success) {
-          setGatewayStatus(gwStatus.value.status || null)
+          const status = gwStatus.value.status || null
+          setGatewayStatus(status)
+          applyPeerTelemetry(status)
         }
         if (gwLogs.status === 'fulfilled' && gwLogs.value?.success && Array.isArray(gwLogs.value.logs)) {
           setGatewayLogs(gwLogs.value.logs.slice(-MAX_LOGS))
@@ -515,7 +616,7 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
 
       electronIpc.sendToWorker({ type: 'get-relays' }).catch(() => {})
     },
-    [setGatewayLogs, setGatewayStatus, setPublicGatewayStatus]
+    [applyPeerTelemetry, setGatewayLogs, setGatewayStatus, setPublicGatewayStatus]
   )
 
   const stopWorkerInternal = useCallback(
@@ -544,6 +645,7 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
       setPublicGatewayStatus(null)
       setPublicGatewayToken(null)
       setJoinFlows({})
+      applyPeerTelemetry(null)
       relayCreateResolversRef.current.forEach(({ reject, timeoutId }) => {
         window.clearTimeout(timeoutId)
         reject(new Error('Worker stopped'))
@@ -551,7 +653,7 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
       relayCreateResolversRef.current = []
       setLifecycle('stopped')
     },
-    [clearRestartTimeout]
+    [applyPeerTelemetry, clearRestartTimeout]
   )
 
   const scheduleAutoRestart = useCallback(() => {
@@ -634,9 +736,11 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
             break
           case 'gateway-status':
             setGatewayStatus(msg.status || null)
+            applyPeerTelemetry(msg.status || null)
             break
           case 'gateway-started':
             setGatewayStatus(msg.status || null)
+            applyPeerTelemetry(msg.status || null)
             break
           case 'gateway-logs':
             if (Array.isArray(msg.logs)) {
@@ -654,6 +758,7 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
             break
           case 'gateway-stopped':
             setGatewayStatus(msg.status || null)
+            applyPeerTelemetry(msg.status || null)
             break
           case 'public-gateway-status':
             setPublicGatewayStatus(msg.state || msg.status || null)
@@ -914,6 +1019,31 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
     stopWorkerInternal
   ])
 
+  useEffect(() => {
+    if (!isElectron()) return
+    if (lifecycle !== 'ready') return
+
+    let cancelled = false
+    const poll = async () => {
+      try {
+        const res = await electronIpc.getGatewayStatus()
+        if (!res?.success) return
+        if (cancelled) return
+        setGatewayStatus(res.status || null)
+        applyPeerTelemetry(res.status || null)
+      } catch (err) {
+        void err
+      }
+    }
+
+    poll()
+    const id = window.setInterval(poll, 60_000)
+    return () => {
+      cancelled = true
+      window.clearInterval(id)
+    }
+  }, [applyPeerTelemetry, lifecycle])
+
   const ready = statusV1?.phase === 'ready'
 
   const readinessMessage = useMemo(() => {
@@ -928,6 +1058,75 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
     if (lifecycle === 'error') return lastError ? `Error: ${lastError}` : readinessMessageForStatus(statusV1)
     return readinessMessageForStatus(statusV1)
   }, [identityReady, lastError, lifecycle, statusV1])
+
+  const getRelayPeerEntry = useCallback(
+    (identifier?: string | null) => {
+      if (!identifier) return null
+      const candidates = new Set<string>()
+      candidates.add(identifier)
+      candidates.add(identifier.replace(':', '/'))
+      // strip protocol and trailing slash
+      try {
+        const parsed = new URL(identifier)
+        candidates.add(parsed.host + parsed.pathname)
+        candidates.add(parsed.host)
+      } catch (_) {
+        void _
+      }
+      let entry: typeof peerRelayMap extends Map<string, infer V> ? V | null : null = null
+      for (const key of candidates) {
+        const found = peerRelayMap.get(key)
+        if (found) {
+          entry = found
+          break
+        }
+      }
+      if (entry) return entry
+      // fuzzy fallback: look for keys that contain the identifier fragment
+      for (const [key, value] of peerRelayMap.entries()) {
+        if (!identifier) continue
+        if (key.includes(identifier) || identifier.includes(key)) {
+          return value
+        }
+      }
+      return null
+    },
+    [peerRelayMap]
+  )
+
+  const getRelayPeerCount = useCallback(
+    (identifier?: string | null) => {
+      const entry = getRelayPeerEntry(identifier)
+      if (!entry) return 0
+      if (typeof entry.peerCount === 'number') return entry.peerCount
+      return entry.peers?.size ?? 0
+    },
+    [getRelayPeerEntry]
+  )
+
+  const getRelayPeerSet = useCallback(
+    (identifier?: string | null) => {
+      const entry = getRelayPeerEntry(identifier)
+      if (!entry) return new Set<string>()
+      return entry.peers instanceof Set ? entry.peers : new Set<string>()
+    },
+    [getRelayPeerEntry]
+  )
+
+  const isMemberOnline = useCallback(
+    (pubkey: string, identifier?: string | null) => {
+      if (!pubkey) return false
+      const normalized = pubkey.toLowerCase()
+      const peers = getRelayPeerSet(identifier)
+      for (const peerKey of peers) {
+        const detail = peerDetails.get(peerKey)
+        if (!detail?.nostrPubkeyHex) continue
+        if (detail.nostrPubkeyHex.toLowerCase() === normalized) return true
+      }
+      return false
+    },
+    [getRelayPeerSet, peerDetails]
+  )
 
   const value = useMemo<WorkerBridgeContextValue>(
     () => ({
@@ -949,6 +1148,9 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
       workerStdout,
       workerStderr,
       lastError,
+      getRelayPeerCount,
+      getRelayPeerSet,
+      isMemberOnline,
       startWorker: async () => {
         setSessionStopRequested(false)
         await startWorkerInternal({ resetRestartAttempts: true })

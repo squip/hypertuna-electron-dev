@@ -67,7 +67,7 @@ export const BIG_RELAY_URLS = [
   'wss://relay.damus.io/',
   'wss://relay.primal.net/',
   'wss://nos.lol/',
-  'wss://hyptertuna.com/relay'
+  'wss://hypertuna.com/relay'
 ]
 
 export const SEARCHABLE_RELAY_URLS = ['wss://relay.nostr.band/', 'wss://search.nos.today/']

@@ -34,13 +34,19 @@ type TTab = 'discover' | 'my' | 'invites'
 const makeGroupKey = (groupId: string, relay?: string) => (relay ? `${relay}|${groupId}` : groupId)
 
 const facepileCache = new Map<string, string[]>() // persists across page mounts within the session
+let runningFetches = 0
+const facepilePending = new Map<string, Promise<string[]>>()
 
-function GroupFacepile({ groupId, relay }: { groupId: string; relay?: string }) {
+function GroupFacepile({ groupId, relay, show }: { groupId: string; relay?: string; show: boolean }) {
   const { t } = useTranslation()
   const { followList } = useNostr()
-  const { fetchGroupDetail } = useGroups()
+  const { fetchGroupDetail, myGroupList } = useGroups()
+  const { getRelayPeerCount } = useWorkerBridge()
   const [members, setMembers] = useState<string[] | null>(null)
 
+  if (!show) return null
+
+  // Lightweight, rate-limited member fetch to avoid hammering relays for every card
   useEffect(() => {
     let cancelled = false
     const cacheKey = makeGroupKey(groupId, relay)
@@ -48,10 +54,46 @@ function GroupFacepile({ groupId, relay }: { groupId: string; relay?: string }) 
       setMembers(facepileCache.get(cacheKey) || [])
       return
     }
-    fetchGroupDetail(groupId, relay)
-      .then((d) => {
+
+    // simple semaphore limiter
+    const MAX_CONCURRENT = 2
+    const acquire = async () => {
+      while (runningFetches >= MAX_CONCURRENT) {
+        await new Promise((res) => setTimeout(res, 150))
+      }
+      runningFetches += 1
+      return () => {
+        runningFetches = Math.max(0, runningFetches - 1)
+      }
+    }
+
+    const loadMembers = () => {
+      const pending = facepilePending.get(cacheKey)
+      if (pending) return pending
+
+      const promise = (async () => {
+        const release = await acquire()
+        try {
+          const isMember = myGroupList.some(
+            (entry) => entry.groupId === groupId && (!relay || entry.relay === relay)
+          )
+          const detail = await fetchGroupDetail(groupId, relay, {
+            discoveryOnly: !isMember,
+            preferRelay: isMember
+          })
+          return detail.members || []
+        } finally {
+          release()
+        }
+      })()
+      facepilePending.set(cacheKey, promise)
+      promise.finally(() => facepilePending.delete(cacheKey))
+      return promise
+    }
+
+    loadMembers()
+      .then((memberList) => {
         if (cancelled) return
-        const memberList = d.members || []
         facepileCache.set(cacheKey, memberList)
         setMembers(memberList)
       })
@@ -60,10 +102,11 @@ function GroupFacepile({ groupId, relay }: { groupId: string; relay?: string }) 
         facepileCache.set(cacheKey, [])
         setMembers([])
       })
+
     return () => {
       cancelled = true
     }
-  }, [fetchGroupDetail, groupId, relay])
+  }, [fetchGroupDetail, groupId, relay, myGroupList])
 
   const sortedMembers = useMemo(() => {
     if (!members || !members.length) return []
@@ -79,9 +122,12 @@ function GroupFacepile({ groupId, relay }: { groupId: string; relay?: string }) 
 
   if (!members || members.length === 0 || sortedMembers.length === 0) return null
 
-  const countLabel = `${new Intl.NumberFormat(undefined, { notation: 'compact' }).format(
+  const memberCountLabel = `${new Intl.NumberFormat(undefined, { notation: 'compact' }).format(
     members.length
   )} ${t('Members')}`
+  const peerCount = getRelayPeerCount(groupId) || getRelayPeerCount(relay)
+  const peerLabel =
+    peerCount > 0 ? `${new Intl.NumberFormat(undefined, { notation: 'compact' }).format(peerCount)} ${t('online')}` : null
 
   return (
     <div className="flex items-center gap-2">
@@ -95,7 +141,9 @@ function GroupFacepile({ groupId, relay }: { groupId: string; relay?: string }) 
           </div>
         ))}
       </div>
-      <div className="text-xs text-muted-foreground font-medium whitespace-nowrap">{countLabel}</div>
+      <div className="text-xs text-muted-foreground font-medium whitespace-nowrap">
+        {peerLabel ? `${memberCountLabel} • ${peerLabel}` : memberCountLabel}
+      </div>
     </div>
   )
 }
@@ -151,7 +199,11 @@ const GroupsPage = forwardRef<TPageRef>((_, ref) => {
     }
   }, [clearJoinFlow, joinFlow?.phase, joinId, showRelayJoin])
 
+  const inviteGroupIds = useMemo(() => new Set(invites.map((inv) => inv.groupId)), [invites])
   const filteredDiscovery = discoveryGroups.filter((g) => {
+    const isMember = myGroupList.some((entry) => entry.groupId === g.id)
+    const invited = inviteGroupIds.has(g.id)
+    if (g.isPublic === false && !isMember && !invited) return false
     if (!search.trim()) return true
     const q = search.toLowerCase()
     return g.name.toLowerCase().includes(q) || (g.about ?? '').toLowerCase().includes(q)
@@ -183,7 +235,11 @@ const GroupsPage = forwardRef<TPageRef>((_, ref) => {
           <div className="flex-1 min-w-0 space-y-1">
             <div className="flex items-center justify-between gap-2">
               <div className="font-semibold text-lg truncate">{name}</div>
-              <GroupFacepile groupId={groupId} relay={relay} />
+              <GroupFacepile
+                groupId={groupId}
+                relay={relay}
+                show={meta?.isPublic !== false || myGroupList.some((entry) => entry.groupId === groupId)}
+              />
             </div>
             {about && <div className="text-sm text-muted-foreground line-clamp-2">{about}</div>}
             {membersText && <div className="text-xs text-muted-foreground">{membersText}</div>}

@@ -49,7 +49,11 @@ type TGroupsContext = {
   saveMyGroupList: (entries: TGroupListEntry[], options?: TPublishOptions) => Promise<void>
   sendJoinRequest: (groupId: string, relay?: string, code?: string, reason?: string) => Promise<void>
   sendLeaveRequest: (groupId: string, relay?: string, reason?: string) => Promise<void>
-  fetchGroupDetail: (groupId: string, relay?: string) => Promise<{
+  fetchGroupDetail: (
+    groupId: string,
+    relay?: string,
+    opts?: { preferRelay?: boolean; discoveryOnly?: boolean }
+  ) => Promise<{
     metadata: TGroupMetadata | null
     admins: TGroupAdmin[]
     members: string[]
@@ -159,6 +163,8 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       const [metadataEvents, relayEvents] = await Promise.all([
         client.fetchEvents(discoveryRelays, {
           kinds: [ExtendedKind.GROUP_METADATA],
+          '#i': [HYPERTUNA_IDENTIFIER_TAG],
+          since: 1764892800, // 2025-12-05T00:00:00Z - temporary cutoff to filter legacy noise
           limit: 200
         }),
         client.fetchEvents(discoveryRelays, {
@@ -280,13 +286,18 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
   )
 
   const fetchGroupDetail = useCallback(
-    async (groupId: string, relay?: string) => {
+    async (
+      groupId: string,
+      relay?: string,
+      opts?: { preferRelay?: boolean; discoveryOnly?: boolean }
+    ) => {
       const resolved = relay ? resolveRelayUrl(relay) : null
-      // If we have an authenticated/tokenized relay, prefer it, but always include public discovery relays
-      const groupRelays = resolved ? [resolved] : defaultDiscoveryRelays
-      const metadataRelays = Array.from(
-        new Set([...(resolved ? [resolved] : []), ...discoveryRelays])
-      )
+      const preferRelay = !!opts?.preferRelay && !!resolved && !opts?.discoveryOnly
+      // Default: discovery only for list/facepile; optionally prefer relay for detail when member
+      const groupRelays = preferRelay ? [resolved!] : defaultDiscoveryRelays
+      const metadataRelays = opts?.discoveryOnly
+        ? discoveryRelays
+        : Array.from(new Set([...(preferRelay ? [resolved!] : []), ...discoveryRelays]))
 
       let metadataEvt = null as any
       try {
@@ -723,12 +734,15 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       createGroup: async (data) => {
         const { name, about, picture, isPublic, isOpen, relays } = data
         if (!pubkey) throw new Error('Not logged in')
-        const targetRelays = relays?.length ? relays : discoveryRelays
+
+        const discoveryTargets = discoveryRelays
+        const localTargets = relays?.length ? relays : discoveryRelays
         const groupId = buildGroupIdForCreation(pubkey, name)
+        const createdAt = Math.floor(Date.now() / 1000)
 
         const creationEvent: TDraftEvent = {
           kind: 9007,
-          created_at: Math.floor(Date.now() / 1000),
+          created_at: createdAt,
           tags: [['h', groupId]],
           content: ''
         }
@@ -739,22 +753,67 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
         if (picture) metadataTags.push(['picture', picture])
         metadataTags.push([isPublic ? 'public' : 'private'])
         metadataTags.push([isOpen ? 'open' : 'closed'])
+        metadataTags.push(['i', HYPERTUNA_IDENTIFIER_TAG])
 
         const metadataEvent: TDraftEvent = {
-          kind: 9002,
-          created_at: Math.floor(Date.now() / 1000),
+          kind: 39000,
+          created_at: createdAt,
           tags: metadataTags,
           content: ''
         }
 
-        await publish(creationEvent, { specifiedRelayUrls: targetRelays })
-        await publish(metadataEvent, { specifiedRelayUrls: targetRelays })
+        // Admins (self)
+        const adminsEvent: TDraftEvent = {
+          kind: 39001,
+          created_at: createdAt,
+          tags: [
+            ['h', groupId],
+            ['p', pubkey, 'admin']
+          ],
+          content: ''
+        }
 
-        setDiscoveryRelays(targetRelays)
-        const updatedList = [...myGroupList, { groupId, relay: targetRelays[0] }]
+        // Members (self)
+        const membersEvent: TDraftEvent = {
+          kind: 39002,
+          created_at: createdAt,
+          tags: [
+            ['h', groupId],
+            ['p', pubkey]
+          ],
+          content: ''
+        }
+
+        // Roles placeholder
+        const rolesEvent: TDraftEvent = {
+          kind: 39003,
+          created_at: createdAt,
+          tags: [['h', groupId]],
+          content: ''
+        }
+
+        // Publish per public/private rules
+        await publish(creationEvent, { specifiedRelayUrls: localTargets })
+
+        // 39000 always to discovery + local
+        await publish(metadataEvent, { specifiedRelayUrls: Array.from(new Set([...localTargets, ...discoveryTargets])) })
+
+        if (isPublic) {
+          await publish(adminsEvent, { specifiedRelayUrls: Array.from(new Set([...localTargets, ...discoveryTargets])) })
+          await publish(membersEvent, { specifiedRelayUrls: Array.from(new Set([...localTargets, ...discoveryTargets])) })
+          await publish(rolesEvent, { specifiedRelayUrls: Array.from(new Set([...localTargets, ...discoveryTargets])) })
+        } else {
+          // private: 39001/02/03 only to local
+          await publish(adminsEvent, { specifiedRelayUrls: localTargets })
+          await publish(membersEvent, { specifiedRelayUrls: localTargets })
+          await publish(rolesEvent, { specifiedRelayUrls: localTargets })
+        }
+
+        setDiscoveryRelays(discoveryTargets)
+        const updatedList = [...myGroupList, { groupId, relay: localTargets[0] }]
         setMyGroupList(updatedList)
         await saveMyGroupList(updatedList)
-        return { groupId, relay: targetRelays[0] }
+        return { groupId, relay: localTargets[0] }
       },
       createHypertunaRelayGroup
     }),
