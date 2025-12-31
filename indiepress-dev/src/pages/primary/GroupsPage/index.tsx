@@ -117,7 +117,7 @@ function GroupFacepile({ groupId, relay, show }: { groupId: string; relay?: stri
       if (aFollow !== bFollow) return aFollow ? -1 : 1
       return 0
     })
-    return list.slice(0, 5)
+    return list.slice(0, 3)
   }, [members, followList])
 
   if (!members || members.length === 0 || sortedMembers.length === 0) return null
@@ -130,7 +130,7 @@ function GroupFacepile({ groupId, relay, show }: { groupId: string; relay?: stri
     peerCount > 0 ? `${new Intl.NumberFormat(undefined, { notation: 'compact' }).format(peerCount)} ${t('online')}` : null
 
   return (
-    <div className="flex items-center gap-2">
+    <div className="inline-flex items-center gap-1 rounded-full bg-muted px-2 py-1">
       <div className="flex -space-x-2">
         {sortedMembers.map((pubkey) => (
           <div
@@ -141,8 +141,9 @@ function GroupFacepile({ groupId, relay, show }: { groupId: string; relay?: stri
           </div>
         ))}
       </div>
-      <div className="text-xs text-muted-foreground font-medium whitespace-nowrap">
-        {peerLabel ? `${memberCountLabel} • ${peerLabel}` : memberCountLabel}
+      <div className="text-xs font-medium whitespace-nowrap truncate">
+        {memberCountLabel}
+        {peerLabel ? ` • ${peerLabel}` : ''}
       </div>
     </div>
   )
