@@ -86,7 +86,7 @@ export default function GroupMetadataEditor({
       </div>
       <div className="space-y-2">
         <Label>Picture</Label>
-        <Tabs defaultValue="url" className="w-full">
+        <Tabs defaultValue="upload" className="w-full">
           <TabsList className="grid w-full grid-cols-2">
             <TabsTrigger value="url">URL</TabsTrigger>
             <TabsTrigger value="upload">Upload</TabsTrigger>
@@ -100,11 +100,6 @@ export default function GroupMetadataEditor({
               }}
               placeholder="https://..."
             />
-            {form.picture && (
-              <div className="relative w-full h-32 rounded overflow-hidden border">
-                <img src={form.picture} alt="Preview" className="w-full h-full object-cover" />
-              </div>
-            )}
           </TabsContent>
           <TabsContent value="upload" className="space-y-2">
             <Uploader
@@ -114,27 +109,32 @@ export default function GroupMetadataEditor({
                 setForm((f) => ({ ...f, picture: url }))
               }}
             >
-              <div className="border-2 border-dashed rounded-lg p-8 text-center cursor-pointer hover:bg-accent/50 transition-colors">
-                <Upload className="w-8 h-8 mx-auto mb-2 opacity-50" />
-                <p className="text-sm text-muted-foreground">Click to upload an image</p>
+              <div className="relative w-full h-40 border-2 border-dashed rounded-lg overflow-hidden cursor-pointer hover:bg-accent/50 transition-colors flex items-center justify-center">
+                {!form.picture && (
+                  <div className="text-center p-6">
+                    <Upload className="w-8 h-8 mx-auto mb-2 opacity-50" />
+                    <p className="text-sm text-muted-foreground">Click to upload an image</p>
+                  </div>
+                )}
+                {form.picture && (
+                  <>
+                    <img src={form.picture} alt="Preview" className="w-full h-full object-cover" />
+                    <Button
+                      variant="destructive"
+                      size="icon"
+                      className="absolute top-2 right-2"
+                      onClick={(e) => {
+                        e.stopPropagation()
+                        setHasInteracted(true)
+                        setForm((f) => ({ ...f, picture: '' }))
+                      }}
+                    >
+                      <X className="w-4 h-4" />
+                    </Button>
+                  </>
+                )}
               </div>
             </Uploader>
-            {form.picture && (
-              <div className="relative w-full h-32 rounded overflow-hidden border">
-                <img src={form.picture} alt="Preview" className="w-full h-full object-cover" />
-                <Button
-                  variant="destructive"
-                  size="icon"
-                  className="absolute top-2 right-2"
-                  onClick={() => {
-                    setHasInteracted(true)
-                    setForm((f) => ({ ...f, picture: '' }))
-                  }}
-                >
-                  <X className="w-4 h-4" />
-                </Button>
-              </div>
-            )}
           </TabsContent>
         </Tabs>
       </div>

@@ -52,7 +52,8 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
     removeUser,
     deleteGroup,
     deleteEvent,
-    resolveRelayUrl
+    resolveRelayUrl,
+    myGroupList
   } = useGroups()
   const { pubkey } = useNostr()
   const { joinFlows, startJoinFlow } = useWorkerBridge()
@@ -72,6 +73,12 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
   const [removeEventId, setRemoveEventId] = useState('')
   const requestIdRef = useRef(0)
 
+  const myGroupRelay = useMemo(
+    () => (groupId ? myGroupList.find((entry) => entry.groupId === groupId)?.relay : undefined),
+    [groupId, myGroupList]
+  )
+  const effectiveGroupRelay = useMemo(() => groupRelay || myGroupRelay, [groupRelay, myGroupRelay])
+
   useEffect(() => {
     const searchRelay =
       typeof window !== 'undefined'
@@ -87,10 +94,17 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
     const requestId = ++requestIdRef.current
     setIsLoading(true)
     setError(null)
-    fetchGroupDetail(groupId, groupRelay, { preferRelay: true })
+    fetchGroupDetail(groupId, effectiveGroupRelay, { preferRelay: true })
       .then((d) => {
         // Ignore stale responses
         if (requestId !== requestIdRef.current) return
+        console.info('[GroupPage] detail fetched', {
+          groupId,
+          relay: effectiveGroupRelay,
+          membershipStatus: d?.membershipStatus,
+          membersCount: d?.members?.length,
+          adminsCount: d?.admins?.length
+        })
         setDetail((prev) => {
           const next = { ...d }
           // Preserve previous data if new fetch is empty/undefined
@@ -102,7 +116,14 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
           if ((!next.members || !next.members.length) && isSameGroup && prev?.members?.length) {
             next.members = prev.members
           }
-          if (!next.membershipStatus && isSameGroup && prev?.membershipStatus) {
+          if (
+            (!next.membershipStatus ||
+              (next.membershipStatus === 'not-member' &&
+                isSameGroup &&
+                prev?.membershipStatus === 'member' &&
+                (!next.members || next.members.length === 0))) &&
+            prev?.membershipStatus
+          ) {
             next.membershipStatus = prev.membershipStatus
           }
           return next
@@ -110,18 +131,21 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
       })
       .catch((err) => setError((err as Error).message))
       .finally(() => setIsLoading(false))
-  }, [fetchGroupDetail, groupId, groupRelay])
+  }, [fetchGroupDetail, groupId, effectiveGroupRelay])
 
-  const groupKey = useMemo(() => makeGroupKey(groupId || '', groupRelay), [groupId, groupRelay])
+  const groupKey = useMemo(
+    () => makeGroupKey(groupId || '', effectiveGroupRelay),
+    [groupId, effectiveGroupRelay]
+  )
   const isFavorite = favoriteGroups.includes(groupKey)
 
   const inviteToken = useMemo(() => {
     const match = invites.find(
       (inv) =>
-        inv.groupId === groupId && (!groupRelay || !inv.relay || inv.relay === groupRelay)
+        inv.groupId === groupId && (!effectiveGroupRelay || !inv.relay || inv.relay === effectiveGroupRelay)
     )
     return match?.token
-  }, [invites, groupId, groupRelay])
+  }, [invites, groupId, effectiveGroupRelay])
 
   const joinFlow = useMemo(() => {
     const id = groupId || ''
@@ -129,8 +153,8 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
   }, [groupId, joinFlows])
 
   const resolvedGroupRelay = useMemo(() => {
-    return groupRelay ? resolveRelayUrl(groupRelay) : undefined
-  }, [groupRelay, resolveRelayUrl])
+    return effectiveGroupRelay ? resolveRelayUrl(effectiveGroupRelay) : undefined
+  }, [effectiveGroupRelay, resolveRelayUrl])
 
   const groupSubRequests = useMemo(
     () =>
@@ -140,8 +164,8 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
               source: 'relays' as const,
               urls: resolvedGroupRelay
                 ? [resolvedGroupRelay]
-                : groupRelay
-                  ? [groupRelay]
+                : effectiveGroupRelay
+                  ? [effectiveGroupRelay]
                   : BIG_RELAY_URLS,
               filter: {
                 '#h': [groupId],
@@ -157,7 +181,7 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
             }
           ]
         : [],
-    [groupId, groupRelay, resolvedGroupRelay]
+    [groupId, effectiveGroupRelay, resolvedGroupRelay]
   )
 
   useEffect(() => {
@@ -166,12 +190,13 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
       rawId: id,
       groupId,
       groupRelay,
+      effectiveGroupRelay,
       resolvedGroupRelay
     })
     if (groupSubRequests.length) {
       console.info('[GroupPage] subRequests', groupSubRequests)
     }
-  }, [groupId, groupRelay, id, resolvedGroupRelay, groupSubRequests])
+  }, [groupId, groupRelay, effectiveGroupRelay, id, resolvedGroupRelay, groupSubRequests])
 
   const isHypertunaGroup = useMemo(() => {
     const tags = detail?.metadata?.event?.tags
@@ -181,8 +206,8 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
   useEffect(() => {
     if (!groupId) return
     if (joinFlow?.phase !== 'success') return
-    fetchGroupDetail(groupId, groupRelay, { preferRelay: true }).then(setDetail).catch(() => {})
-  }, [fetchGroupDetail, groupId, groupRelay, joinFlow?.phase])
+    fetchGroupDetail(groupId, effectiveGroupRelay, { preferRelay: true }).then(setDetail).catch(() => {})
+  }, [fetchGroupDetail, groupId, effectiveGroupRelay, joinFlow?.phase])
 
   const handleJoin = async () => {
     if (!groupId) return
@@ -192,7 +217,7 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
         return
       }
 
-      await sendJoinRequest(groupId, groupRelay, inviteToken)
+      await sendJoinRequest(groupId, effectiveGroupRelay, inviteToken)
       setDetail((prev) =>
         prev
           ? { ...prev, membershipStatus: 'pending' }
@@ -212,7 +237,7 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
     if (!invitees.length) return
     setIsSendingInvite(true)
     try {
-      await sendInvites(groupId, invitees, groupRelay)
+      await sendInvites(groupId, invitees, effectiveGroupRelay)
       toast.success(t('Invites sent'))
       setInviteeInput('')
     } catch (err) {
@@ -225,13 +250,28 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
 
   const handleSaveMetadata = async (data: TGroupMetadataForm) => {
     if (!groupId) return
-    setIsSavingMeta(true)
+      setIsSavingMeta(true)
     try {
-      await updateMetadata(groupId, data, groupRelay)
+      await updateMetadata(groupId, data, effectiveGroupRelay)
       toast.success(t('Metadata updated'))
+      // Optimistic local update
+      setDetail((prev) => {
+        if (!prev?.metadata) return prev
+        return {
+          ...prev,
+          metadata: {
+            ...prev.metadata,
+            name: data.name ?? prev.metadata.name,
+            about: data.about ?? prev.metadata.about,
+            picture: data.picture ?? prev.metadata.picture,
+            isOpen: typeof data.isOpen === 'boolean' ? data.isOpen : prev.metadata.isOpen,
+            isPublic: typeof data.isPublic === 'boolean' ? data.isPublic : prev.metadata.isPublic
+          }
+        }
+      })
       setIsMetadataDialogOpen(false)
       // Refresh detail
-        fetchGroupDetail(groupId, groupRelay, { preferRelay: true }).then(setDetail)
+        fetchGroupDetail(groupId, effectiveGroupRelay, { preferRelay: true }).then(setDetail)
     } catch (err) {
       toast.error(t('Failed to update metadata'))
       setError((err as Error).message)
@@ -243,7 +283,7 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
   const handleAddMember = async () => {
     if (!groupId || !memberInput.trim()) return
     try {
-      await addUser(groupId, memberInput.trim(), groupRelay)
+      await addUser(groupId, memberInput.trim(), effectiveGroupRelay)
       toast.success(t('User added'))
       setMemberInput('')
     } catch (err) {
@@ -255,7 +295,7 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
   const handleRemoveMember = async () => {
     if (!groupId || !removePubkey.trim()) return
     try {
-      await removeUser(groupId, removePubkey.trim(), groupRelay)
+      await removeUser(groupId, removePubkey.trim(), effectiveGroupRelay)
       toast.success(t('User removed'))
       setRemovePubkey('')
     } catch (err) {
@@ -267,7 +307,7 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
   const handleDeleteGroup = async () => {
     if (!groupId) return
     try {
-      await deleteGroup(groupId, groupRelay)
+      await deleteGroup(groupId, effectiveGroupRelay)
       toast.success(t('Group delete requested'))
     } catch (err) {
       toast.error(t('Failed to delete group'))
@@ -278,7 +318,7 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
   const handleDeleteEvent = async () => {
     if (!groupId || !removeEventId.trim()) return
     try {
-      await deleteEvent(groupId, removeEventId.trim(), groupRelay)
+      await deleteEvent(groupId, removeEventId.trim(), effectiveGroupRelay)
       toast.success(t('Delete requested'))
       setRemoveEventId('')
     } catch (err) {
@@ -290,7 +330,7 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
   const handleLeave = async () => {
     if (!groupId) return
     try {
-      await sendLeaveRequest(groupId, groupRelay)
+      await sendLeaveRequest(groupId, effectiveGroupRelay)
       setDetail((prev) =>
         prev
           ? { ...prev, membershipStatus: 'not-member' }
@@ -302,7 +342,7 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
   }
 
   const fallbackMeta = discoveryGroups.find(
-    (g) => g.id === groupId && (!groupRelay || !g.relay || g.relay === groupRelay)
+    (g) => g.id === groupId && (!effectiveGroupRelay || !g.relay || g.relay === effectiveGroupRelay)
   )
   const effectiveDetail =
     detail || (fallbackMeta ? { metadata: fallbackMeta, admins: [], members: [], membershipStatus: 'not-member' as const } : null)
@@ -576,11 +616,11 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
           setOpen={setIsComposerOpen}
           groupContext={{
             groupId,
-            relay: resolvedGroupRelay || groupRelay,
+            relay: resolvedGroupRelay || effectiveGroupRelay,
             name: effectiveDetail?.metadata?.name,
             picture: groupPicture
           }}
-          openFrom={resolvedGroupRelay ? [resolvedGroupRelay] : groupRelay ? [groupRelay] : undefined}
+          openFrom={resolvedGroupRelay ? [resolvedGroupRelay] : effectiveGroupRelay ? [effectiveGroupRelay] : undefined}
         />
       )}
       <Dialog open={isMetadataDialogOpen} onOpenChange={setIsMetadataDialogOpen}>

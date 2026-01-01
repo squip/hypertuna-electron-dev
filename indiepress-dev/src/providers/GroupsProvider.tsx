@@ -292,22 +292,28 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       relay?: string,
       opts?: { preferRelay?: boolean; discoveryOnly?: boolean }
     ) => {
-      const resolved = relay ? resolveRelayUrl(relay) : null
-      const preferRelay = !!opts?.preferRelay && !!resolved && !opts?.discoveryOnly
-      // Default: discovery only for list/facepile; optionally prefer relay for detail when member
+      const relayFromList = myGroupList.find((entry) => entry.groupId === groupId)?.relay
+      const targetRelay = relay || relayFromList || undefined
+      const resolved = targetRelay ? resolveRelayUrl(targetRelay) : null
+      const isInMyGroups = myGroupList.some((entry) => entry.groupId === groupId)
+      const preferRelay = (!opts?.discoveryOnly && (opts?.preferRelay || isInMyGroups) && !!resolved)
+      // Default: discovery only for list/facepile; prefer relay for detail when member/admin
       const groupRelays = preferRelay ? [resolved!] : defaultDiscoveryRelays
       const metadataRelays = opts?.discoveryOnly
         ? discoveryRelays
         : Array.from(new Set([...(preferRelay ? [resolved!] : []), ...discoveryRelays]))
 
+      const fetchLatestByTag = async (relays: string[], kind: number, tagKey: 'd' | 'h') => {
+        const filter: any = { kinds: [kind], limit: 5 }
+        filter[`#${tagKey}`] = [groupId]
+        const events = await client.fetchEvents(relays, filter)
+        return events.sort((a, b) => b.created_at - a.created_at)[0] || null
+      }
+
       let metadataEvt = null as any
       try {
-        const events = await client.fetchEvents(metadataRelays, {
-          kinds: [ExtendedKind.GROUP_METADATA],
-          '#d': [groupId],
-          limit: 5
-        })
-        metadataEvt = events.sort((a, b) => b.created_at - a.created_at)[0] || null
+        metadataEvt = (await fetchLatestByTag(metadataRelays, ExtendedKind.GROUP_METADATA, 'd')) ||
+          (await fetchLatestByTag(metadataRelays, ExtendedKind.GROUP_METADATA, 'h'))
       } catch (error) {
         console.warn('Failed to fetch group metadata', error)
         metadataEvt = null
@@ -319,21 +325,15 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       let joinRequests: any[] = []
 
       try {
-        ;[adminsEvt] = await client.fetchEvents(groupRelays, {
-          kinds: [39001],
-          '#d': [groupId],
-          limit: 1
-        })
+        adminsEvt = (await fetchLatestByTag(groupRelays, 39001, 'd')) ||
+          (await fetchLatestByTag(groupRelays, 39001, 'h'))
       } catch (_) {
         adminsEvt = null
       }
 
       try {
-        ;[membersEvt] = await client.fetchEvents(groupRelays, {
-          kinds: [39002],
-          '#d': [groupId],
-          limit: 1
-        })
+        membersEvt = (await fetchLatestByTag(groupRelays, 39002, 'd')) ||
+          (await fetchLatestByTag(groupRelays, 39002, 'h'))
       } catch (_) {
         membersEvt = null
       }
@@ -365,13 +365,41 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
         ? deriveMembershipStatus(pubkey, membershipEvents, joinRequests)
         : 'not-member'
 
+      // Fallback: if membership events are missing but the member list includes the user, treat as member
+      const membersFromEvent = membersEvt ? parseGroupMembersEvent(membersEvt) : []
+      let coercedMembershipStatus =
+        membershipStatus === 'not-member' && pubkey && membersFromEvent.includes(pubkey)
+          ? 'member'
+          : membershipStatus
+
+      // If this group is in my list, default to member unless explicitly removed
+      if (coercedMembershipStatus === 'not-member' && isInMyGroups) {
+        coercedMembershipStatus = 'member'
+      }
+
+      // If we believe we're a member but members list is empty, include self so UI doesn't zero out
+      let members = membersFromEvent
+      if (coercedMembershipStatus === 'member' && pubkey) {
+        if (!members.includes(pubkey)) members = [...members, pubkey]
+      }
+
       const metadata = metadataEvt ? parseGroupMetadataEvent(metadataEvt, relay) : null
       const admins = adminsEvt ? parseGroupAdminsEvent(adminsEvt) : []
-      const members = membersEvt ? parseGroupMembersEvent(membersEvt) : []
 
-      return { metadata, admins, members, membershipStatus }
+      console.info('[GroupsProvider] fetchGroupDetail result', {
+        groupId,
+        relay: targetRelay,
+        resolved,
+        preferRelay,
+        metadataFound: !!metadataEvt,
+        adminsCount: admins.length,
+        membersCount: members.length,
+        membershipStatus: coercedMembershipStatus
+      })
+
+      return { metadata, admins, members, membershipStatus: coercedMembershipStatus }
     },
-    [discoveryRelays, pubkey, resolveRelayUrl]
+    [discoveryRelays, pubkey, resolveRelayUrl, myGroupList]
   )
 
   const saveMyGroupList = useCallback(
@@ -674,9 +702,32 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
         }
         const relayUrls = resolved ? Array.from(new Set([resolved, ...discoveryRelays])) : discoveryRelays
         await publish(metadataEvent, { specifiedRelayUrls: relayUrls })
+
+        // Optimistically update discoveryGroups cache
+        setDiscoveryGroups((prev) =>
+          prev.map((g) => {
+            if (g.id !== groupId) return g
+            if (relay && g.relay) {
+              const baseRelay = getBaseRelayUrl(relay)
+              const baseExisting = getBaseRelayUrl(g.relay)
+              if (baseRelay !== baseExisting) return g
+            }
+            return {
+              ...g,
+              name: name ?? g.name,
+              about: about ?? g.about,
+              picture: picture ?? g.picture,
+              isPublic: typeof data.isPublic === 'boolean' ? data.isPublic : g.isPublic,
+              isOpen: typeof data.isOpen === 'boolean' ? data.isOpen : g.isOpen
+            }
+          })
+        )
+
+        // Refresh discovery list to propagate to other views/cards
+        refreshDiscovery().catch(() => {})
       }
     },
-    [discoveryRelays, pubkey, publish, resolveRelayUrl]
+    [discoveryRelays, pubkey, publish, refreshDiscovery, resolveRelayUrl]
   )
 
   const addUser = useCallback(
