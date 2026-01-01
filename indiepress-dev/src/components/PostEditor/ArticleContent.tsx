@@ -1,5 +1,7 @@
 import { Button } from '@/components/ui/button'
 import PostRelaySelector from './PostRelaySelector'
+import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar'
+import { cn } from '@/lib/utils'
 import { createLongFormDraftEvent } from '@/lib/draft-event'
 import { useNostr } from '@/providers/NostrProvider'
 import postEditorCache from '@/services/post-editor-cache.service'
@@ -19,7 +21,8 @@ export default function ArticleContent({
   existingEvent,
   extraTags = [],
   onPublish,
-  renderSections
+  renderSections,
+  groupContext
 }: {
   close: () => void
   openFrom?: string[]
@@ -31,6 +34,12 @@ export default function ArticleContent({
     body: React.ReactNode
     footer: React.ReactNode
   }) => React.ReactNode
+  groupContext?: {
+    groupId: string
+    relay?: string
+    name?: string
+    picture?: string
+  }
 }) {
   const { t } = useTranslation()
   const { publish, checkLogin } = useNostr()
@@ -54,6 +63,8 @@ export default function ArticleContent({
   const [metadataSnapshot, setMetadataSnapshot] = useState<MetadataSnapshot | null>(null)
   const [cacheHydrated, setCacheHydrated] = useState(false)
   const [templateResetKey, setTemplateResetKey] = useState(0)
+  const groupDisplayName = groupContext?.name || groupContext?.groupId
+  const groupInitials = (groupDisplayName || 'GR').slice(0, 2).toUpperCase()
 
   const cacheKey = useMemo(
     () => `article-editor:${existingEvent?.id ?? 'new'}`,
@@ -304,13 +315,25 @@ export default function ArticleContent({
       }
       try {
         const draftEvent = buildDraft(isDraft)
+        if (groupContext?.groupId) {
+          draftEvent.tags = draftEvent.tags || []
+          if (!draftEvent.tags.some((t) => t[0] === 'h' && t[1] === groupContext.groupId)) {
+            draftEvent.tags.push(['h', groupContext.groupId])
+          }
+        }
         let newEvent
         if (onPublish) {
           await onPublish(draftEvent, { isDraft, relayUrls: additionalRelayUrls })
         } else {
+          const relayUrls =
+            additionalRelayUrls.length > 0
+              ? additionalRelayUrls
+              : groupContext?.relay
+                ? [groupContext.relay]
+                : openFrom || []
           newEvent = await publish(draftEvent, {
-            specifiedRelayUrls: isProtectedEvent ? additionalRelayUrls : undefined,
-            additionalRelayUrls
+            specifiedRelayUrls: relayUrls.length ? relayUrls : undefined,
+            additionalRelayUrls: relayUrls
           })
         }
         let description: string | undefined
@@ -439,12 +462,32 @@ export default function ArticleContent({
             </button>
           </div>
         ))}
-      <PostRelaySelector
-        setIsProtectedEvent={setIsProtectedEvent}
-        setAdditionalRelayUrls={setAdditionalRelayUrls}
-        parentEvent={existingEvent}
-        openFrom={openFrom}
-      />
+      <div className="flex flex-wrap items-center gap-2 justify-between">
+        {groupContext?.groupId && (
+          <div className="inline-flex items-center gap-2 rounded-full bg-muted px-2 py-1">
+            <span className="text-xs text-muted-foreground whitespace-nowrap">
+              {t('Posting to group relay for')}
+            </span>
+            <div className="flex items-center gap-2 min-w-0">
+              <Avatar className="h-6 w-6 shrink-0">
+                {groupContext.picture && (
+                  <AvatarImage src={groupContext.picture} alt={groupDisplayName} />
+                )}
+                <AvatarFallback className="text-[10px] font-semibold">{groupInitials}</AvatarFallback>
+              </Avatar>
+              <span className="truncate text-sm font-semibold text-foreground">{groupDisplayName}</span>
+            </div>
+          </div>
+        )}
+        {!groupContext && (
+          <PostRelaySelector
+            setIsProtectedEvent={setIsProtectedEvent}
+            setAdditionalRelayUrls={setAdditionalRelayUrls}
+            parentEvent={existingEvent}
+            openFrom={openFrom}
+          />
+        )}
+      </div>
       <div className="flex flex-wrap items-center gap-2 justify-end max-sm:hidden">
         <Button
           data-post-cancel-button

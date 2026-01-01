@@ -322,6 +322,7 @@ export default function PostEditor({
             existingEvent={articleOptions?.existingEvent}
             extraTags={articleOptions?.extraTags}
             onPublish={articleOptions?.onPublish}
+            groupContext={groupContext}
             renderSections={({ header, body, footer }) => (
               <PostEditorFrame
                 maxHeightClass="max-h-[calc(100vh-160px)]"
