@@ -88,7 +88,41 @@ const GroupsContext = createContext<TGroupsContext | undefined>(undefined)
 export const useGroups = () => {
   const context = useContext(GroupsContext)
   if (!context) {
-    throw new Error('useGroups must be used within a GroupsProvider')
+    console.warn('useGroups called outside GroupsProvider; returning fallback context')
+    return {
+      discoveryGroups: [],
+      invites: [],
+      favoriteGroups: [],
+      myGroupList: [],
+      isLoadingDiscovery: false,
+      discoveryError: null,
+      invitesError: null,
+      refreshDiscovery: async () => {},
+      refreshInvites: async () => {},
+      resolveRelayUrl: (r?: string) => r,
+      toggleFavorite: () => {},
+      saveMyGroupList: async () => {},
+      sendJoinRequest: async () => {},
+      sendLeaveRequest: async () => {},
+      fetchGroupDetail: async () => ({
+        metadata: null,
+        admins: [],
+        members: [],
+        membershipStatus: 'not-member' as TGroupMembershipStatus
+      }),
+      sendInvites: async () => {},
+      updateMetadata: async () => {},
+      addUser: async () => {},
+      removeUser: async () => {},
+      deleteGroup: async () => {},
+      deleteEvent: async () => {},
+      createGroup: async () => {
+        throw new Error('GroupsProvider not available')
+      },
+      createHypertunaRelayGroup: async () => {
+        throw new Error('GroupsProvider not available')
+      }
+    }
   }
   return context
 }
@@ -297,69 +331,108 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       const resolved = targetRelay ? resolveRelayUrl(targetRelay) : null
       const isInMyGroups = myGroupList.some((entry) => entry.groupId === groupId)
       const preferRelay = (!opts?.discoveryOnly && (opts?.preferRelay || isInMyGroups) && !!resolved)
-      // Default: discovery only for list/facepile; prefer relay for detail when member/admin
-      const groupRelays = preferRelay ? [resolved!] : defaultDiscoveryRelays
+
+      // Default: discovery only for list/facepile; if member/admin, stick to the resolved group relay only.
+      const groupRelays = preferRelay && resolved ? [resolved] : defaultDiscoveryRelays
       const metadataRelays = opts?.discoveryOnly
         ? discoveryRelays
-        : Array.from(new Set([...(preferRelay ? [resolved!] : []), ...discoveryRelays]))
+        : preferRelay && resolved
+          ? [resolved]
+          : Array.from(new Set([...(preferRelay && resolved ? [resolved] : []), ...discoveryRelays]))
+
+      const time = () => performance.now()
+      const logDuration = (label: string, start: number) => {
+        console.info(`[GroupsProvider] fetch ${label} took ${(performance.now() - start).toFixed(0)}ms`, {
+          groupId,
+          relays: preferRelay && resolved ? 'group-relay-only' : 'discovery',
+          resolved
+        })
+      }
 
       const fetchLatestByTag = async (relays: string[], kind: number, tagKey: 'd' | 'h') => {
         const filter: any = { kinds: [kind], limit: 5 }
         filter[`#${tagKey}`] = [groupId]
+        const start = time()
         const events = await client.fetchEvents(relays, filter)
+        logDuration(`${kind}#${tagKey}`, start)
         return events.sort((a, b) => b.created_at - a.created_at)[0] || null
       }
 
-      let metadataEvt = null as any
-      try {
-        metadataEvt = (await fetchLatestByTag(metadataRelays, ExtendedKind.GROUP_METADATA, 'd')) ||
-          (await fetchLatestByTag(metadataRelays, ExtendedKind.GROUP_METADATA, 'h'))
-      } catch (error) {
-        console.warn('Failed to fetch group metadata', error)
-        metadataEvt = null
-      }
-
-      let adminsEvt = null as any
-      let membersEvt = null as any
-      let membershipEvents: any[] = []
-      let joinRequests: any[] = []
-
-      try {
-        adminsEvt = (await fetchLatestByTag(groupRelays, 39001, 'd')) ||
-          (await fetchLatestByTag(groupRelays, 39001, 'h'))
-      } catch (_) {
-        adminsEvt = null
-      }
-
-      try {
-        membersEvt = (await fetchLatestByTag(groupRelays, 39002, 'd')) ||
-          (await fetchLatestByTag(groupRelays, 39002, 'h'))
-      } catch (_) {
-        membersEvt = null
-      }
-
-      try {
-        membershipEvents = await client.fetchEvents(groupRelays, {
-          kinds: [9000, 9001],
-          '#h': [groupId],
-          limit: 50
-        })
-      } catch (_) {
-        membershipEvents = []
-      }
-
-      if (pubkey) {
+      // Fetch metadata/admins/members in parallel (two tag variants), plus membership events.
+      const metadataPromise = (async () => {
         try {
-          joinRequests = await client.fetchEvents(groupRelays, {
-            kinds: [9021],
-            authors: [pubkey],
-            '#h': [groupId],
-            limit: 10
-          })
-        } catch (_) {
-          joinRequests = []
+          return (
+            (await fetchLatestByTag(metadataRelays, ExtendedKind.GROUP_METADATA, 'd')) ||
+            (await fetchLatestByTag(metadataRelays, ExtendedKind.GROUP_METADATA, 'h'))
+          )
+        } catch (error) {
+          console.warn('Failed to fetch group metadata', error)
+          return null
         }
-      }
+      })()
+
+      const adminsPromise = (async () => {
+        try {
+          return (
+            (await fetchLatestByTag(groupRelays, 39001, 'd')) ||
+            (await fetchLatestByTag(groupRelays, 39001, 'h'))
+          )
+        } catch (_e) {
+          return null
+        }
+      })()
+
+      const membersPromise = (async () => {
+        try {
+          return (
+            (await fetchLatestByTag(groupRelays, 39002, 'd')) ||
+            (await fetchLatestByTag(groupRelays, 39002, 'h'))
+          )
+        } catch (_e) {
+          return null
+        }
+      })()
+
+      const membershipPromise = (async () => {
+        try {
+          const start = time()
+          const events = await client.fetchEvents(groupRelays, {
+            kinds: [9000, 9001],
+            '#h': [groupId],
+            limit: 50
+          })
+          logDuration('9000/9001', start)
+          return events
+        } catch (_e) {
+          return []
+        }
+      })()
+
+      const joinRequestsPromise = pubkey
+        ? (async () => {
+            try {
+              const start = time()
+              const events = await client.fetchEvents(groupRelays, {
+                kinds: [9021],
+                authors: [pubkey],
+                '#h': [groupId],
+                limit: 10
+              })
+              logDuration('9021', start)
+              return events
+            } catch (_e) {
+              return []
+            }
+          })()
+        : Promise.resolve([])
+
+      const [metadataEvt, adminsEvt, membersEvt, membershipEvents, joinRequests] = await Promise.all([
+        metadataPromise,
+        adminsPromise,
+        membersPromise,
+        membershipPromise,
+        joinRequestsPromise
+      ])
 
       const membershipStatus = pubkey
         ? deriveMembershipStatus(pubkey, membershipEvents, joinRequests)

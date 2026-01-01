@@ -92,7 +92,7 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
   useEffect(() => {
     if (!groupId) return
     const requestId = ++requestIdRef.current
-    setIsLoading(true)
+    setIsLoading(false) // allow showing cached data immediately
     setError(null)
     fetchGroupDetail(groupId, effectiveGroupRelay, { preferRelay: true })
       .then((d) => {
