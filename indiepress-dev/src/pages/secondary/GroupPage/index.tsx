@@ -1,5 +1,4 @@
 import { Button } from '@/components/ui/button'
-import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import SecondaryPageLayout from '@/layouts/SecondaryPageLayout'
 import { useGroups } from '@/providers/GroupsProvider'
@@ -317,12 +316,7 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
   const groupPicture = effectiveDetail?.metadata?.picture || fallbackMeta?.picture
   const groupTitle = (
     <span className="inline-flex items-center gap-2 min-w-0">
-      <Avatar className="h-8 w-8 shrink-0">
-        {groupPicture && <AvatarImage src={groupPicture} alt={groupDisplayName} />}
-        <AvatarFallback className="text-sm font-semibold">
-          {(groupDisplayName || 'GR').slice(0, 2).toUpperCase()}
-        </AvatarFallback>
-      </Avatar>
+     
       <span className="truncate">{groupDisplayName}</span>
     </span>
   )
@@ -602,6 +596,7 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
               isOpen: detail?.metadata?.isOpen,
               isPublic: detail?.metadata?.isPublic
             }}
+            isOpen={isMetadataDialogOpen}
             onSave={handleSaveMetadata}
             onCancel={() => setIsMetadataDialogOpen(false)}
             saving={isSavingMeta}

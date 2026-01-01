@@ -11,23 +11,10 @@ import { Input } from '@/components/ui/input'
 import { useSecondaryPage } from '@/PageManager'
 import { toGroup } from '@/lib/link'
 import GroupCreateDialog from '@/components/GroupCreateDialog'
-import { isElectron } from '@/lib/platform'
 import { useWorkerBridge } from '@/providers/WorkerBridgeProvider'
-import { toast } from 'sonner'
 import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar'
 import { SimpleUserAvatar } from '@/components/UserAvatar'
 import { useNostr } from '@/providers/NostrProvider'
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle
-} from '@/components/ui/dialog'
-import { Label } from '@/components/ui/label'
-import { Textarea } from '@/components/ui/textarea'
-import { Switch } from '@/components/ui/switch'
 
 type TTab = 'discover' | 'my' | 'invites'
 
@@ -161,44 +148,12 @@ const GroupsPage = forwardRef<TPageRef>((_, ref) => {
     refreshInvites,
     isLoadingDiscovery,
     discoveryError,
-    invitesError,
-    createHypertunaRelayGroup
-  } =
-    useGroups()
+    invitesError
+  } = useGroups()
   const [tab, setTab] = useState<TTab>('discover')
   const [search, setSearch] = useState('')
   const { push } = useSecondaryPage()
   const [showCreate, setShowCreate] = useState(false)
-  const [showCreateActions, setShowCreateActions] = useState(false)
-  const [showRelayCreate, setShowRelayCreate] = useState(false)
-  const [showRelayJoin, setShowRelayJoin] = useState(false)
-  const [showRelayCta, setShowRelayCta] = useState(false)
-  const [relayName, setRelayName] = useState('')
-  const [relayDescription, setRelayDescription] = useState('')
-  const [relayPublic, setRelayPublic] = useState(true)
-  const [relayOpenMembership, setRelayOpenMembership] = useState(true)
-  const [relayCreating, setRelayCreating] = useState(false)
-  const [joinIdentifier, setJoinIdentifier] = useState('')
-  const [joinToken, setJoinToken] = useState('')
-  const [joinBusy, setJoinBusy] = useState(false)
-  const desktopDownloadUrl =
-    import.meta.env.VITE_DESKTOP_DOWNLOAD_URL || 'https://hypertuna.com/download'
-  const isDesktop = isElectron()
-  const { sendToWorker, startJoinFlow, joinFlows, clearJoinFlow } = useWorkerBridge()
-
-  const joinId = joinIdentifier.trim()
-  const joinFlow = joinId ? joinFlows[joinId] : undefined
-
-  useEffect(() => {
-    if (!showRelayJoin) return
-    if (!joinId.includes(':')) return
-    if (joinFlow?.phase === 'success') {
-      setShowRelayJoin(false)
-      setJoinIdentifier('')
-      setJoinToken('')
-      clearJoinFlow(joinId)
-    }
-  }, [clearJoinFlow, joinFlow?.phase, joinId, showRelayJoin])
 
   const inviteGroupIds = useMemo(() => new Set(invites.map((inv) => inv.groupId)), [invites])
   const filteredDiscovery = discoveryGroups.filter((g) => {
@@ -344,7 +299,7 @@ const GroupsPage = forwardRef<TPageRef>((_, ref) => {
           <Button variant="ghost" size="icon" onClick={() => refreshDiscovery()}>
             <Loader2 className="w-4 h-4" />
           </Button>
-          <Button onClick={() => setShowCreateActions(true)}>{t('Create')}</Button>
+          <Button onClick={() => setShowCreate(true)}>{t('Create')}</Button>
         </div>
         <Tabs value={tab} onValueChange={(val) => setTab(val as TTab)}>
           <TabsList className="grid grid-cols-3 w-full">
@@ -364,247 +319,6 @@ const GroupsPage = forwardRef<TPageRef>((_, ref) => {
         </Tabs>
       </div>
       <GroupCreateDialog open={showCreate} onOpenChange={setShowCreate} />
-      <Dialog open={showCreateActions} onOpenChange={setShowCreateActions}>
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>{t('Create or join')}</DialogTitle>
-            <DialogDescription>
-              {t('Start a new Nostr group or manage Hypertuna relays (desktop only).')}
-            </DialogDescription>
-          </DialogHeader>
-          <div className="space-y-3">
-            <Button
-              variant="outline"
-              className="w-full justify-between"
-              onClick={() => {
-                setShowCreateActions(false)
-                setShowCreate(true)
-              }}
-            >
-              <span>{t('Create Nostr group')}</span>
-              <span className="text-xs text-muted-foreground">{t('NIP-29')}</span>
-            </Button>
-            <Button
-              variant="outline"
-              className="w-full justify-between"
-              onClick={() => {
-                setShowCreateActions(false)
-                if (isDesktop) setShowRelayCreate(true)
-                else setShowRelayCta(true)
-              }}
-            >
-              <span>{t('Create Hypertuna relay')}</span>
-              <span className="text-xs text-muted-foreground">{isDesktop ? t('Desktop') : t('Desktop only')}</span>
-            </Button>
-            <Button
-              variant="outline"
-              className="w-full justify-between"
-              onClick={() => {
-                setShowCreateActions(false)
-                if (isDesktop) setShowRelayJoin(true)
-                else setShowRelayCta(true)
-              }}
-            >
-              <span>{t('Join Hypertuna relay')}</span>
-              <span className="text-xs text-muted-foreground">{isDesktop ? t('Desktop') : t('Desktop only')}</span>
-            </Button>
-          </div>
-          <DialogFooter>
-            <Button variant="secondary" onClick={() => setShowCreateActions(false)}>
-              {t('Close')}
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
-      <Dialog open={showRelayCreate} onOpenChange={setShowRelayCreate}>
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>{t('Create Hypertuna relay')}</DialogTitle>
-            <DialogDescription>
-              {t('Creates a new Hypertuna relay using the local worker (desktop only).')}
-            </DialogDescription>
-          </DialogHeader>
-          <div className="space-y-3">
-            <div className="space-y-1">
-              <Label htmlFor="relay-name">{t('Name')}</Label>
-              <Input
-                id="relay-name"
-                value={relayName}
-                onChange={(e) => setRelayName(e.target.value)}
-                placeholder={t('My Relay') as string}
-              />
-            </div>
-            <div className="space-y-1">
-              <Label htmlFor="relay-description">{t('Description')}</Label>
-              <Textarea
-                id="relay-description"
-                value={relayDescription}
-                onChange={(e) => setRelayDescription(e.target.value)}
-                placeholder={t('Optional description') as string}
-              />
-            </div>
-            <div className="flex items-center justify-between rounded-md border px-3 py-2">
-              <div>
-                <div className="font-medium text-sm">{t('Public')}</div>
-                <div className="text-xs text-muted-foreground">
-                  {t('Make this relay discoverable via gateway')}
-                </div>
-              </div>
-              <Switch checked={relayPublic} onCheckedChange={setRelayPublic} />
-            </div>
-            <div className="flex items-center justify-between rounded-md border px-3 py-2">
-              <div>
-                <div className="font-medium text-sm">{t('Open membership')}</div>
-                <div className="text-xs text-muted-foreground">
-                  {t('Anyone can join without approval')}
-                </div>
-              </div>
-              <Switch checked={relayOpenMembership} onCheckedChange={setRelayOpenMembership} />
-            </div>
-            <DialogFooter className="gap-2">
-              <Button variant="outline" onClick={() => setShowRelayCreate(false)}>
-                {t('Cancel')}
-              </Button>
-              <Button
-                onClick={async () => {
-                  if (!relayName.trim()) {
-                    toast.error(t('Please enter a relay name'))
-                    return
-                  }
-                  setRelayCreating(true)
-                  try {
-                    await createHypertunaRelayGroup({
-                      name: relayName.trim(),
-                      about: relayDescription.trim() || undefined,
-                      isPublic: relayPublic,
-                      isOpen: relayOpenMembership,
-                      fileSharing: true
-                    })
-                    toast.success(t('Relay created'))
-                    setShowRelayCreate(false)
-                    setRelayName('')
-                    setRelayDescription('')
-                  } catch (err: any) {
-                    toast.error(err?.message || t('Failed to create relay'))
-                  } finally {
-                    setRelayCreating(false)
-                  }
-                }}
-                disabled={relayCreating}
-              >
-                {relayCreating ? t('Creating...') : t('Create relay')}
-              </Button>
-            </DialogFooter>
-          </div>
-        </DialogContent>
-      </Dialog>
-
-      <Dialog open={showRelayJoin} onOpenChange={setShowRelayJoin}>
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>{t('Join Hypertuna relay')}</DialogTitle>
-            <DialogDescription>
-              {t('Join an existing Hypertuna relay by key or public identifier.')}
-            </DialogDescription>
-          </DialogHeader>
-          <div className="space-y-3">
-            <div className="space-y-1">
-              <Label htmlFor="join-identifier">{t('Relay key or public identifier')}</Label>
-              <Input
-                id="join-identifier"
-                value={joinIdentifier}
-                onChange={(e) => setJoinIdentifier(e.target.value)}
-                placeholder="relay key or npub:relayName"
-              />
-            </div>
-            <div className="space-y-1">
-              <Label htmlFor="join-token">{t('Auth token')} ({t('optional')})</Label>
-              <Input
-                id="join-token"
-                value={joinToken}
-                onChange={(e) => setJoinToken(e.target.value)}
-                placeholder={t('Token if required') as string}
-              />
-            </div>
-            <DialogFooter className="gap-2">
-              <Button variant="outline" onClick={() => setShowRelayJoin(false)}>
-                {t('Cancel')}
-              </Button>
-              <Button
-                onClick={async () => {
-                  if (!joinIdentifier.trim()) {
-                    toast.error(t('Please enter a relay identifier'))
-                    return
-                  }
-                  setJoinBusy(true)
-                  try {
-                    const identifier = joinIdentifier.trim()
-                    const token = joinToken.trim()
-                    const isHex = /^[a-fA-F0-9]{64}$/.test(identifier)
-                    const relayKey = isHex ? identifier : undefined
-                    const publicIdentifier = !relayKey && identifier.includes(':') ? identifier : undefined
-
-                    if (publicIdentifier && !token) {
-                      await startJoinFlow(publicIdentifier, { fileSharing: true })
-                      toast.message(t('Join flow started'))
-                    } else {
-                      await sendToWorker({
-                        type: 'join-relay',
-                        data: {
-                          relayKey,
-                          publicIdentifier,
-                          authToken: token || undefined,
-                          fileSharing: true
-                        }
-                      })
-                      toast.success(t('Join requested'))
-                      sendToWorker({ type: 'get-relays' }).catch(() => {})
-                      setShowRelayJoin(false)
-                      setJoinIdentifier('')
-                      setJoinToken('')
-                    }
-                  } catch (err: any) {
-                    toast.error(err?.message || t('Failed to join relay'))
-                  } finally {
-                    setJoinBusy(false)
-                  }
-                }}
-                disabled={joinBusy}
-              >
-                {joinBusy ? t('Joining...') : t('Join relay')}
-              </Button>
-            </DialogFooter>
-            {joinFlow && (
-              <div className="rounded-md border border-border/50 bg-muted/30 p-2 text-xs space-y-1">
-                <div className="font-medium">{t('Join flow')}</div>
-                <div className="text-muted-foreground capitalize">{t('Phase')}: {joinFlow.phase}</div>
-                {joinFlow.error && <div className="text-red-500">{joinFlow.error}</div>}
-              </div>
-            )}
-          </div>
-        </DialogContent>
-      </Dialog>
-
-      <Dialog open={showRelayCta} onOpenChange={setShowRelayCta}>
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>{t('Hypertuna relays')}</DialogTitle>
-            <DialogDescription>
-              {t('Available in the desktop app. Download to create or join relays.')}
-            </DialogDescription>
-          </DialogHeader>
-          <DialogFooter className="flex flex-col sm:flex-row sm:justify-end sm:space-x-2">
-            <Button variant="outline" onClick={() => setShowRelayCta(false)}>
-              {t('Close')}
-            </Button>
-            <Button asChild>
-              <a href={desktopDownloadUrl} target="_blank" rel="noreferrer">
-                {t('Download desktop app')}
-              </a>
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
     </PrimaryPageLayout>
   )
 })

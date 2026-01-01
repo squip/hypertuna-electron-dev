@@ -78,6 +78,7 @@ type TGroupsContext = {
     about?: string
     isPublic: boolean
     isOpen: boolean
+    picture?: string
     fileSharing?: boolean
   }) => Promise<{ groupId: string; relay: string }>
 }
@@ -474,12 +475,14 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       about,
       isPublic,
       isOpen,
+      picture,
       fileSharing
     }: {
       name: string
       about?: string
       isPublic: boolean
       isOpen: boolean
+      picture?: string
       fileSharing?: boolean
     }) => {
       if (!pubkey) throw new Error('Not logged in')
@@ -507,7 +510,8 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
         isPublic,
         isOpen,
         fileSharing,
-        relayWsUrl
+        relayWsUrl,
+        pictureTagUrl: picture
       })
 
       if (isPublic) {
@@ -620,23 +624,59 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       relay?: string
     ) => {
       if (!pubkey) throw new Error('Not logged in')
-      const tags: string[][] = [['h', groupId]]
-      if (typeof data.name === 'string') tags.push(['name', data.name])
-      if (typeof data.about === 'string') tags.push(['about', data.about])
-      if (typeof data.picture === 'string') tags.push(['picture', data.picture])
-      if (typeof data.isPublic === 'boolean') tags.push([data.isPublic ? 'public' : 'private'])
-      if (typeof data.isOpen === 'boolean') tags.push([data.isOpen ? 'open' : 'closed'])
-
-      const draftEvent: TDraftEvent = {
-        kind: 9002,
-        created_at: Math.floor(Date.now() / 1000),
-        tags,
-        content: ''
-      }
       const resolved = relay ? resolveRelayUrl(relay) : undefined
-      await publish(draftEvent, { specifiedRelayUrls: resolved ? [resolved] : undefined })
+      const baseTagValue = (value?: string) => (typeof value === 'string' ? value.trim() : undefined)
+
+      const commandTags: string[][] = [['h', groupId]]
+      const name = baseTagValue(data.name)
+      const about = baseTagValue(data.about)
+      const picture = baseTagValue(data.picture)
+
+      if (name !== undefined) commandTags.push(['name', name])
+      if (about !== undefined) commandTags.push(['about', about])
+      if (picture) commandTags.push(['picture', picture])
+      if (typeof data.isPublic === 'boolean') commandTags.push([data.isPublic ? 'public' : 'private'])
+      if (typeof data.isOpen === 'boolean') commandTags.push([data.isOpen ? 'open' : 'closed'])
+
+      if (commandTags.length > 1) {
+        const draftEvent: TDraftEvent = {
+          kind: 9002,
+          created_at: Math.floor(Date.now() / 1000),
+          tags: commandTags,
+          content: ''
+        }
+        await publish(draftEvent, { specifiedRelayUrls: resolved ? [resolved] : undefined })
+      }
+
+      // Publish a 39000 snapshot so clients render the updated metadata
+      const metadataTags: string[][] = [
+        ['h', groupId],
+        ['d', groupId]
+      ]
+      if (name !== undefined) metadataTags.push(['name', name])
+      if (about !== undefined) metadataTags.push(['about', about])
+      if (picture) metadataTags.push(['picture', picture])
+      if (typeof data.isPublic === 'boolean') metadataTags.push([data.isPublic ? 'public' : 'private'])
+      if (typeof data.isOpen === 'boolean') metadataTags.push([data.isOpen ? 'open' : 'closed'])
+
+      const isHypertuna = groupId.includes(':')
+      if (isHypertuna) {
+        metadataTags.push(['hypertuna', groupId])
+        metadataTags.push(['i', HYPERTUNA_IDENTIFIER_TAG])
+      }
+
+      if (metadataTags.length > 2) {
+        const metadataEvent: TDraftEvent = {
+          kind: ExtendedKind.GROUP_METADATA,
+          created_at: Math.floor(Date.now() / 1000),
+          tags: metadataTags,
+          content: ''
+        }
+        const relayUrls = resolved ? Array.from(new Set([resolved, ...discoveryRelays])) : discoveryRelays
+        await publish(metadataEvent, { specifiedRelayUrls: relayUrls })
+      }
     },
-    [pubkey, publish, resolveRelayUrl]
+    [discoveryRelays, pubkey, publish, resolveRelayUrl]
   )
 
   const addUser = useCallback(

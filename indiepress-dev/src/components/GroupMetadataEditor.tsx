@@ -3,6 +3,9 @@ import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Textarea } from '@/components/ui/textarea'
 import { Switch } from '@/components/ui/switch'
+import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
+import Uploader from '@/components/PostEditor/Uploader'
+import { Upload, X } from 'lucide-react'
 import { useEffect, useState } from 'react'
 
 export type TGroupMetadataForm = {
@@ -17,12 +20,14 @@ export default function GroupMetadataEditor({
   initial,
   onSave,
   onCancel,
-  saving
+  saving,
+  isOpen
 }: {
   initial?: Partial<TGroupMetadataForm>
   onSave: (data: TGroupMetadataForm) => void
   onCancel: () => void
   saving?: boolean
+  isOpen?: boolean
 }) {
   const [form, setForm] = useState<TGroupMetadataForm>({
     name: initial?.name ?? '',
@@ -31,16 +36,28 @@ export default function GroupMetadataEditor({
     isPublic: initial?.isPublic ?? true,
     isOpen: initial?.isOpen ?? true
   })
+  const [hasInteracted, setHasInteracted] = useState(false)
 
-  useEffect(() => {
-    setForm({
+  const nextFormFromInitial = () => ({
       name: initial?.name ?? '',
       about: initial?.about ?? '',
       picture: initial?.picture ?? '',
       isPublic: initial?.isPublic ?? true,
       isOpen: initial?.isOpen ?? true
     })
-  }, [initial])
+
+  useEffect(() => {
+    if (!isOpen) return
+    if (hasInteracted) return
+    setForm(nextFormFromInitial())
+  }, [initial, isOpen, hasInteracted])
+
+  useEffect(() => {
+    if (!isOpen) return
+    setHasInteracted(false)
+    setForm(nextFormFromInitial())
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isOpen])
 
   return (
     <div className="space-y-4">
@@ -48,7 +65,10 @@ export default function GroupMetadataEditor({
         <Label>Group Name</Label>
         <Input
           value={form.name}
-          onChange={(e) => setForm((f) => ({ ...f, name: e.target.value }))}
+          onChange={(e) => {
+            setHasInteracted(true)
+            setForm((f) => ({ ...f, name: e.target.value }))
+          }}
           placeholder="Enter group name"
         />
       </div>
@@ -56,18 +76,67 @@ export default function GroupMetadataEditor({
         <Label>About</Label>
         <Textarea
           value={form.about}
-          onChange={(e) => setForm((f) => ({ ...f, about: e.target.value }))}
+          onChange={(e) => {
+            setHasInteracted(true)
+            setForm((f) => ({ ...f, about: e.target.value }))
+          }}
           placeholder="Description"
           rows={3}
         />
       </div>
       <div className="space-y-2">
         <Label>Picture</Label>
-        <Input
-          value={form.picture}
-          onChange={(e) => setForm((f) => ({ ...f, picture: e.target.value }))}
-          placeholder="https://..."
-        />
+        <Tabs defaultValue="url" className="w-full">
+          <TabsList className="grid w-full grid-cols-2">
+            <TabsTrigger value="url">URL</TabsTrigger>
+            <TabsTrigger value="upload">Upload</TabsTrigger>
+          </TabsList>
+          <TabsContent value="url" className="space-y-2">
+            <Input
+              value={form.picture}
+              onChange={(e) => {
+                setHasInteracted(true)
+                setForm((f) => ({ ...f, picture: e.target.value }))
+              }}
+              placeholder="https://..."
+            />
+            {form.picture && (
+              <div className="relative w-full h-32 rounded overflow-hidden border">
+                <img src={form.picture} alt="Preview" className="w-full h-full object-cover" />
+              </div>
+            )}
+          </TabsContent>
+          <TabsContent value="upload" className="space-y-2">
+            <Uploader
+              accept="image/*"
+              onUploadSuccess={({ url }) => {
+                setHasInteracted(true)
+                setForm((f) => ({ ...f, picture: url }))
+              }}
+            >
+              <div className="border-2 border-dashed rounded-lg p-8 text-center cursor-pointer hover:bg-accent/50 transition-colors">
+                <Upload className="w-8 h-8 mx-auto mb-2 opacity-50" />
+                <p className="text-sm text-muted-foreground">Click to upload an image</p>
+              </div>
+            </Uploader>
+            {form.picture && (
+              <div className="relative w-full h-32 rounded overflow-hidden border">
+                <img src={form.picture} alt="Preview" className="w-full h-full object-cover" />
+                <Button
+                  variant="destructive"
+                  size="icon"
+                  className="absolute top-2 right-2"
+                  onClick={() => {
+                    setHasInteracted(true)
+                    setForm((f) => ({ ...f, picture: '' }))
+                  }}
+                >
+                  <X className="w-4 h-4" />
+                </Button>
+              </div>
+            )}
+          </TabsContent>
+        </Tabs>
       </div>
       <div className="flex items-center justify-between">
         <div>
@@ -76,7 +145,10 @@ export default function GroupMetadataEditor({
         </div>
         <Switch
           checked={form.isPublic}
-          onCheckedChange={(val) => setForm((f) => ({ ...f, isPublic: val }))}
+          onCheckedChange={(val) => {
+            setHasInteracted(true)
+            setForm((f) => ({ ...f, isPublic: val }))
+          }}
         />
       </div>
       <div className="flex items-center justify-between">
@@ -84,7 +156,13 @@ export default function GroupMetadataEditor({
           <Label>Open membership</Label>
           <div className="text-xs text-muted-foreground">Join requests auto-accept</div>
         </div>
-        <Switch checked={form.isOpen} onCheckedChange={(val) => setForm((f) => ({ ...f, isOpen: val }))} />
+        <Switch
+          checked={form.isOpen}
+          onCheckedChange={(val) => {
+            setHasInteracted(true)
+            setForm((f) => ({ ...f, isOpen: val }))
+          }}
+        />
       </div>
       <div className="flex gap-2 justify-end">
         <Button variant="secondary" onClick={onCancel}>
