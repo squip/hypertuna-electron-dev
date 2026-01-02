@@ -22,6 +22,7 @@ export function formatNpub(npub: string, length = 12) {
 }
 
 export function formatUserId(userId: string) {
+  if (typeof userId !== 'string') return ''
   if (userId.startsWith('npub1')) {
     return formatNpub(userId)
   }
@@ -29,6 +30,7 @@ export function formatUserId(userId: string) {
 }
 
 export function userIdToPubkey(userId: string) {
+  if (typeof userId !== 'string') return ''
   if (userId.startsWith('npub1') || userId.startsWith('nprofile1')) {
     try {
       const { type, data } = nip19.decode(userId)

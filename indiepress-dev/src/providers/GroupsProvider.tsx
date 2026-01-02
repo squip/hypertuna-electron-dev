@@ -33,6 +33,7 @@ import { useNostr } from './NostrProvider'
 import { randomString } from '@/lib/random'
 import { useWorkerBridge } from './WorkerBridgeProvider'
 import type { TPublishOptions } from '@/types'
+import * as nip19 from '@nostr/tools/nip19'
 
 type TGroupsContext = {
   discoveryGroups: TGroupMetadata[]
@@ -334,11 +335,10 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
 
       // Default: discovery only for list/facepile; if member/admin, stick to the resolved group relay only.
       const groupRelays = preferRelay && resolved ? [resolved] : defaultDiscoveryRelays
+      const resolvedRelayList = resolved ? [resolved] : []
       const metadataRelays = opts?.discoveryOnly
         ? discoveryRelays
-        : preferRelay && resolved
-          ? [resolved]
-          : Array.from(new Set([...(preferRelay && resolved ? [resolved] : []), ...discoveryRelays]))
+        : Array.from(new Set([...resolvedRelayList, ...discoveryRelays]))
 
       const time = () => performance.now()
       const logDuration = (label: string, start: number) => {
@@ -349,22 +349,66 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
         })
       }
 
-      const fetchLatestByTag = async (relays: string[], kind: number, tagKey: 'd' | 'h') => {
-        const filter: any = { kinds: [kind], limit: 5 }
-        filter[`#${tagKey}`] = [groupId]
+      const fetchLatestByTags = async (relays: string[], kind: number, tagKeys: Array<'d' | 'h'>) => {
         const start = time()
-        const events = await client.fetchEvents(relays, filter)
-        logDuration(`${kind}#${tagKey}`, start)
-        return events.sort((a, b) => b.created_at - a.created_at)[0] || null
+        const results = await Promise.all(
+          tagKeys.map(async (tagKey) => {
+            const filter: any = { kinds: [kind], limit: 10 }
+            filter[`#${tagKey}`] = [groupId]
+            const events = await client.fetchEvents(relays, filter)
+            return { tagKey, events }
+          })
+        )
+        logDuration(`${kind}#${tagKeys.join(',')}`, start)
+        results.forEach(({ tagKey, events }) => {
+          console.info('[GroupsProvider] fetched events batch', {
+            groupId,
+            kind,
+            tagKey,
+            relayTargets: relays,
+            count: events.length,
+            createdAts: events.map((e) => e.created_at).sort((a, b) => b - a)
+          })
+        })
+        const flat = results.flatMap((r) => r.events)
+        const sorted = flat.sort((a, b) => b.created_at - a.created_at)
+        return sorted[0] || null
       }
 
       // Fetch metadata/admins/members in parallel (two tag variants), plus membership events.
       const metadataPromise = (async () => {
         try {
-          return (
-            (await fetchLatestByTag(metadataRelays, ExtendedKind.GROUP_METADATA, 'd')) ||
-            (await fetchLatestByTag(metadataRelays, ExtendedKind.GROUP_METADATA, 'h'))
-          )
+          const evtDAndH = await fetchLatestByTags(metadataRelays, ExtendedKind.GROUP_METADATA, ['d', 'h'])
+          const candidates = [evtDAndH].filter(Boolean).sort((a, b) => (b!.created_at || 0) - (a!.created_at || 0))
+          const evt = candidates[0] || null
+          console.info('[GroupsProvider] metadata candidates', {
+            groupId,
+            preferRelay,
+            metadataRelays,
+            candidates: candidates.map((c) => ({
+              created_at: c?.created_at,
+              id: c?.id,
+              kind: c?.kind,
+              picture: c?.tags?.find?.((t: any) => t[0] === 'picture')?.[1]
+            })),
+            chosen: evt
+              ? {
+                  created_at: evt.created_at,
+                  id: evt.id,
+                  kind: evt.kind,
+                  picture: evt.tags?.find?.((t: any) => t[0] === 'picture')?.[1]
+                }
+              : null
+          })
+          console.info('[GroupsProvider] fetched metadata evt', {
+            groupId,
+            kind: evt?.kind,
+            created_at: (evt as any)?.created_at,
+            tags: evt?.tags,
+            relayTargets: metadataRelays,
+            raw: evt
+          })
+          return evt
         } catch (error) {
           console.warn('Failed to fetch group metadata', error)
           return null
@@ -373,10 +417,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
 
       const adminsPromise = (async () => {
         try {
-          return (
-            (await fetchLatestByTag(groupRelays, 39001, 'd')) ||
-            (await fetchLatestByTag(groupRelays, 39001, 'h'))
-          )
+          return await fetchLatestByTags(groupRelays, 39001, ['d', 'h'])
         } catch (_e) {
           return null
         }
@@ -384,10 +425,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
 
       const membersPromise = (async () => {
         try {
-          return (
-            (await fetchLatestByTag(groupRelays, 39002, 'd')) ||
-            (await fetchLatestByTag(groupRelays, 39002, 'h'))
-          )
+          return await fetchLatestByTags(groupRelays, 39002, ['d', 'h'])
         } catch (_e) {
           return null
         }
@@ -440,6 +478,26 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
 
       // Fallback: if membership events are missing but the member list includes the user, treat as member
       const membersFromEvent = membersEvt ? parseGroupMembersEvent(membersEvt) : []
+      const groupIdPubkey = (() => {
+        try {
+          if (groupId?.startsWith('npub')) {
+            const decoded = nip19.decode(groupId)
+            if (decoded.type === 'npub') return decoded.data as string
+          }
+          const dTag = metadataEvt?.tags?.find((t) => t[0] === 'd')?.[1]
+          if (dTag?.startsWith?.('npub')) {
+            const decoded = nip19.decode(dTag)
+            if (decoded.type === 'npub') return decoded.data as string
+          }
+        } catch (_err) {
+          // ignore decode failures
+        }
+        return undefined
+      })()
+      const creatorPubkey = metadataEvt?.pubkey
+      const isCreator =
+        !!pubkey &&
+        ((!!creatorPubkey && creatorPubkey === pubkey) || (!!groupIdPubkey && groupIdPubkey === pubkey))
       let coercedMembershipStatus =
         membershipStatus === 'not-member' && pubkey && membersFromEvent.includes(pubkey)
           ? 'member'
@@ -447,6 +505,9 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
 
       // If this group is in my list, default to member unless explicitly removed
       if (coercedMembershipStatus === 'not-member' && isInMyGroups) {
+        coercedMembershipStatus = 'member'
+      }
+      if (isCreator) {
         coercedMembershipStatus = 'member'
       }
 
@@ -459,12 +520,30 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       const metadata = metadataEvt ? parseGroupMetadataEvent(metadataEvt, relay) : null
       const admins = adminsEvt ? parseGroupAdminsEvent(adminsEvt) : []
 
+      console.info('[GroupsProvider] membership derivation', {
+        groupId,
+        relay: targetRelay,
+        membershipEventsCount: membershipEvents.length,
+        joinRequestsCount: joinRequests.length,
+        initialStatus: membershipStatus,
+        membersFromEventCount: membersFromEvent.length,
+        isInMyGroups,
+        isCreator,
+        creatorPubkey,
+        groupIdPubkey,
+        coercedStatus: coercedMembershipStatus
+      })
+
       console.info('[GroupsProvider] fetchGroupDetail result', {
         groupId,
         relay: targetRelay,
         resolved,
         preferRelay,
+        isInMyGroups,
+        isCreator,
         metadataFound: !!metadataEvt,
+        metadataCreatedAt: metadataEvt?.created_at,
+        metadataPicture: metadata?.picture,
         adminsCount: admins.length,
         membersCount: members.length,
         membershipStatus: coercedMembershipStatus
@@ -746,6 +825,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
           tags: commandTags,
           content: ''
         }
+        console.info('[GroupsProvider] updateMetadata command 9002', draftEvent)
         await publish(draftEvent, { specifiedRelayUrls: resolved ? [resolved] : undefined })
       }
 
@@ -773,6 +853,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
           tags: metadataTags,
           content: ''
         }
+        console.info('[GroupsProvider] updateMetadata 39000', metadataEvent)
         const relayUrls = resolved ? Array.from(new Set([resolved, ...discoveryRelays])) : discoveryRelays
         await publish(metadataEvent, { specifiedRelayUrls: relayUrls })
 
@@ -895,9 +976,9 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       removeUser,
       deleteGroup,
       deleteEvent,
-      createGroup: async (data) => {
-        const { name, about, picture, isPublic, isOpen, relays } = data
-        if (!pubkey) throw new Error('Not logged in')
+    createGroup: async (data) => {
+      const { name, about, picture, isPublic, isOpen, relays } = data
+      if (!pubkey) throw new Error('Not logged in')
 
         const discoveryTargets = discoveryRelays
         const localTargets = relays?.length ? relays : discoveryRelays
@@ -911,20 +992,21 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
           content: ''
         }
 
-        const metadataTags: string[][] = [['h', groupId]]
-        metadataTags.push(['name', name])
-        if (about) metadataTags.push(['about', about])
-        if (picture) metadataTags.push(['picture', picture])
-        metadataTags.push([isPublic ? 'public' : 'private'])
-        metadataTags.push([isOpen ? 'open' : 'closed'])
-        metadataTags.push(['i', HYPERTUNA_IDENTIFIER_TAG])
+      const metadataTags: string[][] = [['h', groupId]]
+      metadataTags.push(['name', name])
+      if (about) metadataTags.push(['about', about])
+      if (picture) metadataTags.push(['picture', picture])
+      metadataTags.push([isPublic ? 'public' : 'private'])
+      metadataTags.push([isOpen ? 'open' : 'closed'])
+      metadataTags.push(['i', HYPERTUNA_IDENTIFIER_TAG])
 
-        const metadataEvent: TDraftEvent = {
-          kind: 39000,
-          created_at: createdAt,
-          tags: metadataTags,
-          content: ''
-        }
+      const metadataEvent: TDraftEvent = {
+        kind: 39000,
+        created_at: createdAt,
+        tags: metadataTags,
+        content: ''
+      }
+      console.info('[GroupsProvider] createGroup metadata event', metadataEvent)
 
         // Admins (self)
         const adminsEvent: TDraftEvent = {

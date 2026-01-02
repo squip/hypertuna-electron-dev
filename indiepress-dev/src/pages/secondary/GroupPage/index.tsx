@@ -27,6 +27,7 @@ import {
 } from '@/components/ui/dialog'
 import { Label } from '@/components/ui/label'
 import { useWorkerBridge } from '@/providers/WorkerBridgeProvider'
+import * as nip19 from '@nostr/tools/nip19'
 
 type TGroupPageProps = {
   index?: number
@@ -77,7 +78,18 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
     () => (groupId ? myGroupList.find((entry) => entry.groupId === groupId)?.relay : undefined),
     [groupId, myGroupList]
   )
+  const isInMyGroups = useMemo(
+    () => !!(groupId && myGroupList.some((entry) => entry.groupId === groupId)),
+    [groupId, myGroupList]
+  )
   const effectiveGroupRelay = useMemo(() => groupRelay || myGroupRelay, [groupRelay, myGroupRelay])
+  const fallbackMeta = useMemo(
+    () =>
+      discoveryGroups.find(
+        (g) => g.id === groupId && (!effectiveGroupRelay || !g.relay || g.relay === effectiveGroupRelay)
+      ),
+    [discoveryGroups, effectiveGroupRelay, groupId]
+  )
 
   useEffect(() => {
     const searchRelay =
@@ -103,18 +115,93 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
           relay: effectiveGroupRelay,
           membershipStatus: d?.membershipStatus,
           membersCount: d?.members?.length,
-          adminsCount: d?.admins?.length
+          adminsCount: d?.admins?.length,
+          metadataCreatedAt: d?.metadata?.event?.created_at,
+          metadataPicture: d?.metadata?.picture,
+          metadataTags: d?.metadata?.event?.tags,
+          prevMetadataCreatedAt: detail?.metadata?.event?.created_at,
+          prevMetadataPicture: detail?.metadata?.picture,
+          prevMetadataTags: detail?.metadata?.event?.tags
         })
         setDetail((prev) => {
+          if (!d) return prev
+          const incomingMetaTs = d?.metadata?.event?.created_at || 0
+          const incomingMetaPicture = d?.metadata?.picture
+          const prevMetaTs = prev?.metadata?.event?.created_at || 0
+          const prevMetaPicture = prev?.metadata?.picture
+          const fallbackMetaTs = fallbackMeta?.event?.created_at || 0
+          const fallbackMetaPicture = fallbackMeta?.picture
+          console.info('[GroupPage] detail merge', {
+            groupId,
+            incomingMetaTs,
+            incomingMetaPicture,
+            prevMetaTs,
+            prevMetaPicture,
+            fallbackMetaTs,
+            fallbackMetaPicture
+          })
+          const normalizeMembers = (members?: any[]) =>
+            (members || [])
+              .map((m) => (typeof m === 'string' ? m : m?.pubkey))
+              .filter(Boolean) as string[]
+
+          d.members = normalizeMembers(d.members)
+          const normalizedPrevMembers = normalizeMembers(prev?.members)
+
+          const isSameGroup = (prev?.metadata?.id || groupId) === groupId
           const next = { ...d }
+          const isIncomingEmpty =
+            !next.metadata &&
+            (!next.admins || next.admins.length === 0) &&
+            (!next.members || next.members.length === 0)
+          if (isSameGroup && prev?.metadata && isIncomingEmpty) {
+            console.info('[GroupPage] detail merge skip empty', { groupId })
+            return prev
+          }
           // Preserve previous data if new fetch is empty/undefined
-          const isSameGroup = prev?.metadata?.id === groupId
-          if (!next.metadata && isSameGroup && prev?.metadata) next.metadata = prev.metadata
+          // If incoming metadata is older than cached, keep the newer one
+          const prevMetadata = prev?.metadata
+          const prevMetaTsCached = prevMetadata?.event?.created_at || 0
+          const nextMetaTs = next?.metadata?.event?.created_at || 0
+          if (isSameGroup && prevMetadata && prevMetaTsCached > 0 && nextMetaTs > 0 && nextMetaTs < prevMetaTsCached) {
+            console.info('[GroupPage] keeping newer cached metadata', {
+              groupId,
+              prevMetaTs: prevMetaTsCached,
+              nextMetaTs
+            })
+            next.metadata = prevMetadata
+          }
+          const metaCandidates = [
+            next.metadata,
+            prevMetadata,
+            fallbackMeta
+          ].filter(Boolean) as typeof next.metadata[]
+          const bestMeta = metaCandidates.sort((a, b) => (b?.event?.created_at || 0) - (a?.event?.created_at || 0))[0]
+          if (bestMeta) {
+            const pictureFromBestOrFallback =
+              bestMeta.picture || metaCandidates.find((m) => m?.picture)?.picture
+            next.metadata = { ...bestMeta, picture: pictureFromBestOrFallback || bestMeta.picture }
+          }
+          if (isSameGroup && prevMetadata?.picture && (!next?.metadata || !next.metadata.picture)) {
+            next.metadata = {
+              ...next.metadata,
+              picture: prevMetadata.picture,
+              id: next.metadata?.id || prevMetadata.id,
+              relay: next.metadata?.relay || prevMetadata.relay,
+              name: next.metadata?.name ?? prevMetadata.name,
+              about: next.metadata?.about ?? prevMetadata.about,
+              isOpen: next.metadata?.isOpen ?? prevMetadata.isOpen,
+              isPublic: next.metadata?.isPublic ?? prevMetadata.isPublic,
+              tags: next.metadata?.tags ?? prevMetadata.tags,
+              event: next.metadata?.event || prevMetadata.event
+            }
+          }
+          if (!next.metadata && isSameGroup && prevMetadata) next.metadata = prevMetadata
           if ((!next.admins || !next.admins.length) && isSameGroup && prev?.admins?.length) {
             next.admins = prev.admins
           }
-          if ((!next.members || !next.members.length) && isSameGroup && prev?.members?.length) {
-            next.members = prev.members
+          if ((!next.members || !next.members.length) && isSameGroup && normalizedPrevMembers?.length) {
+            next.members = normalizedPrevMembers
           }
           if (
             (!next.membershipStatus ||
@@ -125,6 +212,18 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
             prev?.membershipStatus
           ) {
             next.membershipStatus = prev.membershipStatus
+          }
+          if (isInMyGroups || isCreator) {
+            if (next.membershipStatus !== 'member') {
+              console.info('[GroupPage] forcing membership via myGroupList/creator', { groupId })
+            }
+            next.membershipStatus = 'member'
+            if (pubkey) {
+              const hasSelf = next.members?.some((m) => m === pubkey)
+              if (!hasSelf) {
+                next.members = [...(next.members || []), pubkey]
+              }
+            }
           }
           return next
         })
@@ -202,6 +301,27 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
     const tags = detail?.metadata?.event?.tags
     return Array.isArray(tags) && tags.some((t) => t[0] === 'i' && t[1] === 'hypertuna:relay')
   }, [detail?.metadata?.event?.tags])
+
+  const decodeNpub = (value?: string) => {
+    if (!value || !value.startsWith('npub')) return undefined
+    try {
+      const decoded = nip19.decode(value)
+      return decoded.type === 'npub' ? (decoded.data as string) : undefined
+    } catch {
+      return undefined
+    }
+  }
+
+  const isCreator = useMemo(() => {
+    if (!pubkey) return false
+    const idPart = groupId?.split(':')?.[0]
+    const idPubkey = decodeNpub(idPart)
+    const dTagPubkey =
+      decodeNpub(detail?.metadata?.event?.tags?.find?.((t) => t[0] === 'd')?.[1]) ||
+      decodeNpub(fallbackMeta?.event?.tags?.find?.((t) => t[0] === 'd')?.[1])
+    const metaPubkey = detail?.metadata?.event?.pubkey || fallbackMeta?.event?.pubkey
+    return metaPubkey === pubkey || idPubkey === pubkey || dTagPubkey === pubkey
+  }, [pubkey, groupId, detail?.metadata?.event, fallbackMeta])
 
   useEffect(() => {
     if (!groupId) return
@@ -341,13 +461,21 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
     }
   }
 
-  const fallbackMeta = discoveryGroups.find(
-    (g) => g.id === groupId && (!effectiveGroupRelay || !g.relay || g.relay === effectiveGroupRelay)
-  )
-  const effectiveDetail =
-    detail || (fallbackMeta ? { metadata: fallbackMeta, admins: [], members: [], membershipStatus: 'not-member' as const } : null)
+  const baseDetail =
+    detail ||
+    (fallbackMeta
+      ? { metadata: fallbackMeta, admins: [], members: [], membershipStatus: 'not-member' as const }
+      : null)
+  let membershipStatus = baseDetail?.membershipStatus ?? 'not-member'
+  if (isInMyGroups || isCreator) {
+    membershipStatus = 'member'
+  }
+  const membersWithSelf = new Set(baseDetail?.members || [])
+  if (membershipStatus === 'member' && pubkey) {
+    membersWithSelf.add(pubkey)
+  }
+  const effectiveDetail = baseDetail ? { ...baseDetail, membershipStatus, members: Array.from(membersWithSelf) } : null
 
-  const membershipStatus = effectiveDetail?.membershipStatus ?? 'not-member'
   const isAdmin =
     !!pubkey && !!effectiveDetail?.admins?.some((admin) => admin.pubkey === pubkey)
 
