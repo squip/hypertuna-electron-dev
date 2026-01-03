@@ -615,21 +615,35 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
             </CardContent>
           </Card>
 
-          <Tabs value={activeTab} onValueChange={(v) => setActiveTab(v as 'notes' | 'members')}>
-            <TabsList className="w-full grid grid-cols-2">
-              <TabsTrigger value="notes">{t('Notes')}</TabsTrigger>
-              <TabsTrigger value="members">
-                {t('Members')}
-                {effectiveDetail.members ? ` (${effectiveDetail.members.length})` : ''}
-              </TabsTrigger>
-            </TabsList>
-            <TabsContent value="notes" className="mt-2">
+          <Tabs
+            value={activeTab}
+            onValueChange={(v) => setActiveTab(v as 'notes' | 'members')}
+            className="w-full"
+          >
+            <div className="border-b">
+              <TabsList className="w-full justify-start h-auto p-0 bg-transparent px-4">
+                <TabsTrigger
+                  value="notes"
+                  className="rounded-none border-b-2 border-transparent data-[state=active]:border-primary data-[state=active]:bg-transparent data-[state=active]:shadow-none px-4 py-3"
+                >
+                  {t('Notes')}
+                </TabsTrigger>
+                <TabsTrigger
+                  value="members"
+                  className="rounded-none border-b-2 border-transparent data-[state=active]:border-primary data-[state=active]:bg-transparent data-[state=active]:shadow-none px-4 py-3"
+                >
+                  {t('Members')}
+                  {effectiveDetail.members ? ` (${effectiveDetail.members.length})` : ''}
+                </TabsTrigger>
+              </TabsList>
+            </div>
+            <TabsContent value="notes" className="mt-0">
               <NormalFeed
                 subRequests={groupSubRequests}
                 isMainFeed={false}
               />
             </TabsContent>
-            <TabsContent value="members" className="mt-2">
+            <TabsContent value="members" className="mt-0">
               <div className="space-y-3">
                 {isAdmin && (
                   <div className="flex gap-2">
