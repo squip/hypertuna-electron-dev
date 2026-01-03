@@ -655,7 +655,47 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
   if (membershipStatus === 'member' && pubkey) {
     membersWithSelf.add(pubkey)
   }
-  const effectiveDetail = baseDetail ? { ...baseDetail, membershipStatus, members: Array.from(membersWithSelf) } : null
+  const mockMembersConfig = useMemo(() => {
+    if (process.env.NODE_ENV !== 'development') return null
+    if (typeof window === 'undefined') return null
+    const params = new URLSearchParams(window.location.search)
+    if (!params.has('mockMembers')) return null
+
+    let parsed: string[] | null = null
+    const raw = params.get('mockMembers')
+    if (raw) {
+      try {
+        const data = JSON.parse(raw)
+        if (Array.isArray(data)) {
+          parsed = data.filter((m) => typeof m === 'string' && m.length > 10)
+        }
+      } catch (err) {
+        console.warn('[GroupPage] mockMembers parse failed, using defaults', err)
+      }
+    }
+
+    const defaultMembers = [
+      pubkey ?? 'npub1selfmockxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx',
+      'npub1dummy111111111111111111111111111111111111111111111111111',
+      'npub1dummy222222222222222222222222222222222222222222222222222'
+    ]
+    const members = Array.from(new Set(parsed?.length ? parsed : defaultMembers))
+    const admins = members[1] ? [{ pubkey: members[1] }] : []
+    console.info('[GroupPage] mockMembers enabled', { members, admins })
+    return { members, admins }
+  }, [pubkey])
+
+  const effectiveDetail = useMemo(() => {
+    if (!baseDetail) return null
+    const detailWithSelf = { ...baseDetail, membershipStatus, members: Array.from(membersWithSelf) }
+    if (!mockMembersConfig) return detailWithSelf
+    return {
+      ...detailWithSelf,
+      members: mockMembersConfig.members,
+      admins: mockMembersConfig.admins,
+      membershipStatus: 'member' as const
+    }
+  }, [baseDetail, membershipStatus, membersWithSelf, mockMembersConfig])
   const isOpenGroup = effectiveDetail?.metadata?.isOpen !== false
 
   const isAdmin =
@@ -924,11 +964,14 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
                     >
                       <UserAvatar userId={admin.pubkey} size="xSmall" />
                       <Username userId={admin.pubkey} className="text-xs" />
-                      {admin.roles.length > 0 && (
+                      {(() => {
+                        const roles = Array.isArray((admin as any).roles) ? (admin as any).roles : []
+                        return roles.length > 0 ? (
                         <span className="text-[10px] uppercase tracking-wide text-muted-foreground">
-                          {admin.roles.join(', ')}
+                          {roles.join(', ')}
                         </span>
-                      )}
+                        ) : null
+                      })()}
                     </div>
                   ))}
                 </div>
