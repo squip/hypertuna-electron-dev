@@ -5,12 +5,26 @@ import { useGroups } from '@/providers/GroupsProvider'
 import { TPageRef } from '@/types'
 import { useTranslation } from 'react-i18next'
 import { forwardRef, useEffect, useMemo, useRef, useState } from 'react'
-import { Users, Loader2, LogOut, Send, Star, Settings, Copy, Check } from 'lucide-react'
+import { Event as NostrEvent } from '@nostr/tools/wasm'
+import {
+  Users,
+  Loader2,
+  LogOut,
+  Star,
+  Settings,
+  Copy,
+  Check,
+  Search,
+  UserPlus,
+  EllipsisVertical,
+  Pin,
+  BellOff,
+  TriangleAlert
+} from 'lucide-react'
 import { Card, CardContent } from '@/components/ui/card'
 import UserAvatar from '@/components/UserAvatar'
 import Username from '@/components/Username'
 import NormalFeed from '@/components/NormalFeed'
-import ProfileList from '@/components/ProfileList'
 import { BIG_RELAY_URLS } from '@/constants'
 import { parseGroupIdentifier } from '@/lib/groups'
 import { Input } from '@/components/ui/input'
@@ -25,8 +39,230 @@ import {
   DialogHeader,
   DialogTitle
 } from '@/components/ui/dialog'
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger
+} from '@/components/ui/dropdown-menu'
 import { useWorkerBridge } from '@/providers/WorkerBridgeProvider'
+import { useSearchProfiles } from '@/hooks/useSearchProfiles'
+import FollowButton from '@/components/FollowButton'
+import Nip05 from '@/components/Nip05'
+import { useMuteList } from '@/providers/MuteListProvider'
+import ReportDialog from '@/components/NoteOptions/ReportDialog'
 import * as nip19 from '@nostr/tools/nip19'
+import { SimpleUserAvatar } from '@/components/UserAvatar'
+import { SimpleUsername } from '@/components/Username'
+import { generateImageByPubkey } from '@/lib/pubkey'
+import React from 'react'
+
+type MemberActionsMenuProps = {
+  targetPubkey: string
+  showGrantAdmin: boolean
+  actionsDisabled?: boolean
+  onGrantAdmin: (pubkey: string) => void
+  onReportUser: (pubkey: string) => void
+  onMutePrivately: (pubkey: string) => void
+  onMutePublicly: (pubkey: string) => void
+  t: (key: string, opts?: any) => string
+}
+
+function MemberActionsMenu({
+  targetPubkey,
+  showGrantAdmin,
+  actionsDisabled,
+  onGrantAdmin,
+  onReportUser,
+  onMutePrivately,
+  onMutePublicly,
+  t
+}: MemberActionsMenuProps) {
+  const [open, setOpen] = React.useState(false)
+  return (
+    <DropdownMenu open={open} onOpenChange={setOpen}>
+      <DropdownMenuTrigger asChild>
+        <Button
+          variant="ghost"
+          size="icon"
+          className="h-10 w-10 shrink-0 rounded-lg [&_svg]:size-5"
+          onClick={(e) => e.stopPropagation()}
+          disabled={actionsDisabled}
+        >
+          <EllipsisVertical />
+        </Button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent
+        className="p-1 scrollbar-hide max-h-[50vh] overflow-y-auto"
+        onClick={(e) => e.stopPropagation()}
+      >
+        {showGrantAdmin && (
+          <DropdownMenuItem
+            onClick={() => onGrantAdmin(targetPubkey)}
+            className="relative flex cursor-pointer select-none items-center gap-2 px-2 py-1.5 text-sm rounded-md"
+            disabled={actionsDisabled}
+          >
+            <Pin className="w-4 h-4" />
+            {t('Grant admin permissions')}
+          </DropdownMenuItem>
+        )}
+        <DropdownMenuItem
+          onClick={() => onReportUser(targetPubkey)}
+          className="relative flex cursor-pointer select-none items-center gap-2 px-2 py-1.5 text-sm rounded-md text-destructive focus:text-destructive"
+          disabled={actionsDisabled}
+        >
+          <TriangleAlert className="w-4 h-4" />
+          {t('Report')}
+        </DropdownMenuItem>
+        <DropdownMenuSeparator />
+        <DropdownMenuItem
+          onClick={() => onMutePrivately(targetPubkey)}
+          className="relative flex cursor-pointer select-none items-center gap-2 px-2 py-1.5 text-sm rounded-md text-destructive focus:text-destructive"
+          disabled={actionsDisabled}
+        >
+          <BellOff className="w-4 h-4" />
+          {t('Mute user privately')}
+        </DropdownMenuItem>
+        <DropdownMenuItem
+          onClick={() => onMutePublicly(targetPubkey)}
+          className="relative flex cursor-pointer select-none items-center gap-2 px-2 py-1.5 text-sm rounded-md text-destructive focus:text-destructive"
+          disabled={actionsDisabled}
+        >
+          <BellOff className="w-4 h-4" />
+          {t('Mute user publicly')}
+        </DropdownMenuItem>
+      </DropdownMenuContent>
+    </DropdownMenu>
+  )
+}
+
+type MemberRowProps = {
+  memberPubkey: string
+  isSelf: boolean
+  showGrantAdmin: boolean
+  canMute: boolean
+  nostrProfile: any
+  pubkey?: string | null
+  onGrantAdmin: (pubkey: string) => void
+  onReportUser: (pubkey: string) => void
+  onMutePrivately: (pubkey: string) => void
+  onMutePublicly: (pubkey: string) => void
+  t: (key: string, opts?: any) => string
+}
+
+function MemberRowComponent({
+  memberPubkey,
+  isSelf,
+  showGrantAdmin,
+  canMute,
+  nostrProfile,
+  pubkey,
+  onGrantAdmin,
+  onReportUser,
+  onMutePrivately,
+  onMutePublicly,
+  t
+}: MemberRowProps) {
+  React.useEffect(() => {
+    console.info('[GroupPage] member row render', {
+      memberPubkey,
+      isSelf,
+      ts: Date.now()
+    })
+  })
+
+  const actionsDisabled = isSelf
+  const selfProfile =
+    isSelf && pubkey
+      ? (nostrProfile || {
+          pubkey,
+          metadata: { picture: generateImageByPubkey(pubkey) }
+        })
+      : null
+
+  return (
+    <div className="flex items-center gap-3 px-4 py-3 rounded-lg border border-transparent hover:border-border hover:bg-accent/30">
+      {isSelf ? (
+        <>
+          <SimpleUserAvatar
+            userId={memberPubkey}
+            profile={selfProfile || undefined}
+            className="shrink-0"
+          />
+          <div className="min-w-0 flex-1">
+            <SimpleUsername
+              userId={memberPubkey}
+              profile={selfProfile || undefined}
+              className="font-semibold truncate max-w-full w-fit"
+              withoutSkeleton
+            />
+            <Nip05 pubkey={memberPubkey} profile={selfProfile || undefined} />
+          </div>
+        </>
+      ) : (
+        <>
+          <UserAvatar userId={memberPubkey} className="shrink-0" />
+          <div className="min-w-0 flex-1">
+            <Username userId={memberPubkey} className="font-semibold truncate max-w-full w-fit" />
+            <Nip05 pubkey={memberPubkey} />
+          </div>
+        </>
+      )}
+      <div className="flex items-center gap-2 flex-shrink-0">
+        {!isSelf ? (
+          <>
+            <FollowButton pubkey={memberPubkey} />
+            {(canMute || actionsDisabled) && (
+              <MemberActionsMenu
+                targetPubkey={memberPubkey}
+                showGrantAdmin={showGrantAdmin}
+                actionsDisabled={actionsDisabled}
+                onGrantAdmin={onGrantAdmin}
+                onReportUser={onReportUser}
+                onMutePrivately={onMutePrivately}
+                onMutePublicly={onMutePublicly}
+                t={t}
+              />
+            )}
+          </>
+        ) : (
+          <>
+            <Button className="rounded-full min-w-28" variant="outline" size="sm" disabled>
+              {t('Follow')}
+            </Button>
+            <MemberActionsMenu
+              targetPubkey={memberPubkey}
+              showGrantAdmin={false}
+              actionsDisabled
+              onGrantAdmin={onGrantAdmin}
+              onReportUser={onReportUser}
+              onMutePrivately={onMutePrivately}
+              onMutePublicly={onMutePublicly}
+              t={t}
+            />
+          </>
+        )}
+      </div>
+    </div>
+  )
+}
+
+const MemoizedMemberRow = React.memo(
+  MemberRowComponent,
+  (prev, next) =>
+    prev.memberPubkey === next.memberPubkey &&
+    prev.isSelf === next.isSelf &&
+    prev.showGrantAdmin === next.showGrantAdmin &&
+    prev.canMute === next.canMute &&
+    prev.nostrProfile === next.nostrProfile &&
+    prev.pubkey === next.pubkey &&
+    prev.onGrantAdmin === next.onGrantAdmin &&
+    prev.onReportUser === next.onReportUser &&
+    prev.onMutePrivately === next.onMutePrivately &&
+    prev.onMutePublicly === next.onMutePublicly &&
+    prev.t === next.t
+)
 
 type TGroupPageProps = {
   index?: number
@@ -48,11 +284,11 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
     invites,
     sendInvites,
     updateMetadata,
-    removeUser,
+    grantAdmin,
     resolveRelayUrl,
     myGroupList
   } = useGroups()
-  const { pubkey } = useNostr()
+  const { pubkey, profile: nostrProfile } = useNostr()
   const { joinFlows, startJoinFlow } = useWorkerBridge()
   const [isLoading, setIsLoading] = useState(true)
   const [activeTab, setActiveTab] = useState<'notes' | 'members'>('notes')
@@ -60,13 +296,30 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
   const [groupRelay, setGroupRelay] = useState<string | undefined>(relay)
   const [groupId, setGroupId] = useState<string | undefined>(id)
   const [detail, setDetail] = useState<Awaited<ReturnType<typeof fetchGroupDetail>> | null>(null)
-  const [inviteeInput, setInviteeInput] = useState('')
   const [isSendingInvite, setIsSendingInvite] = useState(false)
   const [isComposerOpen, setIsComposerOpen] = useState(false)
   const [isMetadataDialogOpen, setIsMetadataDialogOpen] = useState(false)
   const [isSavingMeta, setIsSavingMeta] = useState(false)
-  const [removePubkey, setRemovePubkey] = useState('')
   const [copiedRelayUrl, setCopiedRelayUrl] = useState(false)
+  const [memberSearch, setMemberSearch] = useState('')
+  const [isInviteDialogOpen, setIsInviteDialogOpen] = useState(false)
+  const [inviteSearch, setInviteSearch] = useState('')
+  const [selectedInvitees, setSelectedInvitees] = useState<string[]>([])
+  const [reportTarget, setReportTarget] = useState<string | null>(null)
+  const { profiles: inviteProfiles, isFetching: isSearchingInvites } = useSearchProfiles(inviteSearch, 8)
+  const { mutePrivately, mutePublicly } = useMuteList()
+  const reportEvent = useMemo(() => {
+    if (!reportTarget) return null
+    return {
+      id: reportTarget,
+      pubkey: reportTarget,
+      kind: 0,
+      tags: [],
+      content: '',
+      created_at: Math.floor(Date.now() / 1000),
+      sig: ''
+    } as NostrEvent
+  }, [reportTarget])
   const requestIdRef = useRef(0)
 
   const myGroupRelay = useMemo(
@@ -343,26 +596,6 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
     }
   }
 
-  const handleSendInvites = async () => {
-    if (!groupId || !inviteeInput.trim()) return
-    const invitees = inviteeInput
-      .split(',')
-      .map((v) => v.trim())
-      .filter(Boolean)
-    if (!invitees.length) return
-    setIsSendingInvite(true)
-    try {
-      await sendInvites(groupId, invitees, effectiveGroupRelay)
-      toast.success(t('Invites sent'))
-      setInviteeInput('')
-    } catch (err) {
-      toast.error(t('Failed to send invites'))
-      setError((err as Error).message)
-    } finally {
-      setIsSendingInvite(false)
-    }
-  }
-
   const handleSaveMetadata = async (data: TGroupMetadataForm) => {
     if (!groupId) return
     setIsSavingMeta(true)
@@ -395,18 +628,6 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
     }
   }
 
-  const handleRemoveMember = async () => {
-    if (!groupId || !removePubkey.trim()) return
-    try {
-      await removeUser(groupId, removePubkey.trim(), effectiveGroupRelay)
-      toast.success(t('User removed'))
-      setRemovePubkey('')
-    } catch (err) {
-      toast.error(t('Failed to remove user'))
-      setError((err as Error).message)
-    }
-  }
-
   const handleLeave = async () => {
     if (!groupId) return
     try {
@@ -435,6 +656,7 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
     membersWithSelf.add(pubkey)
   }
   const effectiveDetail = baseDetail ? { ...baseDetail, membershipStatus, members: Array.from(membersWithSelf) } : null
+  const isOpenGroup = effectiveDetail?.metadata?.isOpen !== false
 
   const isAdmin =
     !!pubkey && !!effectiveDetail?.admins?.some((admin) => admin.pubkey === pubkey)
@@ -451,6 +673,24 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
 
   const relayUrlToCopy = resolvedGroupRelay || effectiveGroupRelay
 
+  const filteredMembers = useMemo(() => {
+    const term = memberSearch.trim().toLowerCase()
+    const members = effectiveDetail?.members || []
+    if (!term) return members
+    return members.filter((m) => {
+      const normalized = m.toLowerCase()
+      let npub: string | null = null
+      try {
+        npub = nip19.npubEncode(m)
+      } catch {
+        npub = null
+      }
+      return normalized.includes(term) || (npub ? npub.toLowerCase().includes(term) : false)
+    })
+  }, [effectiveDetail?.members, memberSearch])
+
+  const canInviteMembers = isOpenGroup || isAdmin
+
   const handleCopyRelayUrl = async () => {
     if (!relayUrlToCopy) return
     try {
@@ -462,6 +702,92 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
       console.error('[GroupPage] failed to copy relay URL', err)
     }
   }
+
+  const handleInviteToggle = (pubkey: string) => {
+    setSelectedInvitees((prev) =>
+      prev.includes(pubkey) ? prev.filter((p) => p !== pubkey) : [...prev, pubkey]
+    )
+  }
+
+  const handleInviteSubmit = async () => {
+    if (!groupId || !selectedInvitees.length) return
+    setIsSendingInvite(true)
+    try {
+      await sendInvites(groupId, selectedInvitees, effectiveGroupRelay)
+      toast.success(t('Invites sent'))
+      setSelectedInvitees([])
+      setInviteSearch('')
+      setIsInviteDialogOpen(false)
+    } catch (err) {
+      toast.error(t('Failed to send invites'))
+      setError((err as Error).message)
+    } finally {
+      setIsSendingInvite(false)
+    }
+  }
+
+  const handleGrantAdmin = React.useCallback(
+    async (targetPubkey: string) => {
+      if (!groupId) return
+      try {
+        await grantAdmin(groupId, targetPubkey, effectiveGroupRelay)
+        toast.success(t('Admin permissions granted'))
+      } catch (err) {
+        toast.error(t('Failed to grant admin permissions'))
+        setError((err as Error).message)
+      }
+    },
+    [effectiveGroupRelay, grantAdmin, groupId, t]
+  )
+
+  const handleReportUser = React.useCallback((targetPubkey: string) => {
+    setReportTarget(targetPubkey)
+  }, [])
+
+  const handleMutePrivately = React.useCallback(
+    (targetPubkey: string) => {
+      mutePrivately(targetPubkey)
+    },
+    [mutePrivately]
+  )
+
+  const handleMutePublicly = React.useCallback(
+    (targetPubkey: string) => {
+      mutePublicly(targetPubkey)
+    },
+    [mutePublicly]
+  )
+
+  const memberRows = useMemo(
+    () =>
+      filteredMembers.map((member) => (
+        <MemoizedMemberRow
+          key={member}
+          memberPubkey={member}
+          isSelf={member === pubkey}
+          showGrantAdmin={isAdmin && member !== pubkey}
+          canMute={member !== pubkey}
+          nostrProfile={nostrProfile}
+          pubkey={pubkey}
+          onGrantAdmin={handleGrantAdmin}
+          onReportUser={handleReportUser}
+          onMutePrivately={handleMutePrivately}
+          onMutePublicly={handleMutePublicly}
+          t={t}
+        />
+      )),
+    [
+      filteredMembers,
+      handleGrantAdmin,
+      handleMutePrivately,
+      handleMutePublicly,
+      handleReportUser,
+      isAdmin,
+      nostrProfile,
+      pubkey,
+      t
+    ]
+  )
 
   const content = (
     <SecondaryPageLayout
@@ -639,64 +965,33 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
               />
             </TabsContent>
             <TabsContent value="members" className="mt-0">
-              <div className="space-y-3">
-                {effectiveDetail.members && effectiveDetail.members.length > 0 ? (
-                  <div className="space-y-2">
-                    <ProfileList pubkeys={effectiveDetail.members} />
-                    {isAdmin && (
-                      <div className="space-y-1">
-                        <div className="text-xs text-muted-foreground">{t('Remove member')}</div>
-                        <div className="flex gap-2">
-                          <Input
-                            value={removePubkey}
-                            onChange={(e) => setRemovePubkey(e.target.value)}
-                            placeholder={t('Pubkey to remove') as string}
-                          />
-                          <Button variant="outline" onClick={handleRemoveMember} size="sm">
-                            {t('Remove')}
-                          </Button>
-                        </div>
-                      </div>
-                    )}
+              <div className="space-y-4">
+                <div className="px-4 py-3 border-b flex items-center gap-2">
+                  <div className="relative flex-1">
+                    <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
+                    <Input
+                      value={memberSearch}
+                      onChange={(e) => setMemberSearch(e.target.value)}
+                      placeholder={t('Search users...') as string}
+                      className="pl-9"
+                    />
                   </div>
-                ) : (
-                  <div className="text-muted-foreground text-sm">{t('No members listed')}</div>
-                )}
+                  {canInviteMembers && (
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      className="h-10 w-10 shrink-0 rounded-lg"
+                      onClick={() => setIsInviteDialogOpen(true)}
+                      title={t('Invite members')}
+                    >
+                      <UserPlus className="w-5 h-5" />
+                    </Button>
+                  )}
+                </div>
+                <div className="space-y-2">{memberRows}</div>
               </div>
             </TabsContent>
           </Tabs>
-
-          {membershipStatus === 'member' && isAdmin && (
-            <Card className="overflow-hidden border">
-              <CardContent className="p-4 space-y-3">
-                <div className="flex items-center justify-between">
-                  <div className="font-semibold">{t('Send invites')}</div>
-                  <Button
-                    size="sm"
-                    variant="outline"
-                    onClick={handleSendInvites}
-                    disabled={isSendingInvite}
-                  >
-                    {isSendingInvite ? (
-                      <Loader2 className="w-4 h-4 animate-spin" />
-                    ) : (
-                      <Send className="w-4 h-4 mr-2" />
-                    )}
-                    {t('Send')}
-                  </Button>
-                </div>
-                <Input
-                  value={inviteeInput}
-                  onChange={(e) => setInviteeInput(e.target.value)}
-                  placeholder={t('Enter npubs or hex pubkeys, comma separated') as string}
-                />
-                <div className="text-xs text-muted-foreground">
-                  {t('Each invite will include a unique token encrypted to the invitee.')}
-                </div>
-              </CardContent>
-            </Card>
-          )}
-
         </div>
       )}
     </SecondaryPageLayout>
@@ -718,6 +1013,111 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
           openFrom={resolvedGroupRelay ? [resolvedGroupRelay] : effectiveGroupRelay ? [effectiveGroupRelay] : undefined}
         />
       )}
+      {reportEvent && (
+        <ReportDialog
+          event={reportEvent}
+          isOpen={!!reportTarget}
+          closeDialog={() => setReportTarget(null)}
+        />
+      )}
+      <Dialog
+        open={isInviteDialogOpen}
+        onOpenChange={(open) => {
+          setIsInviteDialogOpen(open)
+          if (!open) {
+            setSelectedInvitees([])
+            setInviteSearch('')
+          }
+        }}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>{t('Invite members')}</DialogTitle>
+          </DialogHeader>
+          <div className="space-y-3">
+            <div className="relative">
+              <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
+              <Input
+                value={inviteSearch}
+                onChange={(e) => setInviteSearch(e.target.value)}
+                placeholder={t('Search users...') as string}
+                className="pl-9"
+              />
+            </div>
+            <div className="max-h-64 overflow-y-auto space-y-2">
+              {inviteSearch && isSearchingInvites && (
+                <div className="text-sm text-muted-foreground px-2">{t('Searching...')}</div>
+              )}
+              {inviteSearch && !isSearchingInvites && inviteProfiles.length === 0 && (
+                <div className="text-sm text-muted-foreground px-2">{t('No users found')}</div>
+              )}
+              {inviteProfiles
+                .filter((profile) => !(effectiveDetail?.members || []).includes(profile.pubkey))
+                .map((profile) => {
+                  const isSelected = selectedInvitees.includes(profile.pubkey)
+                  return (
+                    <div
+                      key={profile.pubkey}
+                      className="flex items-center gap-2 hover:bg-accent rounded px-2 py-1 transition-colors"
+                    >
+                      <UserAvatar userId={profile.pubkey} className="shrink-0" />
+                      <div className="flex-1 overflow-hidden">
+                        <Username
+                          userId={profile.pubkey}
+                          className="font-semibold truncate max-w-full w-fit"
+                        />
+                        <Nip05 pubkey={profile.pubkey} />
+                      </div>
+                      <Button
+                        variant={isSelected ? 'secondary' : 'outline'}
+                        size="sm"
+                        onClick={() => handleInviteToggle(profile.pubkey)}
+                        className="flex-shrink-0 h-8 px-3"
+                      >
+                        {isSelected ? (
+                          <>
+                            <Check className="w-3 h-3 mr-1" />
+                            {t('Added')}
+                          </>
+                        ) : (
+                          <>
+                            <UserPlus className="w-3 h-3 mr-1" />
+                            {t('Add')}
+                          </>
+                        )}
+                      </Button>
+                    </div>
+                  )
+                })}
+            </div>
+            {selectedInvitees.length > 0 && (
+              <div className="flex flex-wrap gap-2">
+                {selectedInvitees.map((pk) => (
+                  <Button
+                    key={pk}
+                    variant="secondary"
+                    size="sm"
+                    className="flex items-center gap-2"
+                    onClick={() => handleInviteToggle(pk)}
+                  >
+                    <UserAvatar userId={pk} size="xSmall" />
+                    <Username userId={pk} className="truncate max-w-[8rem]" />
+                    <span className="text-xs text-muted-foreground">{t('Remove')}</span>
+                  </Button>
+                ))}
+              </div>
+            )}
+            <Button
+              onClick={handleInviteSubmit}
+              disabled={!selectedInvitees.length || isSendingInvite}
+              className="w-full"
+            >
+              {isSendingInvite && <Loader2 className="w-4 h-4 mr-2 animate-spin" />}
+              {t('Invite')}
+            </Button>
+          </div>
+        </DialogContent>
+      </Dialog>
       <Dialog open={isMetadataDialogOpen} onOpenChange={setIsMetadataDialogOpen}>
         <DialogContent>
           <DialogHeader>

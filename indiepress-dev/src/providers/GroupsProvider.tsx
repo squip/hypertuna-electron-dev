@@ -62,6 +62,7 @@ type TGroupsContext = {
   }>
   sendInvites: (groupId: string, invitees: string[], relay?: string) => Promise<void>
   updateMetadata: (groupId: string, data: Partial<{ name: string; about: string; picture: string; isPublic: boolean; isOpen: boolean }>, relay?: string) => Promise<void>
+  grantAdmin: (groupId: string, targetPubkey: string, relay?: string) => Promise<void>
   addUser: (groupId: string, targetPubkey: string, relay?: string) => Promise<void>
   removeUser: (groupId: string, targetPubkey: string, relay?: string) => Promise<void>
   deleteGroup: (groupId: string, relay?: string) => Promise<void>
@@ -113,6 +114,7 @@ export const useGroups = () => {
       }),
       sendInvites: async () => {},
       updateMetadata: async () => {},
+      grantAdmin: async () => {},
       addUser: async () => {},
       removeUser: async () => {},
       deleteGroup: async () => {},
@@ -902,6 +904,24 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
     [pubkey, publish, resolveRelayUrl]
   )
 
+  const grantAdmin = useCallback(
+    async (groupId: string, targetPubkey: string, relay?: string) => {
+      if (!pubkey) throw new Error('Not logged in')
+      const draftEvent: TDraftEvent = {
+        kind: 9003,
+        created_at: Math.floor(Date.now() / 1000),
+        tags: [
+          ['h', groupId],
+          ['p', targetPubkey, 'admin']
+        ],
+        content: ''
+      }
+      const resolved = relay ? resolveRelayUrl(relay) : undefined
+      await publish(draftEvent, { specifiedRelayUrls: resolved ? [resolved] : undefined })
+    },
+    [pubkey, publish, resolveRelayUrl]
+  )
+
   const removeUser = useCallback(
     async (groupId: string, targetPubkey: string, relay?: string) => {
       if (!pubkey) throw new Error('Not logged in')
@@ -972,6 +992,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       fetchGroupDetail,
       sendInvites,
       updateMetadata,
+      grantAdmin,
       addUser,
       removeUser,
       deleteGroup,
@@ -1079,6 +1100,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       fetchGroupDetail,
       sendInvites,
       updateMetadata,
+      grantAdmin,
       addUser,
       removeUser,
       deleteGroup,
