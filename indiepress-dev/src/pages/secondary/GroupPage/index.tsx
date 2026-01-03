@@ -5,7 +5,7 @@ import { useGroups } from '@/providers/GroupsProvider'
 import { TPageRef } from '@/types'
 import { useTranslation } from 'react-i18next'
 import { forwardRef, useEffect, useMemo, useRef, useState } from 'react'
-import { Users, Loader2, LogOut, Send, Star } from 'lucide-react'
+import { Users, Loader2, LogOut, Send, Star, Settings, Copy, Check } from 'lucide-react'
 import { Card, CardContent } from '@/components/ui/card'
 import UserAvatar from '@/components/UserAvatar'
 import Username from '@/components/Username'
@@ -25,7 +25,6 @@ import {
   DialogHeader,
   DialogTitle
 } from '@/components/ui/dialog'
-import { Label } from '@/components/ui/label'
 import { useWorkerBridge } from '@/providers/WorkerBridgeProvider'
 import * as nip19 from '@nostr/tools/nip19'
 
@@ -49,10 +48,7 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
     invites,
     sendInvites,
     updateMetadata,
-    addUser,
     removeUser,
-    deleteGroup,
-    deleteEvent,
     resolveRelayUrl,
     myGroupList
   } = useGroups()
@@ -69,9 +65,8 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
   const [isComposerOpen, setIsComposerOpen] = useState(false)
   const [isMetadataDialogOpen, setIsMetadataDialogOpen] = useState(false)
   const [isSavingMeta, setIsSavingMeta] = useState(false)
-  const [memberInput, setMemberInput] = useState('')
   const [removePubkey, setRemovePubkey] = useState('')
-  const [removeEventId, setRemoveEventId] = useState('')
+  const [copiedRelayUrl, setCopiedRelayUrl] = useState(false)
   const requestIdRef = useRef(0)
 
   const myGroupRelay = useMemo(
@@ -370,7 +365,7 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
 
   const handleSaveMetadata = async (data: TGroupMetadataForm) => {
     if (!groupId) return
-      setIsSavingMeta(true)
+    setIsSavingMeta(true)
     try {
       await updateMetadata(groupId, data, effectiveGroupRelay)
       toast.success(t('Metadata updated'))
@@ -391,24 +386,12 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
       })
       setIsMetadataDialogOpen(false)
       // Refresh detail
-        fetchGroupDetail(groupId, effectiveGroupRelay, { preferRelay: true }).then(setDetail)
+      fetchGroupDetail(groupId, effectiveGroupRelay, { preferRelay: true }).then(setDetail)
     } catch (err) {
       toast.error(t('Failed to update metadata'))
       setError((err as Error).message)
     } finally {
       setIsSavingMeta(false)
-    }
-  }
-
-  const handleAddMember = async () => {
-    if (!groupId || !memberInput.trim()) return
-    try {
-      await addUser(groupId, memberInput.trim(), effectiveGroupRelay)
-      toast.success(t('User added'))
-      setMemberInput('')
-    } catch (err) {
-      toast.error(t('Failed to add user'))
-      setError((err as Error).message)
     }
   }
 
@@ -420,29 +403,6 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
       setRemovePubkey('')
     } catch (err) {
       toast.error(t('Failed to remove user'))
-      setError((err as Error).message)
-    }
-  }
-
-  const handleDeleteGroup = async () => {
-    if (!groupId) return
-    try {
-      await deleteGroup(groupId, effectiveGroupRelay)
-      toast.success(t('Group delete requested'))
-    } catch (err) {
-      toast.error(t('Failed to delete group'))
-      setError((err as Error).message)
-    }
-  }
-
-  const handleDeleteEvent = async () => {
-    if (!groupId || !removeEventId.trim()) return
-    try {
-      await deleteEvent(groupId, removeEventId.trim(), effectiveGroupRelay)
-      toast.success(t('Delete requested'))
-      setRemoveEventId('')
-    } catch (err) {
-      toast.error(t('Failed to delete event'))
       setError((err as Error).message)
     }
   }
@@ -489,23 +449,25 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
     </span>
   )
 
+  const relayUrlToCopy = resolvedGroupRelay || effectiveGroupRelay
+
+  const handleCopyRelayUrl = async () => {
+    if (!relayUrlToCopy) return
+    try {
+      await navigator.clipboard.writeText(relayUrlToCopy)
+      setCopiedRelayUrl(true)
+      setTimeout(() => setCopiedRelayUrl(false), 2000)
+    } catch (err) {
+      toast.error(t('Failed to copy to clipboard'))
+      console.error('[GroupPage] failed to copy relay URL', err)
+    }
+  }
+
   const content = (
     <SecondaryPageLayout
       ref={ref}
       index={index}
       title={groupTitle}
-      controls={
-        <div className="flex items-center gap-1">
-          <Button
-            variant="ghost"
-            size="titlebar-icon"
-            onClick={() => toggleFavorite(groupKey)}
-            title={isFavorite ? t('Remove from favorites') : t('Add to favorites')}
-          >
-            <Star className={`w-4 h-4 ${isFavorite ? 'fill-current text-yellow-500' : ''}`} />
-          </Button>
-        </div>
-      }
     >
       {isLoading ? (
         <div className="flex items-center justify-center h-64 text-muted-foreground gap-2">
@@ -521,7 +483,7 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
         </div>
       ) : (
         <div className="space-y-4 pb-6">
-          <Card className="overflow-hidden border">
+          <Card className="overflow-hidden border-0 shadow-none">
             <CardContent className="p-4 space-y-3">
               <div className="flex gap-3 items-start">
                 {effectiveDetail.metadata?.picture && (
@@ -535,6 +497,39 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
                   <div className="flex items-center justify-between gap-2">
                     <div className="text-2xl font-semibold truncate">
                       {effectiveDetail.metadata?.name || groupId}
+                    </div>
+                    <div className="flex items-center gap-1">
+                      {isAdmin && (
+                        <Button
+                          variant="ghost"
+                          size="titlebar-icon"
+                          onClick={() => setIsMetadataDialogOpen(true)}
+                          title={t('Edit metadata')}
+                        >
+                          <Settings className="w-5 h-5" />
+                        </Button>
+                      )}
+                      <Button
+                        variant="ghost"
+                        size="titlebar-icon"
+                        onClick={handleCopyRelayUrl}
+                        disabled={!relayUrlToCopy}
+                        title={t('Copy URL')}
+                      >
+                        {copiedRelayUrl ? (
+                          <Check className="w-5 h-5" />
+                        ) : (
+                          <Copy className="w-5 h-5" />
+                        )}
+                      </Button>
+                      <Button
+                        variant="ghost"
+                        size="titlebar-icon"
+                        onClick={() => toggleFavorite(groupKey)}
+                        title={isFavorite ? t('Remove from favorites') : t('Add to favorites')}
+                      >
+                        <Star className={`w-5 h-5 ${isFavorite ? 'fill-current text-yellow-500' : ''}`} />
+                      </Button>
                     </div>
                   </div>
                   {effectiveDetail.metadata?.about && (
@@ -620,7 +615,7 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
             onValueChange={(v) => setActiveTab(v as 'notes' | 'members')}
             className="w-full"
           >
-            <div className="border-b">
+            <div className="border-b border-t">
               <TabsList className="w-full justify-start h-auto p-0 bg-transparent px-4">
                 <TabsTrigger
                   value="notes"
@@ -645,18 +640,6 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
             </TabsContent>
             <TabsContent value="members" className="mt-0">
               <div className="space-y-3">
-                {isAdmin && (
-                  <div className="flex gap-2">
-                    <Input
-                      value={memberInput}
-                      onChange={(e) => setMemberInput(e.target.value)}
-                      placeholder={t('Add member by pubkey') as string}
-                    />
-                    <Button onClick={handleAddMember} size="sm">
-                      {t('Add')}
-                    </Button>
-                  </div>
-                )}
                 {effectiveDetail.members && effectiveDetail.members.length > 0 ? (
                   <div className="space-y-2">
                     <ProfileList pubkeys={effectiveDetail.members} />
@@ -714,36 +697,6 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
             </Card>
           )}
 
-          {isAdmin && (
-            <Card className="overflow-hidden border">
-              <CardContent className="p-4 space-y-3">
-                <div className="flex items-center justify-between">
-                  <div className="font-semibold">{t('Admin controls')}</div>
-                  <div className="flex gap-2">
-                    <Button variant="outline" size="sm" onClick={() => setIsMetadataDialogOpen(true)}>
-                      {t('Edit metadata')}
-                    </Button>
-                    <Button variant="destructive" size="sm" onClick={handleDeleteGroup}>
-                      {t('Delete group')}
-                    </Button>
-                  </div>
-                </div>
-                <div className="space-y-2">
-                  <Label>{t('Delete event by id')}</Label>
-                  <div className="flex gap-2">
-                    <Input
-                      value={removeEventId}
-                      onChange={(e) => setRemoveEventId(e.target.value)}
-                      placeholder={t('Event ID')}
-                    />
-                    <Button variant="outline" onClick={handleDeleteEvent} size="sm">
-                      {t('Delete')}
-                    </Button>
-                  </div>
-                </div>
-              </CardContent>
-            </Card>
-          )}
         </div>
       )}
     </SecondaryPageLayout>
