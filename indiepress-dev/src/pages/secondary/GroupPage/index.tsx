@@ -674,12 +674,27 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
       }
     }
 
+    const normalizeMockMember = (m: string) => {
+      try {
+        const decoded = nip19.decode(m)
+        if (decoded.type === 'npub') return decoded.data as string
+        if (decoded.type === 'nprofile' && typeof decoded.data === 'object' && 'pubkey' in decoded.data) {
+          return (decoded.data as any).pubkey as string
+        }
+      } catch {
+        // fall through to returning raw value
+      }
+      return m
+    }
+
     const defaultMembers = [
-      pubkey ?? 'npub1selfmockxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx',
-      'npub1dummy111111111111111111111111111111111111111111111111111',
-      'npub1dummy222222222222222222222222222222222222222222222222222'
+      pubkey ?? 'ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff',
+      'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+      'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
     ]
-    const members = Array.from(new Set(parsed?.length ? parsed : defaultMembers))
+    const members = Array.from(
+      new Set((parsed?.length ? parsed : defaultMembers).map(normalizeMockMember).filter((m) => !!m && m.length > 10))
+    )
     const admins = members[1] ? [{ pubkey: members[1] }] : []
     console.info('[GroupPage] mockMembers enabled', { members, admins })
     return { members, admins }
